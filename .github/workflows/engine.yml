@@ -29,6 +29,8 @@ jobs:
       # INICIO DA MODIFICAÇÃO
       - name: 🧐 Analyze Manifest Requirements
         id: manifest_check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           echo "🔍 Identificando qual pasta disparou o pipeline..."
@@ -63,7 +65,35 @@ jobs:
              exit 1
           fi
 
-          NEEDS_ACCESS=$(jq -r '(.external_repositories // []) | if type=="array" then (length > 0) else false end' "$MANIFEST_PATH")
+          EXTERNAL_REPOS=$(jq -c '.external_repositories // []' "$MANIFEST_PATH")
+          NEEDS_ACCESS="false"
+          
+          if [ "$EXTERNAL_REPOS" != "[]" ] && [ "$EXTERNAL_REPOS" != "null" ]; then
+            echo "📦 Verificando visibilidade dos repositórios externos..."
+            
+            while IFS= read -r repo; do
+              ORG=$(echo "$repo" | jq -r '.org')
+              REPO_NAME=$(echo "$repo" | jq -r '.repo_name')
+              
+              echo "🔍 Checando API do GitHub para: $ORG/$REPO_NAME"
+              
+              HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+                -H "Authorization: Bearer $GITHUB_TOKEN" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/$ORG/$REPO_NAME")
+                
+              if [ "$HTTP_STATUS" == "200" ]; then
+                echo "   ✅ Público (HTTP 200). Não requer token externo."
+              else
+                echo "   🔒 Privado (HTTP $HTTP_STATUS). Requer token do backend!"
+                NEEDS_ACCESS="true"
+                break
+              fi
+            done < <(echo "$EXTERNAL_REPOS" | jq -c '.[]')
+          else
+            echo "ℹ️ Nenhum repositório externo declarado no manifesto."
+          fi
+
           echo "📊 Resultado da análise Gatekeeper: $NEEDS_ACCESS"
           
           # SALVANDO NA MEMÓRIA PARA O RESTO DO PIPELINE

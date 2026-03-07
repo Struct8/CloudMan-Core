@@ -106,16 +106,9 @@ jobs:
         shell: bash
         run: |
           # 1. Roteamento Dinâmico (Dev vs Prod) baseado na branch
-          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-            STAGE="prod"
-            GATEKEEPER_URL="https://prod.v2.cloudman.pro/st/GithubGateKeeper-prod"
-            AUDIENCE="https://github.com/cloudmanpro"
-          else
-            STAGE="dev"
-            GATEKEEPER_URL="https://dev.v2.cloudman.pro/st/GithubGateKeeper-dev"
-            AUDIENCE="https://github.com/cloudmandev"
-          fi
-
+          STAGE="dev"
+          GATEKEEPER_URL="https://dev.v2.cloudman.pro/st/GithubGateKeeper-dev"
+          AUDIENCE="https://github.com/cloudmandev"
           echo "🚀 Detectado ambiente: $STAGE"
           echo "🔗 Acionando Gatekeeper em: $GATEKEEPER_URL"
 

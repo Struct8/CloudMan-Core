@@ -6,7 +6,16 @@ function handlePush(resource) {
     console.log('🔽 Downloading code from AWS...');
     
     const getUrlCmd = `aws lambda get-function --function-name "${funcId}" --query 'Code.Location' --output text --region ${region}`;
-    const url = execSync(getUrlCmd).toString().trim();
+    
+    let url;
+    try {
+        // O { stdio: 'pipe' } impede que o erro vaze solto no console e permite tratar ele
+        url = execSync(getUrlCmd, { stdio: 'pipe' }).toString().trim();
+    } catch (error) {
+        // Extrai a mensagem de erro do AWS CLI
+        const errorMessage = error.stderr ? error.stderr.toString().trim() : error.message;
+        throw new Error(errorMessage); // Isso será pego pelo catch no orchestrator.js
+    }
 
     if (!url || url === 'None') {
         throw new Error(`Could not get code URL for ${funcId}. Check if function exists.`);

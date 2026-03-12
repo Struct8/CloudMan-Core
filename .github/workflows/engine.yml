@@ -284,11 +284,6 @@ jobs:
                   # PASSO 3: EXECUÇÃO DO TERRAFORM
                   # ---------------------------------------------------------
                   echo -e "${color}▶️ ${label} Executando Terraform $action...${NC}"
-
-                  # Como configuramos o backend com profile=backend no init,
-                  # o Terraform vai usar:
-                  # 1. Profile 'backend' -> Para S3 e DynamoDB (Lock)
-                  # 2. Env Vars (AWS_ACCESS_KEY...) -> Para o Provider AWS (Resources)
                   
                   if [ "$action" == "plan" ]; then
                     terraform plan -input=false
@@ -298,23 +293,18 @@ jobs:
                     terraform destroy -auto-approve -input=false
                     DESTROY_STATUS=$? # Captura o status do destroy
 
-                    # Se o destroy foi um sucesso (exit code 0), prossegue para deletar o state remoto e local
                     if [ $DESTROY_STATUS -eq 0 ]; then
-                        echo -e "${color}▶️ ${label} Destroy bem-sucedido. Removendo arquivo de state (TF_STATE) do S3...${NC}"
+                        echo -e "${color}▶️ ${label} Destroy bem-sucedido. Removendo state remoto do S3...${NC}"
                         
-                        # 1. Descobrir dinamicamente o Bucket e Key do S3 lendo o cache do Terraform
-                        if [ -f ".terraform/terraform.tfstate" ]; then
-                            BACKEND_TYPE=$(jq -r '.backend.type // empty' .terraform/terraform.tfstate)
-                            
-                            if [ "$BACKEND_TYPE" == "s3" ]; then
-                                S3_BUCKET=$(jq -r '.backend.config.bucket // empty' .terraform/terraform.tfstate)
-                                S3_KEY=$(jq -r '.backend.config.key // empty' .terraform/terraform.tfstate)
-                                
-                                if [ -n "$S3_BUCKET" ] && [ -n "$S3_KEY" ]; then
-                                    echo -e "${color}🗑️ ${label} Deletando remote state: s3://${S3_BUCKET}/${S3_KEY}${NC}"
-                                    aws s3 rm "s3://${S3_BUCKET}/${S3_KEY}" --profile backend || echo "⚠️ Aviso: Falha ao deletar arquivo no S3. Pode já ter sido excluído."
-                                fi
-                            fi
+                        # Monta a chave do S3 baseada no path (Pasta + Nome do arquivo de state)
+                        # Ajuste "terraform.tfstate" se o seu backend.tf usar outro nome final de arquivo
+                        S3_KEY="${path}/terraform.tfstate"
+                        
+                        if [ -n "$BACKEND_BUCKET" ]; then
+                            echo -e "${color}🗑️ ${label} Deletando arquivo: s3://${BACKEND_BUCKET}/${S3_KEY}${NC}"
+                            aws s3 rm "s3://${BACKEND_BUCKET}/${S3_KEY}" --profile backend || echo "⚠️ Aviso: Falha ao deletar arquivo no S3. Ele pode já ter sido excluído."
+                        else
+                            echo -e "${color}⚠️ ${label} Variável 'bucket' não encontrada no manifest.json. State remoto mantido.${NC}"
                         fi
 
                         # 2. Limpar arquivos locais
@@ -326,9 +316,9 @@ jobs:
                     fi
                   fi
               )
+
               return $?
           }
-
           # ==============================================================================
           # MAIN
           # ==============================================================================
@@ -352,6 +342,7 @@ jobs:
           # Exporta para ser visível dentro do subshell do terraform init
           export BACKEND_ROLE=$(jq -r '.backend_global_config.role_arn' "$MANIFEST_PATH")
           export BACKEND_REGION=$(jq -r '.backend_global_config.region' "$MANIFEST_PATH")
+          export BACKEND_BUCKET=$(jq -r '.backend_global_config.bucket // empty' "$MANIFEST_PATH")
 
           echo "⚡ Ação Global: $ACTION"
           echo "🔑 Configurando Backend Profile..."

@@ -296,15 +296,18 @@ jobs:
                     if [ $DESTROY_STATUS -eq 0 ]; then
                         echo -e "${color}▶️ ${label} Destroy bem-sucedido. Removendo state remoto do S3...${NC}"
                         
-                        # Monta a chave do S3 baseada no path (Pasta + Nome do arquivo de state)
-                        # Ajuste "terraform.tfstate" se o seu backend.tf usar outro nome final de arquivo
-                        S3_KEY="${path}/terraform.tfstate"
-                        
-                        if [ -n "$BACKEND_BUCKET" ]; then
-                            echo -e "${color}🗑️ ${label} Deletando arquivo: s3://${BACKEND_BUCKET}/${S3_KEY}${NC}"
-                            aws s3 rm "s3://${BACKEND_BUCKET}/${S3_KEY}" --profile backend || echo "⚠️ Aviso: Falha ao deletar arquivo no S3. Ele pode já ter sido excluído."
+                        # Extrai a Key EXATA (caminho + nome do arquivo) que o Terraform está usando
+                        if [ -f ".terraform/terraform.tfstate" ]; then
+                            S3_EXACT_KEY=$(jq -r '.backend.config.key // empty' .terraform/terraform.tfstate)
+                            
+                            if [ -n "$BACKEND_BUCKET" ] && [ -n "$S3_EXACT_KEY" ]; then
+                                echo -e "${color}🗑️ ${label} Deletando arquivo: s3://${BACKEND_BUCKET}/${S3_EXACT_KEY}${NC}"
+                                aws s3 rm "s3://${BACKEND_BUCKET}/${S3_EXACT_KEY}" --profile backend || echo "⚠️ Aviso: Falha ao deletar arquivo no S3."
+                            else
+                                echo -e "${color}⚠️ ${label} Bucket ou Key não encontrados. State remoto mantido.${NC}"
+                            fi
                         else
-                            echo -e "${color}⚠️ ${label} Variável 'bucket' não encontrada no manifest.json. State remoto mantido.${NC}"
+                             echo -e "${color}⚠️ ${label} Arquivo de cache do Terraform ausente. State remoto mantido.${NC}"
                         fi
 
                         # 2. Limpar arquivos locais

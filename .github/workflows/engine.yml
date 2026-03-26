@@ -287,9 +287,30 @@ jobs:
                   
                   if [ "$action" == "plan" ]; then
                     terraform plan -input=false
+                  
                   elif [ "$action" == "apply" ]; then
                     terraform apply -auto-approve -input=false
+                  
+                  # INÍCIO DA NOVA LÓGICA DE IMPORT
+                  elif [ "$action" == "import" ]; then
+                    echo -e "${color}📥 ${label} Gerando código HCL a partir dos blocos de import...${NC}"
+                    
+                    # 1. Limpa arquivo gerado anteriormente (se existir) para evitar conflitos
+                    rm -f generated_resources.tf
+                    
+                    # 2. Gera o código Terraform (HCL) baseado no arquivo de imports
+                    terraform plan -generate-config-out=generated_resources.tf -input=false
+                    
+                    echo -e "${color}💾 ${label} Aplicando import para salvar o State no S3...${NC}"
+                    # 3. O apply consolida o import e envia automaticamente o tfstate para o bucket S3
+                    terraform apply -auto-approve -input=false
+                    
+                    # 4. Cria uma flag temporária para avisar o Github Actions que precisamos commitar algo
+                    touch "$GITHUB_WORKSPACE/.needs_commit"
+                  # FIM DA LÓGICA DE IMPORT
+
                   elif [ "$action" == "destroy" ]; then
+
                     terraform destroy -auto-approve -input=false
                     DESTROY_STATUS=$? # Captura o status do destroy
 
@@ -434,4 +455,32 @@ jobs:
               fi
               echo "::endgroup::"
           done
+          
+      - name: 💾 Push Terraform Gerado (Import)
+        if: success()
+        shell: bash
+        run: |
+          # Verifica se a flag foi criada durante o step anterior
+          if [ -f "$GITHUB_WORKSPACE/.needs_commit" ]; then
+            echo "📥 Operação de import detectada. Salvando recursos gerados no repositório..."
+            
+            # Configura o bot do Github
+            git config --global user.name "github-actions[bot]"
+            git config --global user.email "github-actions[bot]@users.noreply.github.com"
+            
+            # Adiciona apenas os arquivos gerados pelo Terraform
+            git add ./**/generated_resources.tf
+            
+            # Checa se há algo para commitar
+            if git diff --staged --quiet; then
+              echo "Nenhuma mudança nova para commitar."
+            else
+              # IMPORTANTE: A tag [skip ci] evita que esse commit dispare o workflow novamente (loop infinito)
+              git commit -m "feat: código terraform gerado via import dinâmico [skip ci]"
+              git push
+              echo "✅ Código enviado para o repositório com sucesso!"
+            fi
+          else
+            echo "Nenhuma operação de import realizada nesta execução."
+          fi
           echo "✅ Pipeline finalizado."

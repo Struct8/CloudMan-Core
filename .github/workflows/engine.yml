@@ -293,26 +293,35 @@ jobs:
                   
                   # INÍCIO DA NOVA LÓGICA DE IMPORT (GERAÇÃO PARA REVISÃO)
                   elif [ "$action" == "import" ]; then
-                    echo -e "${color}📥 ${label} Gerando plano de importação em JSON...${NC}"
+                    echo -e "${color}📥 ${label} Gerando rascunho de importação...${NC}"
                     
-                    # 1. Limpeza preventiva para garantir que o Terraform consiga escrever os novos arquivos
+                    # 1. Limpeza preventiva absoluta
                     rm -f generated_resources.tf import.tfplan generated_resources.json
                     
-                    # 2. Tenta gerar o código HCL e o plano binário
-                    # Removido o '|| true' para que possamos validar o resultado
-                    terraform plan -generate-config-out=generated_resources.tf -out=import.tfplan -input=false
+                    # 2. Executa a geração. Usamos '|| true' aqui porque o gerador experimental 
+                    # quase sempre gera avisos ou erros de conflito que não devem travar o pipeline 
+                    # de geração de rascunho.
+                    terraform plan -generate-config-out=generated_resources.tf -out=import.tfplan -input=false || echo "⚠️ Aviso: O gerador encontrou conflitos no HCL, mas continuaremos para gerar o rascunho."
                     
-                    # 3. Valida se o plano foi realmente gerado
-                    if [ -f "import.tfplan" ]; then
-                        echo -e "${color}📄 Convertendo plano para JSON...${NC}"
-                        terraform show -json import.tfplan > generated_resources.json
+                    # 3. Verifica se pelo menos o arquivo .tf foi gerado (mesmo com erros de validação)
+                    if [ -f "generated_resources.tf" ]; then
+                        echo -e "${color}📄 Arquivo HCL gerado. Tentando converter para JSON para o Front-end...${NC}"
                         
-                        echo -e "${color}⏳ ${label} Arquivos gerados com sucesso para revisão.${NC}"
+                        # Tenta gerar o JSON. Se falhar por erro no plano, criamos um JSON básico de sinalização
+                        if terraform show -json import.tfplan > generated_resources.json 2>/dev/null; then
+                            echo -e "${color}✅ JSON gerado com sucesso.${NC}"
+                        else
+                            echo "{\"info\": \"O HCL foi gerado mas o plano contém erros de validação. Verifique o arquivo .tf manualmente.\"}" > generated_resources.json
+                            echo -e "${YELLOW}⚠️ Aviso: Não foi possível gerar o JSON detalhado devido a erros no plano.${NC}"
+                        fi
+                        
+                        echo -e "${color}⏳ ${label} Rascunhos disponíveis para revisão.${NC}"
                         touch "$GITHUB_WORKSPACE/.needs_commit"
                     else
-                        echo -e "${RED}❌ Erro Crítico: Falha ao gerar o arquivo de plano (import.tfplan).${NC}"
+                        echo -e "${RED}❌ Erro Crítico: O Terraform não conseguiu gerar nem o arquivo de rascunho .tf.${NC}"
                         exit 1
                     fi
+
 
                   elif [ "$action" == "destroy" ]; then
 

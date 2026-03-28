@@ -219,7 +219,21 @@ jobs:
               if [ "$provider" == "oci" ]; then color=$RED; fi
 
               (
-                  cd "$path"
+                  cd "$path" || { echo -e "${RED}❌ ERRO: Pasta não encontrada: $path${NC}"; exit 1; }
+
+                  # =========================================================
+                  # 🔍 DEBUG LOG: LISTANDO ARQUIVOS ANTES DO TERRAFORM
+                  # =========================================================
+                  echo -e "${CYAN}---------------------------------------------------${NC}"
+                  echo -e "${CYAN}🔎 [DEBUG] Verificando arquivos no runner (${path}):${NC}"
+                  echo -e "${CYAN}Caminho absoluto: $(pwd)${NC}"
+                  ls -la
+                  echo -e "${CYAN}---------------------------------------------------${NC}"
+          
+                  # ---------------------------------------------------------
+                  # PASSO 1: TERRAFORM INIT
+                  # ---------------------------------------------------------
+                  echo -e "${color}▶️ ${label} Inicializando Backend (State)...${NC}"
 
                   # ---------------------------------------------------------
                   # PASSO 1: TERRAFORM INIT

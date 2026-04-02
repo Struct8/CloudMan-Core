@@ -336,13 +336,6 @@ jobs:
                         exit 1
                     fi
 
-                    # Deleta o arquivo de instrução (import.tf) e o arquivo de saída (generated_resources.json)
-                    # Usamos o 'force' (-f) para evitar erros caso algum deles não tenha sido criado
-                    rm -f import.tf generated_resources.json
-                    
-                    # Se houver outros arquivos temporários que o Terraform gera no seu fluxo:
-                    rm -f temp.tf temp.tfplan 
-
                   elif [ "$action" == "destroy" ]; then
 
                     terraform destroy -auto-approve -input=false

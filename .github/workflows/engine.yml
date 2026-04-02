@@ -303,24 +303,9 @@ jobs:
                     terraform plan -input=false
                   
                   elif [ "$action" == "apply" ]; then
-                    echo -e "${color}🧹 ${label} Removendo arquivos de importação antes do apply para evitar conflitos...${NC}"
-                    
-                    # Remove os arquivos antes de iniciar o apply
-                    rm -f import.tf generated_resources.json
-                    
-                    # Sinaliza para o passo de Git que houve uma limpeza que precisa ser commitada
-                    touch "$GITHUB_WORKSPACE/.needs_cleanup"
-
                     echo -e "${color}▶️ ${label} Executando Terraform apply...${NC}"
                     terraform apply -auto-approve -input=false
                     APPLY_STATUS=$?
-
-                    if [ $APPLY_STATUS -eq 0 ]; then
-                        echo -e "${color}✅ ${label} Apply bem-sucedido.${NC}"
-                    else
-                        echo -e "${RED}❌ ${label} Falha no Apply.${NC}"
-                        return $APPLY_STATUS
-                    fi
                   
                   # INÍCIO DA NOVA LÓGICA DE IMPORT (GERAÇÃO PARA REVISÃO)
                   elif [ "$action" == "import" ]; then

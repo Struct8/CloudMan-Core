@@ -1,5 +1,4 @@
 #!/bin/bash
-# A correção está na linha abaixo: BASH_SOURCE[0] em vez de $0
 source $(dirname "${BASH_SOURCE[0]}")/utils.sh
 
 function auth_aws() {
@@ -26,15 +25,19 @@ function auth_aws() {
     local secret=$(echo $creds | jq -r '.Credentials.SecretAccessKey')
     local token=$(echo $creds | jq -r '.Credentials.SessionToken')
 
-    export AWS_ACCESS_KEY_ID="$key_id"
-    export AWS_SECRET_ACCESS_KEY="$secret"
-    export AWS_SESSION_TOKEN="$token"
-    export AWS_REGION="$region"
-    
-    if [ "$type" == "backend" ]; then
-        aws configure set aws_access_key_id "$key_id" --profile backend
-        aws configure set aws_secret_access_key "$secret" --profile backend
-        aws configure set aws_session_token "$token" --profile backend
-        aws configure set region "$region" --profile backend
+    # A SOLUÇÃO: Grava as credenciais em um profile nomeado dinamicamente (backend ou target)
+    aws configure set aws_access_key_id "$key_id" --profile "$type"
+    aws configure set aws_secret_access_key "$secret" --profile "$type"
+    aws configure set aws_session_token "$token" --profile "$type"
+    aws configure set region "$region" --profile "$type"
+
+    if [ "$type" == "target" ]; then
+        # Força os cloud providers do Terraform a usarem o profile "target"
+        export AWS_PROFILE="target"
+        export AWS_REGION="$region"
+        
+        # Garante que as variáveis engessadas não existam para não conflitar 
+        # com a comunicação do Backend S3 (que usará o profile "backend")
+        unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
     fi
 }

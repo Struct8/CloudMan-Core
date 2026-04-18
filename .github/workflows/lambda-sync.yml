@@ -73,7 +73,7 @@ jobs:
       - name: 📥 Checkout Engine Scripts
         uses: actions/checkout@v4
         with:
-          repository: CloudManPro/CloudMan-Core
+          repository: Struct8/CloudMan-Core
           path: '.engine'
 
       # 3. CONFIGURAR AWS

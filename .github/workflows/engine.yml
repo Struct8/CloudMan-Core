@@ -423,7 +423,7 @@ jobs:
           # ---------------------------------------------------------
           # DEPENDÊNCIAS EXTERNAS
           # ---------------------------------------------------------
-          EXTERNAL_REPOS=$(jq -c '.external_repositories // []' "$MANIFEST_PATH")
+                   EXTERNAL_REPOS=$(jq -c '.external_repositories // []' "$MANIFEST_PATH")
           if [ "$EXTERNAL_REPOS" != "[]" ] && [ "$EXTERNAL_REPOS" != "null" ]; then
               echo "📦 Analisando dependências externas..."
               echo "$EXTERNAL_REPOS" | jq -c '.[]' | while read -r repo; do
@@ -462,9 +462,35 @@ jobs:
                         git pull origin "$BRANCH"
                       )
                   fi
+
+                  # =========================================================
+                  # 🔎 [DEBUG] AUDITORIA DOS ARQUIVOS BAIXADOS
+                  # =========================================================
+                  echo -e "${YELLOW}=========================================================${NC}"
+                  echo -e "${YELLOW}🔎 AUDITORIA DE ARQUIVOS EXTERNOS: $REPO_NAME${NC}"
+                  echo -e "${YELLOW}=========================================================${NC}"
+                  
+                  echo "📂 Listando arquivos fisicamente presentes em $FULL_TARGET_DIR:"
+                  ls -laR "$FULL_TARGET_DIR" | grep -v "\.git" # Lista tudo recursivamente, ignorando a pasta oculta do git
+                  
+                  echo ""
+                  echo "📄 Lendo o conteúdo (primeiras 15 linhas) de cada arquivo injetado:"
+                  
+                  # Loop por cada arquivo listado no manifest.json (ex: scripts/loki.sh)
+                  for file in $FOLDERS; do
+                      FILE_PATH="$FULL_TARGET_DIR/$file"
+                      echo -e "${CYAN}---------------------------------------------------------${NC}"
+                      if [ -f "$FILE_PATH" ]; then
+                          echo -e "${GREEN}✅ ARQUIVO ENCONTRADO:${NC} $file"
+                          echo -e "📝 Conteúdo inicial:"
+                          head -n 15 "$FILE_PATH"
+                      else
+                          echo -e "${RED}❌ ERRO FATAL: Arquivo não existe no disco:${NC} $FILE_PATH"
+                      fi
+                      echo -e "${CYAN}---------------------------------------------------------${NC}"
+                  done
               done
           fi
-
           # ---------------------------------------------------------
           # EXECUÇÃO DOS ESTÁGIOS
           # ---------------------------------------------------------

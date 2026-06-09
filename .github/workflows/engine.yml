@@ -431,21 +431,36 @@ jobs:
                   ORG=$(echo "$repo" | jq -r '.org')
                   BRANCH=$(echo "$repo" | jq -r '.branch')
                   TARGET_DIR=$(echo "$repo" | jq -r '.target_dir')
+                  
+                  # Pega os caminhos exatos dos arquivos (ex: "scripts/grafana-web.sh scripts/loki.sh")
                   FOLDERS=$(echo "$repo" | jq -r '.folders | join(" ")')
                   FULL_TARGET_DIR="./$TARGET_DIR"
                   REPO_URL="https://x-access-token:${GH_CLONE_TOKEN}@github.com/${ORG}/${REPO_NAME}.git"
                   
-                  if [ ! -d "$FULL_TARGET_DIR" ]; then
-                      echo "⬇️  Iniciando Sparse-Checkout de $ORG/$REPO_NAME..."
+                  # VALIDAÇÃO CRÍTICA: Verifica se a pasta possui o .git interno
+                  if [ ! -d "$FULL_TARGET_DIR/.git" ]; then
+                      echo "⬇️  Iniciando Sparse-Checkout de arquivos específicos em $ORG/$REPO_NAME..."
+                      
+                      # Limpa a pasta se ela existir como diretório comum, evitando conflito
+                      rm -rf "$FULL_TARGET_DIR"
+                      
+                      # Faz o clone apenas das informações (sem baixar nenhum arquivo ainda)
                       git clone --depth 1 -b "$BRANCH" --filter=blob:none --no-checkout "$REPO_URL" "$FULL_TARGET_DIR"
                       cd "$FULL_TARGET_DIR"
-                      git sparse-checkout init --cone
-                      git sparse-checkout set $FOLDERS
+                      
+                      # IMPORTANTE: A flag --no-cone permite trabalhar a nível de arquivos isolados
+                      git sparse-checkout set --no-cone $FOLDERS
+                      
+                      # Baixa os arquivos específicos
                       git checkout "$BRANCH"
                       cd - > /dev/null
                   else
-                      echo "🔄 Atualizando pastas em $REPO_NAME..."
-                      (cd "$FULL_TARGET_DIR" && git sparse-checkout set $FOLDERS && git pull origin "$BRANCH")
+                      echo "🔄 Atualizando arquivos específicos em $REPO_NAME..."
+                      (
+                        cd "$FULL_TARGET_DIR" 
+                        git sparse-checkout set --no-cone $FOLDERS 
+                        git pull origin "$BRANCH"
+                      )
                   fi
               done
           fi

@@ -12,6 +12,10 @@ on:
     paths:
       - '**/manifest.json'
       - '**/main.tf'
+
+# >>> NOVO — Camada "concurrency": evita que duas runs do pipeline cheguem a
+# competir pelo mesmo lock. O GitHub enfileira a segunda run em vez de deixar
+# as duas rodarem juntas e brigarem pelo DynamoDB.
 concurrency:
   group: terraform-${{ github.repository }}-${{ github.ref }}
   cancel-in-progress: false
@@ -19,7 +23,7 @@ concurrency:
 permissions:
   id-token: write
   contents: write
-  actions: read
+  actions: read   # >>> NOVO — necessário para o `gh run view` usado no backstop de lock órfão
 
 jobs:
   deploy:
@@ -38,15 +42,15 @@ jobs:
         shell: bash
         run: |
           echo "🔍 Identificando qual pasta disparou o pipeline..."
-          
+
           # 1. Tenta achar o manifesto na pasta que teve o código alterado
           MANIFEST_PATH=$(git diff --name-only HEAD^ HEAD 2>/dev/null | grep "manifest.json" | head -n 1 || true)
-          
+
           # 2. Se for trigger manual ou não achar diff, pega o primeiro que encontrar (fallback)
           if [ -z "$MANIFEST_PATH" ] || [ ! -f "$MANIFEST_PATH" ]; then
             MANIFEST_PATH=$(find . -name "manifest.json" -not -path "*/.*" -print -quit)
           fi
-          
+
           echo "========================================================="
           echo "📂 [LOG DE CAMINHO] MANIFESTO SELECIONADO NA ANÁLISE:"
           echo "Caminho: ${MANIFEST_PATH:-Nenhum encontrado}"
@@ -71,21 +75,21 @@ jobs:
 
           EXTERNAL_REPOS=$(jq -c '.external_repositories // []' "$MANIFEST_PATH")
           NEEDS_ACCESS="false"
-          
+
           if [ "$EXTERNAL_REPOS" != "[]" ] && [ "$EXTERNAL_REPOS" != "null" ]; then
             echo "📦 Verificando visibilidade dos repositórios externos..."
-            
+
             while IFS= read -r repo; do
               ORG=$(echo "$repo" | jq -r '.org')
               REPO_NAME=$(echo "$repo" | jq -r '.repo_name')
-              
+
               echo "🔍 Checando API do GitHub para: $ORG/$REPO_NAME"
-              
+
               HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
                 -H "Authorization: Bearer $GITHUB_TOKEN" \
                 -H "Accept: application/vnd.github.v3+json" \
                 "https://api.github.com/repos/$ORG/$REPO_NAME")
-                
+
               if [ "$HTTP_STATUS" == "200" ]; then
                 echo "   ✅ Público (HTTP 200). Não requer token externo."
               else
@@ -99,7 +103,7 @@ jobs:
           fi
 
           echo "📊 Resultado da análise Gatekeeper: $NEEDS_ACCESS"
-          
+
           # SALVANDO NA MEMÓRIA PARA O RESTO DO PIPELINE
           echo "needs_private_access=$NEEDS_ACCESS" >> $GITHUB_OUTPUT
           echo "manifest_path=$MANIFEST_PATH" >> $GITHUB_OUTPUT
@@ -119,23 +123,23 @@ jobs:
           # 2. Pega o token OIDC do GitHub usando a audiência dinâmica
           ID_TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             "$ACTIONS_ID_TOKEN_REQUEST_URL&aud=$AUDIENCE" | jq -r '.value')
-          
+
           # 3. Faz a chamada POST para o API Gateway correto
           # Nota: O header Content-Type é obrigatório aqui!
           # E passei o github_repo de forma dinâmica também: ${{ github.repository }}
           RESPONSE=$(curl -s -X POST "$GATEKEEPER_URL" \
             -H "Content-Type: application/json" \
             -d "{
-              \"action\": \"exchange_oidc_for_token\", 
+              \"action\": \"exchange_oidc_for_token\",
               \"params\": {
-                \"oidc_token\": \"$ID_TOKEN\", 
+                \"oidc_token\": \"$ID_TOKEN\",
                 \"github_repo\": \"${{ github.repository }}\"
               }
             }")
-          
+
           # 4. Extrai o token do JSON de resposta
           TOKEN=$(echo $RESPONSE | jq -r .token)
-          
+
           if [ "$TOKEN" == "null" ] || [ -z "$TOKEN" ]; then
             echo "❌ Falha na autenticação ($STAGE). Resposta do AWS API Gateway: $RESPONSE"
             exit 1
@@ -169,28 +173,36 @@ jobs:
           GH_CLONE_TOKEN: ${{ steps.gatekeeper.outputs.token || secrets.GITHUB_TOKEN }}
           LOGIN_REGION: ${{ inputs.default_region || 'us-east-1' }}
           SECRETS_CONTEXT: ${{ toJSON(secrets) }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # >>> NOVO — autentica o `gh run view` do backstop (camada 4)
         run: |
           # ==============================================================================
           # CONFIGURAÇÕES E CORES
           # ==============================================================================
           set -o pipefail
+          export LC_ALL=C.UTF-8   # >>> NOVO — garante que `grep -P` (usado no backstop de lock) funcione, independente do locale padrão do runner
           BLUE='\033[0;34m'
           CYAN='\033[0;36m'
           GREEN='\033[0;32m'
           YELLOW='\033[0;33m'
           RED='\033[0;31m'
           NC='\033[0m'
+
+          # >>> NOVO — Camada "marcação de dono": grava no hostname do runner o ID
+          # desta run do Actions. O Terraform tira o campo Info.Who do lock de
+          # usuário@hostname (não existe flag pra injetar metadado direto), então
+          # esse truque deixa todo lock criado por este job identificável depois.
+          # Runners hospedados do GitHub têm sudo sem senha.
           RUN_TAG="gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           sudo hostname "$RUN_TAG" 2>/dev/null || true
+
           ENGINE_PATH=$(readlink -f .cloudman-engine)
           AUTH_SCRIPTS="$ENGINE_PATH/scripts/auth"
-          
+
           if [ ! -d "$AUTH_SCRIPTS" ]; then
               echo "❌ Erro Crítico: Pasta scripts/auth não encontrada"
               exit 1
           fi
-          
+
           chmod +x $AUTH_SCRIPTS/*.sh
           source "$AUTH_SCRIPTS/aws.sh"
 
@@ -202,50 +214,61 @@ jobs:
               echo "🔎 [DEBUG] Verificando identidade ($context):"
               if [ -n "$AWS_PROFILE" ]; then echo "   - AWS_PROFILE: $AWS_PROFILE"; else echo "   - AWS_PROFILE: (unset)"; fi
               if [ -n "$AWS_REGION" ]; then echo "   - AWS_REGION: $AWS_REGION"; else echo "   - AWS_REGION: (unset)"; fi
-              
+
               # Verifica identidade real (se tiver credenciais carregadas)
-                            aws sts get-caller-identity --query "Arn" --output text 2>/dev/null || echo "   - (Sem credenciais ativas no terminal)"
+              aws sts get-caller-identity --query "Arn" --output text 2>/dev/null || echo "   - (Sem credenciais ativas no terminal)"
               echo "---------------------------------------------------"
           }
 
+          # ==============================================================================
+          # >>> NOVO — FUNÇÃO: backstop verificado (camada 4).
+          # Só entra em ação se o terraform falhar por lock ativo. NUNCA destrava por
+          # idade/estimativa de tempo — só se a API do GitHub confirmar que a run dona
+          # do lock já terminou (fato, não chute). Se não conseguir identificar/confirmar
+          # a run dona, não mexe em nada e falha normalmente, igual ao comportamento atual.
+          # IMPORTANTE: usa `tee` pra manter o log do Terraform saindo ao vivo no
+          # console (streaming), em vez de só imprimir tudo de uma vez no final —
+          # sem isso, um destroy/apply demorado (ex. EKS) parece travado.
+          # ==============================================================================
           run_tf_with_stale_lock_recovery() {
-            local status lock_id who_str owner_run_id run_status
-            local output
-        
-            if output=$("$@" 2>&1); then
-                status=0
-            else
-                status=$?
-            fi
-            echo "$output"
-        
-            if [ $status -ne 0 ] && echo "$output" | grep -q "Error acquiring the state lock"; then
-                lock_id=$(echo "$output" | grep -oP '^\s*ID:\s+\K\S+'  | head -n1)
-                who_str=$(echo "$output" | grep -oP '^\s*Who:\s+\K.*' | head -n1)
-                owner_run_id=$(echo "$who_str" | grep -oP 'gh-\K[0-9]+')
-        
-                if [ -z "$owner_run_id" ]; then
-                    echo "🔒 Lock ativo, dono não é uma run do Actions (provável apply manual). Não mexo — falhando."
-                    return $status
-                fi
-        
-                echo "🔎 Lock pertence à run #$owner_run_id. Checando status real via API..."
-                run_status=$(gh run view "$owner_run_id" --json status --jq '.status' 2>/dev/null)
-        
-                if [ "$run_status" == "completed" ]; then
-                    echo "♻️  Run #$owner_run_id já terminou (confirmado via API). Forçando unlock e retentando..."
-                    terraform force-unlock -force "$lock_id"
-                    if output=$("$@" 2>&1); then
-                        status=0
-                    else
-                        status=$?
-                    fi
-                    echo "$output"
-                else
-                    echo "⏳ Run #$owner_run_id ainda está '$run_status' — lock real e ativo. Não mexo."
-                fi
-            fi
-            return $status
+              local status lock_id who_str owner_run_id run_status
+              local logfile
+              logfile=$(mktemp)
+
+              if "$@" 2>&1 | tee "$logfile"; then
+                  status=0
+              else
+                  status=${PIPESTATUS[0]}
+              fi
+
+              if [ $status -ne 0 ] && grep -q "Error acquiring the state lock" "$logfile"; then
+                  lock_id=$(grep -oP '^\s*ID:\s+\K\S+'  "$logfile" | head -n1)
+                  who_str=$(grep -oP '^\s*Who:\s+\K.*' "$logfile" | head -n1)
+                  owner_run_id=$(echo "$who_str" | grep -oP 'gh-\K[0-9]+')
+
+                  if [ -z "$owner_run_id" ]; then
+                      echo "🔒 Lock ativo, dono não é uma run do Actions (provável apply manual). Não mexo — falhando."
+                      rm -f "$logfile"
+                      return $status
+                  fi
+
+                  echo "🔎 Lock pertence à run #$owner_run_id. Checando status real via API..."
+                  run_status=$(gh run view "$owner_run_id" --json status --jq '.status' 2>/dev/null)
+
+                  if [ "$run_status" == "completed" ]; then
+                      echo "♻️  Run #$owner_run_id já terminou (confirmado via API). Forçando unlock e retentando..."
+                      terraform force-unlock -force "$lock_id"
+                      if "$@" 2>&1 | tee "$logfile"; then
+                          status=0
+                      else
+                          status=${PIPESTATUS[0]}
+                      fi
+                  else
+                      echo "⏳ Run #$owner_run_id ainda está '$run_status' — lock real e ativo. Não mexo."
+                  fi
+              fi
+              rm -f "$logfile"
+              return $status
           }
 
           # ==============================================================================
@@ -257,7 +280,7 @@ jobs:
               local auth_json=$3
               local provider=$4
               local label="[$path]"
-              
+
               local color=$BLUE
               if [ "$provider" == "azure" ]; then color=$CYAN; fi
               if [ "$provider" == "cloudflare" ]; then color=$GREEN; fi
@@ -275,7 +298,7 @@ jobs:
                   echo -e "${CYAN}Caminho absoluto: $(pwd)${NC}"
                   ls -la
                   echo -e "${CYAN}---------------------------------------------------${NC}"
-          
+
                   # ---------------------------------------------------------
                   # PASSO 1: TERRAFORM INIT
                   # ---------------------------------------------------------
@@ -285,7 +308,7 @@ jobs:
                   # PASSO 1: TERRAFORM INIT
                   # ---------------------------------------------------------
                   echo -e "${color}▶️ ${label} Inicializando Backend (State)...${NC}"
-                  
+
                   # Limpa ambiente para garantir que o Init use apenas o profile
                   unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_REGION
 
@@ -294,7 +317,7 @@ jobs:
                   # Isso força o Terraform a salvar no .terraform/terraform.tfstate que
                   # ele DEVE usar o profile 'backend' para operações de estado (S3/Dynamo),
                   # ignorando as variáveis de ambiente que vamos carregar no passo 2.
-                  
+
                   terraform init -reconfigure -input=false \
                       -backend-config="profile=backend" \
                       -backend-config="region=$BACKEND_REGION"
@@ -302,17 +325,17 @@ jobs:
                   # ---------------------------------------------------------
                   # PASSO 2: PREPARAÇÃO DO TARGET
                   # ---------------------------------------------------------
-                  
+
                   # Cloudflare handling
                   if [ "$provider" == "cloudflare" ]; then
                       # Prioriza o secret_name vindo do manifest, se não existir, usa o fallback antigo
                       local secret_key=$(echo "$auth_json" | jq -r '.secret_name // empty')
-                      
+
                       if [ -z "$secret_key" ]; then
                           local acc_id=$(echo "$auth_json" | jq -r '.account_id')
                           secret_key="AUTH_CLOUDFLARE_${acc_id}"
                       fi
-                  
+
                       echo "🔑 Buscando Secret: $secret_key"
                       local token=$(echo "$SECRETS_CONTEXT" | jq -r --arg key "$secret_key" '.[$key]')
 
@@ -322,14 +345,14 @@ jobs:
                       fi
                       export CLOUDFLARE_API_TOKEN="$token"
                   fi
-                  
+
                   local script_file="$AUTH_SCRIPTS/${provider}.sh"
-                  
+
                   if [ -f "$script_file" ]; then
                       echo "🔶 Autenticando $provider (target)..."
                       source "$script_file"
                       "auth_${provider}" "$auth_json" "target"
-                      
+
                       # Debug: Mostra que agora estamos logados como TARGET
                       if [ "$provider" == "aws" ]; then
                           debug_auth_status "TARGET AUTH"
@@ -344,31 +367,31 @@ jobs:
                   # PASSO 3: EXECUÇÃO DO TERRAFORM
                   # ---------------------------------------------------------
                   echo -e "${color}▶️ ${label} Executando Terraform $action...${NC}"
-                  
+
                   if [ "$action" == "plan" ]; then
                     run_tf_with_stale_lock_recovery terraform plan -input=false
-                  
+
                   elif [ "$action" == "apply" ]; then
                     echo -e "${color}▶️ ${label} Executando Terraform apply...${NC}"
                     run_tf_with_stale_lock_recovery terraform apply -auto-approve -input=false
                     APPLY_STATUS=$?
-                  
+
                   # INÍCIO DA NOVA LÓGICA DE IMPORT (GERAÇÃO PARA REVISÃO)
                   elif [ "$action" == "import" ]; then
                     echo -e "${color}📥 ${label} Gerando rascunho de importação...${NC}"
-                    
+
                     # 1. Limpeza preventiva absoluta
                     rm -f generated_resources.tf import.tfplan generated_resources.json
-                    
-                    # 2. Executa a geração. Usamos '|| true' aqui porque o gerador experimental 
-                    # quase sempre gera avisos ou erros de conflito que não devem travar o pipeline 
+
+                    # 2. Executa a geração. Usamos '|| true' aqui porque o gerador experimental
+                    # quase sempre gera avisos ou erros de conflito que não devem travar o pipeline
                     # de geração de rascunho.
                     terraform plan -generate-config-out=generated_resources.tf -out=import.tfplan -input=false || echo "⚠️ Aviso: O gerador encontrou conflitos no HCL, mas continuaremos para gerar o rascunho."
-                    
+
                     # 3. Verifica se pelo menos o arquivo .tf foi gerado (mesmo com erros de validação)
                     if [ -f "generated_resources.tf" ]; then
                         echo -e "${color}📄 Arquivo HCL gerado. Tentando converter para JSON para o Front-end...${NC}"
-                        
+
                         # Tenta gerar o JSON. Se falhar por erro no plano, criamos um JSON básico de sinalização
                         if terraform show -json import.tfplan > generated_resources.json 2>/dev/null; then
                             echo -e "${color}✅ JSON gerado com sucesso.${NC}"
@@ -376,7 +399,7 @@ jobs:
                             echo "{\"info\": \"O HCL foi gerado mas o plano contém erros de validação. Verifique o arquivo .tf manualmente.\"}" > generated_resources.json
                             echo -e "${YELLOW}⚠️ Aviso: Não foi possível gerar o JSON detalhado devido a erros no plano.${NC}"
                         fi
-                        
+
                         echo -e "${color}⏳ ${label} Rascunhos disponíveis para revisão.${NC}"
                         touch "$GITHUB_WORKSPACE/.needs_commit"
                     else
@@ -391,21 +414,24 @@ jobs:
 
                     if [ $DESTROY_STATUS -eq 0 ]; then
                         echo -e "${color}▶️ ${label} Destroy bem-sucedido. Iniciando limpeza do Backend Remoto...${NC}"
-                        
+
                         # Extrai a Key EXATA e a Tabela do DynamoDB que o Terraform está usando
                         if [ -f ".terraform/terraform.tfstate" ]; then
                             S3_EXACT_KEY=$(jq -r '.backend.config.key // empty' .terraform/terraform.tfstate)
                             DYNAMODB_TABLE=$(jq -r '.backend.config.dynamodb_table // empty' .terraform/terraform.tfstate)
-                            
+
                             if [ -n "$BACKEND_BUCKET" ] && [ -n "$S3_EXACT_KEY" ]; then
                                 # 1. REMOVE DO S3 (Para a lógica de HEAD request do CloudMan funcionar)
                                 echo -e "${color}🗑️ ${label} Deletando arquivo: s3://${BACKEND_BUCKET}/${S3_EXACT_KEY}${NC}"
                                 aws s3 rm "s3://${BACKEND_BUCKET}/${S3_EXACT_KEY}" --profile backend || echo "⚠️ Aviso: Falha ao deletar arquivo no S3."
-                                
+
                                 # 2. REMOVE DO DYNAMODB (Para o Terraform não quebrar no próximo Apply)
                                 if [ -n "$DYNAMODB_TABLE" ] && [ "$DYNAMODB_TABLE" != "null" ]; then
                                     echo -e "${color}🔓 ${label} Removendo Lock do DynamoDB (Tabela: ${DYNAMODB_TABLE})...${NC}"
 
+                                    # >>> NOVO — o LockID real do Terraform é "<bucket>/<key>" (SEM sufixo).
+                                    # O "-md5" abaixo é só o cache de checksum de consistência do S3, não é
+                                    # o lock em si — por isso apagamos os dois agora, não só o -md5.
                                     aws dynamodb delete-item \
                                         --table-name "$DYNAMODB_TABLE" \
                                         --key "{\"LockID\": {\"S\": \"${BACKEND_BUCKET}/${S3_EXACT_KEY}\"}}" \
@@ -414,7 +440,7 @@ jobs:
 
                                     # O padrão de LockID do Terraform no S3 é sempre: <bucket>/<key>-md5
                                     LOCK_ID="${BACKEND_BUCKET}/${S3_EXACT_KEY}-md5"
-                                    
+
                                     aws dynamodb delete-item \
                                         --table-name "$DYNAMODB_TABLE" \
                                         --key "{\"LockID\": {\"S\": \"$LOCK_ID\"}}" \
@@ -443,10 +469,10 @@ jobs:
           # ==============================================================================
           # MAIN
           # ==============================================================================
-          
+
           # RESGATANDO O CAMINHO SALVO NA MEMÓRIA DO PASSO 1
           MANIFEST_PATH="${{ steps.manifest_check.outputs.manifest_path }}"
-          
+
           # LOG CLARO PARA DEPURAÇÃO
           echo "========================================================="
           echo "📂 [LOG DE CAMINHO] MANIFESTO RECUPERADO PARA EXECUÇÃO:"
@@ -459,7 +485,7 @@ jobs:
           fi
 
           ACTION=$(jq -r '.action // "apply"' "$MANIFEST_PATH")
-          
+
           # Exporta para ser visível dentro do subshell do terraform init
           export BACKEND_ROLE=$(jq -r '.backend_global_config.role_arn' "$MANIFEST_PATH")
           export BACKEND_REGION=$(jq -r '.backend_global_config.region' "$MANIFEST_PATH")
@@ -467,7 +493,7 @@ jobs:
 
           echo "⚡ Ação Global: $ACTION"
           echo "🔑 Configurando Backend Profile..."
-          
+
           # Cria o profile [backend] em ~/.aws/credentials
           auth_aws "{\"role_arn\": \"$BACKEND_ROLE\", \"region\": \"$BACKEND_REGION\"}" "backend"
           debug_auth_status "BACKEND PROFILE CRIADO"
@@ -486,7 +512,7 @@ jobs:
                   FOLDERS=$(echo "$repo" | jq -r '.folders | join(" ")')
                   FULL_TARGET_DIR="./$TARGET_DIR"
                   REPO_URL="https://x-access-token:${GH_CLONE_TOKEN}@github.com/${ORG}/${REPO_NAME}.git"
-                  
+
                   if [ ! -d "$FULL_TARGET_DIR" ]; then
                       echo "⬇️  Iniciando Sparse-Checkout de $ORG/$REPO_NAME..."
                       git clone --depth 1 -b "$BRANCH" --filter=blob:none --no-checkout "$REPO_URL" "$FULL_TARGET_DIR"
@@ -521,7 +547,7 @@ jobs:
                   path=$(echo "$state" | jq -r '.path')
                   provider=$(echo "$state" | jq -r '.provider')
                   target_auth=$(echo "$state" | jq -c '.target_auth')
-                  
+
                   if [ ! -d "$path" ]; then
                        echo "⚠️  Diretório $path não existe. Pulando."
                        continue
@@ -553,6 +579,17 @@ jobs:
               echo "::endgroup::"
           done
 
+      # >>> NOVO — STEP INTEIRO. Camada que resolve de verdade o caso principal
+      # (apply/destroy cancelado ou com timeout). É um step SEPARADO, que só roda
+      # depois que o step anterior já foi morto pelo GitHub Actions (SIGINT em t=0,
+      # SIGTERM em t=7.5s, SIGKILL em t=10s — e nesse intervalo um trap dentro do
+      # mesmo step não dá tempo de rodar, porque o bash fica bloqueado esperando o
+      # terraform terminar e só processa o trap depois que o filho sai). Rodando
+      # como step à parte, com `if: always()`, ele ganha minutos de orçamento em vez
+      # de segundos, e o workspace (arquivos .terraform/terraform.tfstate de cada
+      # path) continua disponível porque é o mesmo runner/job.
+      # Só apaga o lock se confirmar que ele pertence a ESTA run (via o RUN_TAG
+      # gravado no hostname lá em cima) — nunca um delete às cegas.
       - name: 🔓 Liberar locks órfãos após cancelamento/timeout
         if: always() && !success()
         shell: bash
@@ -566,7 +603,7 @@ jobs:
           jq -c '.pipeline_stages[].states[]' "$MANIFEST_PATH" | while read -r state; do
               path=$(echo "$state" | jq -r '.path')
               cache_file="$path/.terraform/terraform.tfstate"
-              [ -f "$cache_file" ] || continue
+              [ -f "$cache_file" ] || continue   # esse path nem chegou a dar init
 
               bucket=$(jq -r '.backend.config.bucket // empty' "$cache_file")
               key=$(jq -r '.backend.config.key // empty' "$cache_file")
@@ -592,19 +629,18 @@ jobs:
           done
 
       - name: 💾 Push / Cleanup GitOps State
-
         if: success()
         shell: bash
         run: |
           # Configura o bot do Github
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          
+
           # 1. LÓGICA DO PASSO 2 (GERAÇÃO DE IMPORT)
           if [ -f "$GITHUB_WORKSPACE/.needs_commit" ]; then
             echo "📥 Operação de import detectada. Salvando recursos gerados no repositório..."
             git add ./**/generated_resources.json
-            
+
             if ! git diff --staged --quiet; then
               git commit -m "chore: código terraform gerado aguardando revisão do CloudMan [skip ci]"
               git push
@@ -615,10 +651,10 @@ jobs:
           # 2. LÓGICA DO PASSO 4 (LIMPEZA PÓS-APPLY)
           if [ -f "$GITHUB_WORKSPACE/.needs_cleanup" ]; then
             echo "🧹 Operação de apply finalizada. Removendo arquivos de importação do repositório..."
-            
+
             # O parâmetro -u no git add pega arquivos que foram deletados
             git add -u ./**/import.tf ./**/generated_resources.json ./**/generated_resources.tf 2>/dev/null || true
-            
+
             if ! git diff --staged --quiet; then
               git commit -m "chore: cleanup import.tf and json after successful apply [skip ci]"
               git push
@@ -627,5 +663,5 @@ jobs:
               echo "Nenhum arquivo residual para limpar no Git."
             fi
           fi
-          
+
           echo "✅ Pipeline finalizado."

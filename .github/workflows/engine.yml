@@ -209,34 +209,43 @@ jobs:
           }
 
           run_tf_with_stale_lock_recovery() {
-              local output status lock_id who_str owner_run_id run_status
-
-              output=$("$@" 2>&1); status=$?
-              echo "$output"
-
-              if [ $status -ne 0 ] && echo "$output" | grep -q "Error acquiring the state lock"; then
-                  lock_id=$(echo "$output" | grep -oP '^\s*ID:\s+\K\S+'  | head -n1)
-                  who_str=$(echo "$output" | grep -oP '^\s*Who:\s+\K.*' | head -n1)
-                  owner_run_id=$(echo "$who_str" | grep -oP 'gh-\K[0-9]+')
-
-                  if [ -z "$owner_run_id" ]; then
-                      echo "🔒 Lock ativo, dono não é uma run do Actions (provável apply manual). Não mexo — falhando."
-                      return $status
-                  fi
-
-                  echo "🔎 Lock pertence à run #$owner_run_id. Checando status real via API..."
-                  run_status=$(gh run view "$owner_run_id" --json status --jq '.status' 2>/dev/null)
-
-                  if [ "$run_status" == "completed" ]; then
-                      echo "♻️  Run #$owner_run_id já terminou (confirmado via API). Forçando unlock e retentando..."
-                      terraform force-unlock -force "$lock_id"
-                      output=$("$@" 2>&1); status=$?
-                      echo "$output"
-                  else
-                      echo "⏳ Run #$owner_run_id ainda está '$run_status' — lock real e ativo. Não mexo."
-                  fi
-              fi
-              return $status
+            local status lock_id who_str owner_run_id run_status
+            local output
+        
+            if output=$("$@" 2>&1); then
+                status=0
+            else
+                status=$?
+            fi
+            echo "$output"
+        
+            if [ $status -ne 0 ] && echo "$output" | grep -q "Error acquiring the state lock"; then
+                lock_id=$(echo "$output" | grep -oP '^\s*ID:\s+\K\S+'  | head -n1)
+                who_str=$(echo "$output" | grep -oP '^\s*Who:\s+\K.*' | head -n1)
+                owner_run_id=$(echo "$who_str" | grep -oP 'gh-\K[0-9]+')
+        
+                if [ -z "$owner_run_id" ]; then
+                    echo "🔒 Lock ativo, dono não é uma run do Actions (provável apply manual). Não mexo — falhando."
+                    return $status
+                fi
+        
+                echo "🔎 Lock pertence à run #$owner_run_id. Checando status real via API..."
+                run_status=$(gh run view "$owner_run_id" --json status --jq '.status' 2>/dev/null)
+        
+                if [ "$run_status" == "completed" ]; then
+                    echo "♻️  Run #$owner_run_id já terminou (confirmado via API). Forçando unlock e retentando..."
+                    terraform force-unlock -force "$lock_id"
+                    if output=$("$@" 2>&1); then
+                        status=0
+                    else
+                        status=$?
+                    fi
+                    echo "$output"
+                else
+                    echo "⏳ Run #$owner_run_id ainda está '$run_status' — lock real e ativo. Não mexo."
+                fi
+            fi
+            return $status
           }
 
           # ==============================================================================

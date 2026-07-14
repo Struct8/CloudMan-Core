@@ -12,10 +12,14 @@ on:
     paths:
       - '**/manifest.json'
       - '**/main.tf'
+concurrency:
+  group: terraform-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   id-token: write
-  contents: write 
+  contents: write
+  actions: read
 
 jobs:
   deploy:
@@ -165,6 +169,7 @@ jobs:
           GH_CLONE_TOKEN: ${{ steps.gatekeeper.outputs.token || secrets.GITHUB_TOKEN }}
           LOGIN_REGION: ${{ inputs.default_region || 'us-east-1' }}
           SECRETS_CONTEXT: ${{ toJSON(secrets) }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # ==============================================================================
           # CONFIGURAÇÕES E CORES
@@ -176,7 +181,8 @@ jobs:
           YELLOW='\033[0;33m'
           RED='\033[0;31m'
           NC='\033[0m'
-
+          RUN_TAG="gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          sudo hostname "$RUN_TAG" 2>/dev/null || true
           ENGINE_PATH=$(readlink -f .cloudman-engine)
           AUTH_SCRIPTS="$ENGINE_PATH/scripts/auth"
           
@@ -198,8 +204,39 @@ jobs:
               if [ -n "$AWS_REGION" ]; then echo "   - AWS_REGION: $AWS_REGION"; else echo "   - AWS_REGION: (unset)"; fi
               
               # Verifica identidade real (se tiver credenciais carregadas)
-              aws sts get-caller-identity --query "Arn" --output text 2>/dev/null || echo "   - (Sem credenciais ativas no terminal)"
+                            aws sts get-caller-identity --query "Arn" --output text 2>/dev/null || echo "   - (Sem credenciais ativas no terminal)"
               echo "---------------------------------------------------"
+          }
+
+          run_tf_with_stale_lock_recovery() {
+              local output status lock_id who_str owner_run_id run_status
+
+              output=$("$@" 2>&1); status=$?
+              echo "$output"
+
+              if [ $status -ne 0 ] && echo "$output" | grep -q "Error acquiring the state lock"; then
+                  lock_id=$(echo "$output" | grep -oP '^\s*ID:\s+\K\S+'  | head -n1)
+                  who_str=$(echo "$output" | grep -oP '^\s*Who:\s+\K.*' | head -n1)
+                  owner_run_id=$(echo "$who_str" | grep -oP 'gh-\K[0-9]+')
+
+                  if [ -z "$owner_run_id" ]; then
+                      echo "🔒 Lock ativo, dono não é uma run do Actions (provável apply manual). Não mexo — falhando."
+                      return $status
+                  fi
+
+                  echo "🔎 Lock pertence à run #$owner_run_id. Checando status real via API..."
+                  run_status=$(gh run view "$owner_run_id" --json status --jq '.status' 2>/dev/null)
+
+                  if [ "$run_status" == "completed" ]; then
+                      echo "♻️  Run #$owner_run_id já terminou (confirmado via API). Forçando unlock e retentando..."
+                      terraform force-unlock -force "$lock_id"
+                      output=$("$@" 2>&1); status=$?
+                      echo "$output"
+                  else
+                      echo "⏳ Run #$owner_run_id ainda está '$run_status' — lock real e ativo. Não mexo."
+                  fi
+              fi
+              return $status
           }
 
           # ==============================================================================
@@ -300,11 +337,11 @@ jobs:
                   echo -e "${color}▶️ ${label} Executando Terraform $action...${NC}"
                   
                   if [ "$action" == "plan" ]; then
-                    terraform plan -input=false
+                    run_tf_with_stale_lock_recovery terraform plan -input=false
                   
                   elif [ "$action" == "apply" ]; then
                     echo -e "${color}▶️ ${label} Executando Terraform apply...${NC}"
-                    terraform apply -auto-approve -input=false
+                    run_tf_with_stale_lock_recovery terraform apply -auto-approve -input=false
                     APPLY_STATUS=$?
                   
                   # INÍCIO DA NOVA LÓGICA DE IMPORT (GERAÇÃO PARA REVISÃO)
@@ -340,7 +377,7 @@ jobs:
 
                   elif [ "$action" == "destroy" ]; then
 
-                    terraform destroy -auto-approve -input=false
+                    run_tf_with_stale_lock_recovery terraform destroy -auto-approve -input=false
                     DESTROY_STATUS=$? # Captura o status do destroy
 
                     if [ $DESTROY_STATUS -eq 0 ]; then
@@ -359,7 +396,13 @@ jobs:
                                 # 2. REMOVE DO DYNAMODB (Para o Terraform não quebrar no próximo Apply)
                                 if [ -n "$DYNAMODB_TABLE" ] && [ "$DYNAMODB_TABLE" != "null" ]; then
                                     echo -e "${color}🔓 ${label} Removendo Lock do DynamoDB (Tabela: ${DYNAMODB_TABLE})...${NC}"
-                                    
+
+                                    aws dynamodb delete-item \
+                                        --table-name "$DYNAMODB_TABLE" \
+                                        --key "{\"LockID\": {\"S\": \"${BACKEND_BUCKET}/${S3_EXACT_KEY}\"}}" \
+                                        --region "$BACKEND_REGION" \
+                                        --profile backend || echo "⚠️ Aviso: Falha ao deletar o lock real (ou já não existia)."
+
                                     # O padrão de LockID do Terraform no S3 é sempre: <bucket>/<key>-md5
                                     LOCK_ID="${BACKEND_BUCKET}/${S3_EXACT_KEY}-md5"
                                     
@@ -500,8 +543,47 @@ jobs:
               fi
               echo "::endgroup::"
           done
-          
+
+      - name: 🔓 Liberar locks órfãos após cancelamento/timeout
+        if: always() && !success()
+        shell: bash
+        env:
+          RUN_TAG: "gh-${{ github.run_id }}-${{ github.run_attempt }}"
+          DEFAULT_REGION: ${{ inputs.default_region || 'us-east-1' }}
+        run: |
+          MANIFEST_PATH="${{ steps.manifest_check.outputs.manifest_path }}"
+          [ -f "$MANIFEST_PATH" ] || exit 0
+
+          jq -c '.pipeline_stages[].states[]' "$MANIFEST_PATH" | while read -r state; do
+              path=$(echo "$state" | jq -r '.path')
+              cache_file="$path/.terraform/terraform.tfstate"
+              [ -f "$cache_file" ] || continue
+
+              bucket=$(jq -r '.backend.config.bucket // empty' "$cache_file")
+              key=$(jq -r '.backend.config.key // empty' "$cache_file")
+              table=$(jq -r '.backend.config.dynamodb_table // empty' "$cache_file")
+              region=$(jq -r '.backend.config.region // empty' "$cache_file")
+              [ -n "$bucket" ] && [ -n "$key" ] && [ -n "$table" ] || continue
+
+              item=$(aws dynamodb get-item \
+                  --table-name "$table" \
+                  --key "{\"LockID\": {\"S\": \"${bucket}/${key}\"}}" \
+                  --region "${region:-$DEFAULT_REGION}" --profile backend 2>/dev/null)
+
+              who=$(echo "$item" | jq -r '.Item.Info.S // empty' | jq -r '.Who // empty' 2>/dev/null)
+
+              if [ "$who" == "runner@${RUN_TAG}" ]; then
+                  echo "🔓 Lock em ${bucket}/${key} é desta run (${RUN_TAG}). Liberando..."
+                  aws dynamodb delete-item --table-name "$table" \
+                      --key "{\"LockID\": {\"S\": \"${bucket}/${key}\"}}" \
+                      --region "${region:-$DEFAULT_REGION}" --profile backend
+              elif [ -n "$who" ]; then
+                  echo "ℹ️  Lock em ${bucket}/${key} pertence a '${who}' — não é meu, não mexo."
+              fi
+          done
+
       - name: 💾 Push / Cleanup GitOps State
+
         if: success()
         shell: bash
         run: |

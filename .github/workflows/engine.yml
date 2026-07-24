@@ -230,12 +230,12 @@ jobs:
           # console (streaming), em vez de só imprimir tudo de uma vez no final —
           # sem isso, um destroy/apply demorado (ex. EKS) parece travado.
           # ==============================================================================
-          run_tf_with_stale_lock_recovery() {
+                    run_tf_with_stale_lock_recovery() {
               local status lock_id who_str owner_run_id run_status
               local logfile
               logfile=$(mktemp)
 
-              if "$@" 2>&1 | tee "$logfile"; then
+              if "$@" 2>&1 | stdbuf -oL tee "$logfile"; then
                   status=0
               else
                   status=${PIPESTATUS[0]}
@@ -258,7 +258,7 @@ jobs:
                   if [ "$run_status" == "completed" ]; then
                       echo "♻️  Run #$owner_run_id já terminou (confirmado via API). Forçando unlock e retentando..."
                       terraform force-unlock -force "$lock_id"
-                      if "$@" 2>&1 | tee "$logfile"; then
+                      if "$@" 2>&1 | stdbuf -oL tee "$logfile"; then
                           status=0
                       else
                           status=${PIPESTATUS[0]}

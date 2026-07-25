@@ -180,6 +180,31 @@ jobs:
           # ==============================================================================
           set -o pipefail
           export LC_ALL=C.UTF-8   # >>> NOVO — garante que `grep -P` (usado no backstop de lock) funcione, independente do locale padrão do runner
+
+          # ==============================================================================
+          # >>> DIAGNÓSTICO (temporário) — 3 instrumentos pra descobrir POR QUE o log
+          # às vezes não aparece ao vivo. Remover quando a causa estiver identificada.
+          #
+          # 1) BANNER DE VERSÃO: prova QUAL engine.yml realmente rodou. Se o banner não
+          #    aparecer no log, a run está usando uma versão antiga/outro repo, e
+          #    nenhuma mudança nossa está chegando na produção.
+          # 2) HEARTBEAT: imprime uma linha a cada 15s durante TODO o step, em paralelo
+          #    ao terraform. É o teste decisivo:
+          #      - heartbeat aparece ao vivo mas terraform não  -> problema no terraform/pipe
+          #      - NEM o heartbeat aparece ao vivo              -> não é o script; é a
+          #        entrega do Actions ou o navegador (extensão/adblock bloqueando o
+          #        streaming). Nesse caso mexer no YAML nunca vai resolver.
+          # 3) (no _stream_cmd) carimbo de hora por linha do terraform: comparar com o
+          #    "Show timestamps" do GitHub revela se houve retenção no caminho.
+          # ==============================================================================
+          ENGINE_BUILD="2026-07-25 / dbf027d+diag"
+          echo "🏷️  engine.yml build: $ENGINE_BUILD"
+          echo "🕐 início do step: $(date -u '+%H:%M:%S') UTC"
+
+          ( while true; do echo "⏱️  [heartbeat] $(date -u '+%H:%M:%S')Z — step vivo"; sleep 15; done ) &
+          HEARTBEAT_PID=$!
+          trap 'kill $HEARTBEAT_PID 2>/dev/null' EXIT
+
           BLUE='\033[0;34m'
           CYAN='\033[0;36m'
           GREEN='\033[0;32m'
@@ -246,7 +271,19 @@ jobs:
               local logfile="./.cloudman-live.log"
               : > "$logfile"   # zera o log deste comando
 
-              "$@" 2>&1 | stdbuf -oL tee "$logfile"
+              # ORDEM IMPORTA: o tee grava o arquivo CRU (sem carimbo) porque o grep de
+              # lock mais abaixo casa em '^\s*ID:' / '^\s*Who:' — um prefixo quebraria.
+              # O carimbo de hora entra depois, só no console.
+              # Usa printf BUILTIN do bash ('%(...)T', bash 4.2+) de propósito: nada de
+              # awk aqui — no runner Ubuntu o /usr/bin/awk é o mawk, que pode não ter
+              # strftime; se o awk morresse, a saída do terraform sumiria INTEIRA.
+              # printf builtin não bufferiza, então a saída segue linha a linha.
+              # >>> DIAGNÓSTICO temporário: comparar este carimbo (hora em que o script
+              # produziu a linha) com o "Show timestamps" do GitHub (hora em que o runner
+              # entregou) mostra se houve retenção no caminho. Iguais = sem buffer.
+              "$@" 2>&1 \
+                  | stdbuf -oL tee "$logfile" \
+                  | while IFS= read -r _line; do printf '%(%H:%M:%S)T | %s\n' -1 "$_line"; done
               return ${PIPESTATUS[0]}
           }
 

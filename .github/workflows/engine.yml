@@ -558,7 +558,17 @@ jobs:
               IS_PARALLEL=$(jq -r ".pipeline_stages[$i].parallel_execution" "$MANIFEST_PATH")
               STATES_JSON=$(jq -c ".pipeline_stages[$i].states[]" "$MANIFEST_PATH")
 
-              echo "::group::🚀 Estágio: $STAGE_NAME"
+              # >>> NÃO usar "::group::" aqui. O `::group::` renderiza a seção RECOLHIDA
+              # por padrão no painel do Actions — como todo o terraform (init/plan/apply/
+              # destroy) rodava dentro dele, o log ficava escondido atrás de uma dobra
+              # fechada durante TODA a execução. Em stage curto o grupo fechava rápido e
+              # dava a impressão de funcionar; em stage longo (EKS, minutos) nunca
+              # aparecia nada ao vivo — exatamente quando mais se precisa acompanhar.
+              # Separador simples = output sempre visível, sem depender de dobra.
+              echo ""
+              echo "=========================================================="
+              echo "🚀 Estágio: $STAGE_NAME"
+              echo "=========================================================="
 
               pids=""
               failed=0
@@ -596,7 +606,8 @@ jobs:
                   echo "::error::Falha no estágio $STAGE_NAME"
                   exit 1
               fi
-              echo "::endgroup::"
+
+              echo "✅ Estágio concluído: $STAGE_NAME"
           done
 
       # >>> NOVO — STEP INTEIRO. Camada que resolve de verdade o caso principal

@@ -222,7 +222,10 @@ jobs:
 
           # ==============================================================================
           # >>> HELPER: espelha a saída de um comando no console EM TEMPO REAL e num
-          # arquivo (o arquivo serve pro grep de lock e pro dump pós-cancelamento).
+          # arquivo (o arquivo serve SÓ pro grep de "Error acquiring the state lock"
+          # logo abaixo — não serve pra recuperar log pós-cancelamento: o tee grava no
+          # arquivo em block-buffer, então num SIGKILL o arquivo tem MENOS conteúdo do
+          # que o console já mostrou).
           #
           # NÃO envolver isto em `script`/PTY. Testado e REPROVADO: o `script` insere
           # um processo a mais entre o terraform e o stdout do step, e o stdout dele
@@ -235,8 +238,8 @@ jobs:
           # progresso ("Still creating... [10s elapsed]") o terraform emite mesmo sem
           # TTY, então não se perde liveness aqui.
           #
-          # O arquivo é ESTÁVEL por diretório (./.cloudman-live.log) e NÃO é apagado,
-          # pra que o step "always()" de dump consiga recuperá-lo se a run for morta.
+          # O arquivo fica no diretório do próprio state (./.cloudman-live.log), então
+          # é naturalmente isolado por path — seguro no modo parallel_execution.
           # Retorna o exit code REAL do comando (não o do tee).
           # ==============================================================================
           _stream_cmd() {
@@ -595,27 +598,6 @@ jobs:
               fi
               echo "::endgroup::"
           done
-
-      # >>> NOVO — STEP: recupera no console os logs ao vivo que o terraform gravou em
-      # disco mas que não terminaram de sair no painel do Actions (típico quando a run é
-      # cancelada / dá timeout e o step anterior leva SIGKILL). Roda como step separado
-      # com `if: always()`, então ganha orçamento próprio depois do kill, e o workspace
-      # (os .cloudman-live.log de cada path) continua disponível por ser o mesmo runner.
-      - name: 🖨️ Recuperar logs ao vivo se a run foi morta (cancel/timeout)
-        if: always() && !success()
-        shell: bash
-        run: |
-          echo "== Despejando o que o terraform gravou antes de ser interrompido =="
-          found=0
-          while IFS= read -r -d '' f; do
-              found=1
-              echo "::group::📄 $f"
-              # remove ANSI e CR pra ficar legível no painel do Actions
-              sed -r 's/\x1B\[[0-9;?]*[a-zA-Z]//g; s/\r$//' "$f"
-              echo "::endgroup::"
-          done < <(find . -name ".cloudman-live.log" -type f -print0 2>/dev/null)
-          [ "$found" = 0 ] && echo "Nenhum log ao vivo encontrado (nenhum terraform chegou a rodar)."
-          exit 0
 
       # >>> NOVO — STEP INTEIRO. Camada que resolve de verdade o caso principal
       # (apply/destroy cancelado ou com timeout). É um step SEPARADO, que só roda

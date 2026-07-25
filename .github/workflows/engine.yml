@@ -221,53 +221,76 @@ jobs:
           }
 
           # ==============================================================================
+          # >>> HELPER: espelha a saída de um comando no console EM TEMPO REAL e num
+          # arquivo (o arquivo serve só pro grep de lock). Usa PTY via `script` quando
+          # disponível: o terraform "acha" que está num terminal, o que reativa os
+          # heartbeats de progresso ("Still creating... [10s elapsed]") e força flush
+          # por escrita — matando o buffer de bloco do pipe que fazia o log sumir de
+          # forma intermitente. Fallback pra stdbuf+tee se não houver `script`.
+          # O arquivo é ESTÁVEL por diretório (./.cloudman-live.log) e NÃO é apagado,
+          # pra que o step "always()" de dump consiga recuperá-lo se a run for morta.
+          # Retorna o exit code REAL do comando (não o do tee/script).
+          # ==============================================================================
+          _stream_cmd() {
+              local logfile="./.cloudman-live.log"
+              : > "$logfile"   # zera o log deste comando
+
+              if command -v script >/dev/null 2>&1 && script --version 2>/dev/null | grep -q util-linux; then
+                  # PTY: melhor liveness. -e propaga o exit code do filho; -q silencioso; -f flush a cada escrita.
+                  local cmd_str
+                  printf -v cmd_str '%q ' "$@"   # quoting seguro pro sh -c interno do script
+                  script -q -e -f -c "$cmd_str" "$logfile"
+                  return $?
+              fi
+
+              # Fallback sem PTY: line-buffer o tee no console (sem heartbeats, mas ainda tempo real linha a linha).
+              "$@" 2>&1 | stdbuf -oL tee "$logfile"
+              return ${PIPESTATUS[0]}
+          }
+
+          # ==============================================================================
           # >>> NOVO — FUNÇÃO: backstop verificado (camada 4).
           # Só entra em ação se o terraform falhar por lock ativo. NUNCA destrava por
           # idade/estimativa de tempo — só se a API do GitHub confirmar que a run dona
           # do lock já terminou (fato, não chute). Se não conseguir identificar/confirmar
           # a run dona, não mexe em nada e falha normalmente, igual ao comportamento atual.
-          # IMPORTANTE: usa `tee` pra manter o log do Terraform saindo ao vivo no
-          # console (streaming), em vez de só imprimir tudo de uma vez no final —
-          # sem isso, um destroy/apply demorado (ex. EKS) parece travado.
+          # A saída ao vivo (console + arquivo) é feita pelo _stream_cmd acima.
           # ==============================================================================
-                    run_tf_with_stale_lock_recovery() {
-              local status lock_id who_str owner_run_id run_status
-              local logfile
-              logfile=$(mktemp)
+          run_tf_with_stale_lock_recovery() {
+              local status lock_id who_str owner_run_id run_status clean
+              local logfile="./.cloudman-live.log"
 
-              if "$@" 2>&1 | stdbuf -oL tee "$logfile"; then
-                  status=0
-              else
-                  status=${PIPESTATUS[0]}
-              fi
+              _stream_cmd "$@"
+              status=$?
 
-              if [ $status -ne 0 ] && grep -q "Error acquiring the state lock" "$logfile"; then
-                  lock_id=$(grep -oP '^\s*ID:\s+\K\S+'  "$logfile" | head -n1)
-                  who_str=$(grep -oP '^\s*Who:\s+\K.*' "$logfile" | head -n1)
-                  owner_run_id=$(echo "$who_str" | grep -oP 'gh-\K[0-9]+')
+              if [ $status -ne 0 ]; then
+                  # o PTY grava ANSI/CR no arquivo; limpa antes de parsear pra o grep não quebrar
+                  clean=$(sed -r 's/\x1B\[[0-9;?]*[a-zA-Z]//g; s/\r$//' "$logfile" 2>/dev/null)
 
-                  if [ -z "$owner_run_id" ]; then
-                      echo "🔒 Lock ativo, dono não é uma run do Actions (provável apply manual). Não mexo — falhando."
-                      rm -f "$logfile"
-                      return $status
-                  fi
+                  if echo "$clean" | grep -q "Error acquiring the state lock"; then
+                      lock_id=$(echo "$clean" | grep -oP '^\s*ID:\s+\K\S+' | head -n1)
+                      who_str=$(echo "$clean" | grep -oP '^\s*Who:\s+\K.*' | head -n1)
+                      owner_run_id=$(echo "$who_str" | grep -oP 'gh-\K[0-9]+')
 
-                  echo "🔎 Lock pertence à run #$owner_run_id. Checando status real via API..."
-                  run_status=$(gh run view "$owner_run_id" --json status --jq '.status' 2>/dev/null)
-
-                  if [ "$run_status" == "completed" ]; then
-                      echo "♻️  Run #$owner_run_id já terminou (confirmado via API). Forçando unlock e retentando..."
-                      terraform force-unlock -force "$lock_id"
-                      if "$@" 2>&1 | stdbuf -oL tee "$logfile"; then
-                          status=0
-                      else
-                          status=${PIPESTATUS[0]}
+                      if [ -z "$owner_run_id" ]; then
+                          echo "🔒 Lock ativo, dono não é uma run do Actions (provável apply manual). Não mexo — falhando."
+                          return $status
                       fi
-                  else
-                      echo "⏳ Run #$owner_run_id ainda está '$run_status' — lock real e ativo. Não mexo."
+
+                      echo "🔎 Lock pertence à run #$owner_run_id. Checando status real via API..."
+                      run_status=$(gh run view "$owner_run_id" --json status --jq '.status' 2>/dev/null)
+
+                      if [ "$run_status" == "completed" ]; then
+                          echo "♻️  Run #$owner_run_id já terminou (confirmado via API). Forçando unlock e retentando..."
+                          terraform force-unlock -force "$lock_id"
+                          _stream_cmd "$@"
+                          status=$?
+                      else
+                          echo "⏳ Run #$owner_run_id ainda está '$run_status' — lock real e ativo. Não mexo."
+                      fi
                   fi
               fi
-              rm -f "$logfile"
+
               return $status
           }
 
@@ -578,6 +601,27 @@ jobs:
               fi
               echo "::endgroup::"
           done
+
+      # >>> NOVO — STEP: recupera no console os logs ao vivo que o terraform gravou em
+      # disco mas que não terminaram de sair no painel do Actions (típico quando a run é
+      # cancelada / dá timeout e o step anterior leva SIGKILL). Roda como step separado
+      # com `if: always()`, então ganha orçamento próprio depois do kill, e o workspace
+      # (os .cloudman-live.log de cada path) continua disponível por ser o mesmo runner.
+      - name: 🖨️ Recuperar logs ao vivo se a run foi morta (cancel/timeout)
+        if: always() && !success()
+        shell: bash
+        run: |
+          echo "== Despejando o que o terraform gravou antes de ser interrompido =="
+          found=0
+          while IFS= read -r -d '' f; do
+              found=1
+              echo "::group::📄 $f"
+              # remove ANSI e CR pra ficar legível no painel do Actions
+              sed -r 's/\x1B\[[0-9;?]*[a-zA-Z]//g; s/\r$//' "$f"
+              echo "::endgroup::"
+          done < <(find . -name ".cloudman-live.log" -type f -print0 2>/dev/null)
+          [ "$found" = 0 ] && echo "Nenhum log ao vivo encontrado (nenhum terraform chegou a rodar)."
+          exit 0
 
       # >>> NOVO — STEP INTEIRO. Camada que resolve de verdade o caso principal
       # (apply/destroy cancelado ou com timeout). É um step SEPARADO, que só roda

@@ -1,0 +1,26 @@
+# TEMPORARY -- step 0 of the composite-action plan. Delete once measured.
+#
+# Lives on main only because workflow_dispatch requires it; the action it
+# calls lives on feat/composite-action, so main stays free of the port.
+# workflow_dispatch only: no client is affected.
+#
+# Prior measurement, same method, run 30304006034:
+#   ordinary job          30 -> 50 visible lines in 20s
+#   workflow_call job      0 ->  0   (page held 250 chars and an empty panel)
+#
+# If the composite job below lands on the ordinary side, the plan's premise
+# holds. If it lands on the other side, the plan is wrong and nothing else in
+# it should be written.
+name: LOGTEST2 composite (temporary)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  composite:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Engine as composite action
+        uses: Struct8/CloudMan-Core@feat/composite-action
+        with:
+          echo_input: 'passagem de input funcionou'

@@ -29,32 +29,6 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      # >>> DIAGNÓSTICO TEMPORÁRIO — remover junto com o banner/heartbeat.
-      #
-      # Existe só para responder UMA pergunta: a UI do Actions acompanha a TROCA
-      # de step, ou ela se acopla apenas ao step que já estava rodando quando a
-      # página carregou?
-      #
-      # Este é o PRIMEIRO step do job, então é nele que a página se acopla quando
-      # aberta logo no começo. A saída do terraform sai do 7º step, ~6-9s depois
-      # (medido em 11 runs reais).
-      #
-      #   - tiques ao vivo E DEPOIS o terraform ao vivo  -> a UI segue a troca;
-      #     a causa do log sumido está em outro lugar.
-      #   - tiques ao vivo e depois NADA                 -> a UI não migra; o
-      #     conserto é colapsar checkouts/setup-terraform para dentro do step do
-      #     pipeline, de modo a existir um único step longo.
-      #   - nem os tiques aparecem                       -> a run/job ainda não
-      #     existia ao carregar a página; nenhuma mudança no engine resolve.
-      - name: 🔬 DIAG - tique de acoplamento (temporário)
-        shell: bash
-        run: |
-          for i in $(seq 1 10); do
-            echo "🔬 [tique $i/10] $(date -u '+%H:%M:%S')Z — se isto está correndo AO VIVO, a UI acoplou neste step"
-            sleep 1
-          done
-          echo "🔬 [tique] fim — daqui o job troca de step. Observe se o log continua vivo."
-
       - name: 📥 Checkout Client Code
         uses: actions/checkout@v4
         with:

@@ -1,0 +1,30 @@
+# TEMPORARY -- step 0b. Delete once measured.
+#
+# Measured so far, same method (lines visible in the DOM, T0 vs T0+20s):
+#   ordinary job, inline run:    30 -> 50   streams
+#   workflow_call job             0 ->  0   nothing renders at all
+#   composite action (uses:)      0 ->  0   steps listed but no log
+#
+# So what breaks is nesting, not the engine. This tests the shape that is
+# left: the caller checks out the engine and runs its script as an INLINE
+# run: step in its own job -- logic stays central in the engine repo, but
+# the step is not nested.
+name: LOGTEST3 inline (temporary)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  inline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout engine
+        uses: actions/checkout@v4
+        with:
+          repository: Struct8/CloudMan-Core
+          ref: feat/composite-action
+          path: .cloudman-engine
+
+      - name: Run engine script inline
+        shell: bash
+        run: bash .cloudman-engine/scripts/ticktest.sh

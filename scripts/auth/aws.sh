@@ -5,7 +5,7 @@ function auth_aws() {
     local auth_json=$1
     local type=$2 # "backend" ou "target"
 
-    echo "🔶 Autenticando AWS ($type)..."
+    echo "🔶 Authenticating AWS ($type)..."
     
     local role_arn=$(echo "$auth_json" | jq -r '.role_arn')
     local region=$(echo "$auth_json" | jq -r '.region')

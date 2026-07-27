@@ -4,7 +4,7 @@ source $(dirname "${BASH_SOURCE[0]}")/utils.sh
 
 function auth_google() {
     local auth_json=$1
-    echo "🇬 Autenticando Google Cloud (OIDC)..."
+    echo "🇬 Authenticating Google Cloud (OIDC)..."
 
     local wif_provider=$(echo "$auth_json" | jq -r '.workload_identity_provider')
     local service_account=$(echo "$auth_json" | jq -r '.service_account')

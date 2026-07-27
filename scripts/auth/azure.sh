@@ -4,7 +4,7 @@ source $(dirname "${BASH_SOURCE[0]}")/utils.sh
 
 function auth_azure() {
     local auth_json=$1
-    echo "🔷 Autenticando Azure (OIDC)..."
+    echo "🔷 Authenticating Azure (OIDC)..."
 
     local client_id=$(echo "$auth_json" | jq -r '.client_id')
     local tenant_id=$(echo "$auth_json" | jq -r '.tenant_id')

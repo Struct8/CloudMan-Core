@@ -54,7 +54,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
-          echo "🔍 Identificando qual pasta disparou o pipeline..."
+          echo "🔍 Identifying which folder triggered the pipeline..."
 
           # 1. Tenta achar o manifesto na pasta que teve o código alterado
           MANIFEST_PATH=$(git diff --name-only HEAD^ HEAD 2>/dev/null | grep "manifest.json" | head -n 1 || true)
@@ -65,24 +65,24 @@ jobs:
           fi
 
           echo "========================================================="
-          echo "📂 [LOG DE CAMINHO] MANIFESTO SELECIONADO NA ANÁLISE:"
-          echo "Caminho: ${MANIFEST_PATH:-Nenhum encontrado}"
+          echo "📂 [PATH] MANIFEST SELECTED DURING ANALYSIS:"
+          echo "Path: ${MANIFEST_PATH:-none found}"
           echo "========================================================="
 
           if [ -z "$MANIFEST_PATH" ]; then
-            echo "⚠️ Nenhum manifesto encontrado. Assumindo fluxo padrão (false)."
+            echo "⚠️ No manifest found. Assuming the default flow (false)."
             echo "needs_private_access=false" >> $GITHUB_OUTPUT
             exit 0
           fi
 
           if [ ! -s "$MANIFEST_PATH" ]; then
-             echo "⚠️ Arquivo manifest.json existe mas está vazio."
+             echo "⚠️ manifest.json exists but is empty."
              echo "needs_private_access=false" >> $GITHUB_OUTPUT
              exit 0
           fi
 
           if ! jq -e . "$MANIFEST_PATH" >/dev/null 2>&1; then
-             echo "❌ ERRO CRÍTICO: O arquivo $MANIFEST_PATH contém JSON inválido."
+             echo "❌ CRITICAL ERROR: $MANIFEST_PATH contains invalid JSON."
              exit 1
           fi
 
@@ -90,13 +90,13 @@ jobs:
           NEEDS_ACCESS="false"
 
           if [ "$EXTERNAL_REPOS" != "[]" ] && [ "$EXTERNAL_REPOS" != "null" ]; then
-            echo "📦 Verificando visibilidade dos repositórios externos..."
+            echo "📦 Checking visibility of the external repositories..."
 
             while IFS= read -r repo; do
               ORG=$(echo "$repo" | jq -r '.org')
               REPO_NAME=$(echo "$repo" | jq -r '.repo_name')
 
-              echo "🔍 Checando API do GitHub para: $ORG/$REPO_NAME"
+              echo "🔍 Querying the GitHub API for: $ORG/$REPO_NAME"
 
               HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
                 -H "Authorization: Bearer $GITHUB_TOKEN" \
@@ -104,18 +104,18 @@ jobs:
                 "https://api.github.com/repos/$ORG/$REPO_NAME")
 
               if [ "$HTTP_STATUS" == "200" ]; then
-                echo "   ✅ Público (HTTP 200). Não requer token externo."
+                echo "   ✅ Public (HTTP 200). No external token required."
               else
-                echo "   🔒 Privado (HTTP $HTTP_STATUS). Requer token do backend!"
+                echo "   🔒 Private (HTTP $HTTP_STATUS). Backend token required."
                 NEEDS_ACCESS="true"
                 break
               fi
             done < <(echo "$EXTERNAL_REPOS" | jq -c '.[]')
           else
-            echo "ℹ️ Nenhum repositório externo declarado no manifesto."
+            echo "ℹ️ No external repository declared in the manifest."
           fi
 
-          echo "📊 Resultado da análise Gatekeeper: $NEEDS_ACCESS"
+          echo "📊 Gatekeeper analysis result: $NEEDS_ACCESS"
 
           # SALVANDO NA MEMÓRIA PARA O RESTO DO PIPELINE
           echo "needs_private_access=$NEEDS_ACCESS" >> $GITHUB_OUTPUT
@@ -150,14 +150,14 @@ jobs:
               AUDIENCE="https://github.com/cloudmandevv2"
               ;;
             *)
-              echo "❌ Estágio '$STAGE' não tem backend mapeado neste engine."
-              echo "   Mapeados hoje: dev. Acrescente o caso acima ao criar o estágio."
+              echo "❌ Stage '$STAGE' has no backend mapped in this engine."
+              echo "   Mapped today: dev. Add the case above when the stage is created."
               exit 1
               ;;
           esac
 
-          echo "🚀 Detectado ambiente: $STAGE"
-          echo "🔗 Acionando Gatekeeper em: $GATEKEEPER_URL"
+          echo "🚀 Environment: $STAGE"
+          echo "🔗 Calling the Gatekeeper at: $GATEKEEPER_URL"
 
           # 2. Pega o token OIDC do GitHub usando a audiência dinâmica
           ID_TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
@@ -180,12 +180,12 @@ jobs:
           TOKEN=$(echo $RESPONSE | jq -r .token)
 
           if [ "$TOKEN" == "null" ] || [ -z "$TOKEN" ]; then
-            echo "❌ Falha na autenticação ($STAGE). Resposta do AWS API Gateway: $RESPONSE"
+            echo "❌ Authentication failed ($STAGE). AWS API Gateway response: $RESPONSE"
             exit 1
           fi
 
           # 5. Salva o token em segredo para os próximos steps usarem
-          echo "✅ Autenticação bem-sucedida no ambiente $STAGE!"
+          echo "✅ Authenticated successfully against $STAGE!"
           echo "token=$TOKEN" >> $GITHUB_OUTPUT
 
       - name: 📥 Checkout CloudMan Engine
@@ -205,7 +205,7 @@ jobs:
           terraform_version: "1.5.7"  # Adicione esta linha
           terraform_wrapper: false    # Recomendado para scripts bash complexos como o seu
 
-      - name: 🚀 Executar Pipeline Modular
+      - name: 🚀 Run Modular Pipeline
         shell: bash
         env:
           # Mesma lógica de fallback aqui para o clone dentro do script
@@ -228,7 +228,7 @@ jobs:
       # path) continua disponível porque é o mesmo runner/job.
       # Só apaga o lock se confirmar que ele pertence a ESTA run (via o RUN_TAG
       # gravado no hostname lá em cima) — nunca um delete às cegas.
-      - name: 🔓 Liberar locks órfãos após cancelamento/timeout
+      - name: 🔓 Release orphaned locks after cancellation/timeout
         if: always() && !success()
         shell: bash
         env:
@@ -257,12 +257,12 @@ jobs:
               who=$(echo "$item" | jq -r '.Item.Info.S // empty' | jq -r '.Who // empty' 2>/dev/null)
 
               if [ "$who" == "runner@${RUN_TAG}" ]; then
-                  echo "🔓 Lock em ${bucket}/${key} é desta run (${RUN_TAG}). Liberando..."
+                  echo "🔓 Lock on ${bucket}/${key} belongs to this run (${RUN_TAG}). Releasing..."
                   aws dynamodb delete-item --table-name "$table" \
                       --key "{\"LockID\": {\"S\": \"${bucket}/${key}\"}}" \
                       --region "${region:-$DEFAULT_REGION}" --profile backend
               elif [ -n "$who" ]; then
-                  echo "ℹ️  Lock em ${bucket}/${key} pertence a '${who}' — não é meu, não mexo."
+                  echo "ℹ️  Lock on ${bucket}/${key} belongs to '${who}' -- not mine, leaving it alone."
               fi
           done
 
@@ -276,19 +276,19 @@ jobs:
 
           # 1. LÓGICA DO PASSO 2 (GERAÇÃO DE IMPORT)
           if [ -f "$GITHUB_WORKSPACE/.needs_commit" ]; then
-            echo "📥 Operação de import detectada. Salvando recursos gerados no repositório..."
+            echo "📥 Import operation detected. Saving the generated resources to the repository..."
             git add ./**/generated_resources.json
 
             if ! git diff --staged --quiet; then
-              git commit -m "chore: código terraform gerado aguardando revisão do CloudMan [skip ci]"
+              git commit -m "chore: generated terraform awaiting CloudMan review [skip ci]"
               git push
-              echo "✅ Código de importação enviado para o repositório."
+              echo "✅ Import code pushed to the repository."
             fi
           fi
 
           # 2. LÓGICA DO PASSO 4 (LIMPEZA PÓS-APPLY)
           if [ -f "$GITHUB_WORKSPACE/.needs_cleanup" ]; then
-            echo "🧹 Operação de apply finalizada. Removendo arquivos de importação do repositório..."
+            echo "🧹 Apply finished. Removing the import files from the repository..."
 
             # O parâmetro -u no git add pega arquivos que foram deletados
             git add -u ./**/import.tf ./**/generated_resources.json ./**/generated_resources.tf 2>/dev/null || true
@@ -296,9 +296,9 @@ jobs:
             if ! git diff --staged --quiet; then
               git commit -m "chore: cleanup import.tf and json after successful apply [skip ci]"
               git push
-              echo "✅ Arquivos residuais excluídos do repositório com sucesso!"
+              echo "✅ Leftover files removed from the repository."
             else
-              echo "Nenhum arquivo residual para limpar no Git."
+              echo "No leftover files to clean up in git."
             fi
           fi
 

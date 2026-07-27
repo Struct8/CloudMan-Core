@@ -48,7 +48,7 @@ ENGINE_PATH=$(readlink -f .cloudman-engine)
 AUTH_SCRIPTS="$ENGINE_PATH/scripts/auth"
 
 if [ ! -d "$AUTH_SCRIPTS" ]; then
-    echo "❌ Erro Crítico: Pasta scripts/auth não encontrada"
+    echo "❌ Critical error: scripts/auth folder not found"
     exit 1
 fi
 
@@ -60,12 +60,12 @@ source "$AUTH_SCRIPTS/aws.sh"
 # ==============================================================================
 debug_auth_status() {
     local context=$1
-    echo "🔎 [DEBUG] Verificando identidade ($context):"
+    echo "🔎 [DEBUG] Checking identity ($context):"
     if [ -n "$AWS_PROFILE" ]; then echo "   - AWS_PROFILE: $AWS_PROFILE"; else echo "   - AWS_PROFILE: (unset)"; fi
     if [ -n "$AWS_REGION" ]; then echo "   - AWS_REGION: $AWS_REGION"; else echo "   - AWS_REGION: (unset)"; fi
 
     # Verifica identidade real (se tiver credenciais carregadas)
-    aws sts get-caller-identity --query "Arn" --output text 2>/dev/null || echo "   - (Sem credenciais ativas no terminal)"
+    aws sts get-caller-identity --query "Arn" --output text 2>/dev/null || echo "   - (no active credentials in this shell)"
     echo "---------------------------------------------------"
 }
 
@@ -126,20 +126,20 @@ run_tf_with_stale_lock_recovery() {
         owner_run_id=$(echo "$who_str" | grep -oP 'gh-\K[0-9]+')
 
         if [ -z "$owner_run_id" ]; then
-            echo "🔒 Lock ativo, dono não é uma run do Actions (provável apply manual). Não mexo — falhando."
+            echo "🔒 Lock is active and its owner is not an Actions run (likely a manual apply). Leaving it alone -- failing."
             return $status
         fi
 
-        echo "🔎 Lock pertence à run #$owner_run_id. Checando status real via API..."
+        echo "🔎 Lock belongs to run #$owner_run_id. Checking its real status via the API..."
         run_status=$(gh run view "$owner_run_id" --json status --jq '.status' 2>/dev/null)
 
         if [ "$run_status" == "completed" ]; then
-            echo "♻️  Run #$owner_run_id já terminou (confirmado via API). Forçando unlock e retentando..."
+            echo "♻️  Run #$owner_run_id has finished (confirmed via the API). Forcing unlock and retrying..."
             terraform force-unlock -force "$lock_id"
             _stream_cmd "$@"
             status=$?
         else
-            echo "⏳ Run #$owner_run_id ainda está '$run_status' — lock real e ativo. Não mexo."
+            echo "⏳ Run #$owner_run_id is still '$run_status' -- the lock is real and active. Leaving it alone."
         fi
     fi
 
@@ -172,26 +172,26 @@ run_terraform_process() {
     if [ "$provider" == "oci" ]; then color=$RED; fi
 
     (
-        cd "$path" || { echo -e "${RED}❌ ERRO: Pasta não encontrada: $path${NC}"; exit 1; }
+        cd "$path" || { echo -e "${RED}❌ ERROR: folder not found: $path${NC}"; exit 1; }
 
         # =========================================================
         # 🔍 DEBUG LOG: LISTANDO ARQUIVOS ANTES DO TERRAFORM
         # =========================================================
         echo -e "${CYAN}---------------------------------------------------${NC}"
-        echo -e "${CYAN}🔎 [DEBUG] Verificando arquivos no runner (${path}):${NC}"
-        echo -e "${CYAN}Caminho absoluto: $(pwd)${NC}"
+        echo -e "${CYAN}🔎 [DEBUG] Listing files on the runner (${path}):${NC}"
+        echo -e "${CYAN}Absolute path: $(pwd)${NC}"
         ls -la
         echo -e "${CYAN}---------------------------------------------------${NC}"
 
         # ---------------------------------------------------------
         # PASSO 1: TERRAFORM INIT
         # ---------------------------------------------------------
-        echo -e "${color}▶️ ${label} Inicializando Backend (State)...${NC}"
+        echo -e "${color}▶️ ${label} Initializing backend (state)...${NC}"
 
         # ---------------------------------------------------------
         # PASSO 1: TERRAFORM INIT
         # ---------------------------------------------------------
-        echo -e "${color}▶️ ${label} Inicializando Backend (State)...${NC}"
+        echo -e "${color}▶️ ${label} Initializing backend (state)...${NC}"
 
         # Limpa ambiente para garantir que o Init use apenas o profile
         unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_REGION
@@ -220,11 +220,11 @@ run_terraform_process() {
                 secret_key="AUTH_CLOUDFLARE_${acc_id}"
             fi
 
-            echo "🔑 Buscando Secret: $secret_key"
+            echo "🔑 Looking up secret: $secret_key"
             local token=$(echo "$SECRETS_CONTEXT" | jq -r --arg key "$secret_key" '.[$key]')
 
             if [ "$token" == "null" ] || [ -z "$token" ]; then
-                echo "❌ Erro: Secret '$secret_key' não encontrado."
+                echo "❌ Error: secret '$secret_key' not found."
                 exit 1
             fi
             export CLOUDFLARE_API_TOKEN="$token"
@@ -251,11 +251,11 @@ run_terraform_process() {
                     extra_secret="AUTH_${extra_up}_${extra_acc}"
                 fi
 
-                echo "🔑 Credencial adicional ($extra_provider): $extra_secret"
+                echo "🔑 Additional credential ($extra_provider): $extra_secret"
                 local extra_token=$(echo "$SECRETS_CONTEXT" | jq -r --arg key "$extra_secret" '.[$key]')
 
                 if [ "$extra_token" == "null" ] || [ -z "$extra_token" ]; then
-                    echo "❌ Erro: Secret '$extra_secret' não encontrado (exigido por $path)."
+                    echo "❌ Error: secret '$extra_secret' not found (required by $path)."
                     exit 1
                 fi
 
@@ -267,7 +267,7 @@ run_terraform_process() {
                         # Falha alto: seguir sem a variável faria o apply
                         # quebrar depois, com uma mensagem do provider que
                         # não aponta pra cá.
-                        echo "❌ Erro: provider adicional '$extra_provider' não tem variável de ambiente mapeada neste engine."
+                        echo "❌ Error: additional provider '$extra_provider' has no environment variable mapped in this engine."
                         exit 1
                         ;;
                 esac
@@ -277,7 +277,7 @@ run_terraform_process() {
         local script_file="$AUTH_SCRIPTS/${provider}.sh"
 
         if [ -f "$script_file" ]; then
-            echo "🔶 Autenticando $provider (target)..."
+            echo "🔶 Authenticating $provider (target)..."
             source "$script_file"
             "auth_${provider}" "$auth_json" "target"
 
@@ -287,26 +287,26 @@ run_terraform_process() {
             fi
         else
             if [ "$provider" != "cloudflare" ]; then
-                 echo "⚠️  Aviso: Script de autenticação para '$provider' não encontrado."
+                 echo "⚠️  Warning: no authentication script found for '$provider'."
             fi
         fi
 
         # ---------------------------------------------------------
         # PASSO 3: EXECUÇÃO DO TERRAFORM
         # ---------------------------------------------------------
-        echo -e "${color}▶️ ${label} Executando Terraform $action...${NC}"
+        echo -e "${color}▶️ ${label} Running terraform $action...${NC}"
 
         if [ "$action" == "plan" ]; then
           run_tf_with_stale_lock_recovery terraform plan -input=false
 
         elif [ "$action" == "apply" ]; then
-          echo -e "${color}▶️ ${label} Executando Terraform apply...${NC}"
+          echo -e "${color}▶️ ${label} Running terraform apply...${NC}"
           run_tf_with_stale_lock_recovery terraform apply -auto-approve -input=false
           APPLY_STATUS=$?
 
         # INÍCIO DA NOVA LÓGICA DE IMPORT (GERAÇÃO PARA REVISÃO)
         elif [ "$action" == "import" ]; then
-          echo -e "${color}📥 ${label} Gerando rascunho de importação...${NC}"
+          echo -e "${color}📥 ${label} Generating import draft...${NC}"
 
           # 1. Limpeza preventiva absoluta
           rm -f generated_resources.tf import.tfplan generated_resources.json
@@ -314,24 +314,24 @@ run_terraform_process() {
           # 2. Executa a geração. Usamos '|| true' aqui porque o gerador experimental
           # quase sempre gera avisos ou erros de conflito que não devem travar o pipeline
           # de geração de rascunho.
-          terraform plan -generate-config-out=generated_resources.tf -out=import.tfplan -input=false || echo "⚠️ Aviso: O gerador encontrou conflitos no HCL, mas continuaremos para gerar o rascunho."
+          terraform plan -generate-config-out=generated_resources.tf -out=import.tfplan -input=false || echo "⚠️ Warning: the generator hit HCL conflicts, continuing anyway to produce the draft."
 
           # 3. Verifica se pelo menos o arquivo .tf foi gerado (mesmo com erros de validação)
           if [ -f "generated_resources.tf" ]; then
-              echo -e "${color}📄 Arquivo HCL gerado. Tentando converter para JSON para o Front-end...${NC}"
+              echo -e "${color}📄 HCL file generated. Converting it to JSON for the front end...${NC}"
 
               # Tenta gerar o JSON. Se falhar por erro no plano, criamos um JSON básico de sinalização
               if terraform show -json import.tfplan > generated_resources.json 2>/dev/null; then
-                  echo -e "${color}✅ JSON gerado com sucesso.${NC}"
+                  echo -e "${color}✅ JSON generated successfully.${NC}"
               else
-                  echo "{\"info\": \"O HCL foi gerado mas o plano contém erros de validação. Verifique o arquivo .tf manualmente.\"}" > generated_resources.json
-                  echo -e "${YELLOW}⚠️ Aviso: Não foi possível gerar o JSON detalhado devido a erros no plano.${NC}"
+                  echo "{\"info\": \"The HCL was generated but the plan has validation errors. Review the .tf file by hand.\"}" > generated_resources.json
+                  echo -e "${YELLOW}⚠️ Warning: could not generate the detailed JSON because the plan has errors.${NC}"
               fi
 
-              echo -e "${color}⏳ ${label} Rascunhos disponíveis para revisão.${NC}"
+              echo -e "${color}⏳ ${label} Drafts are ready for review.${NC}"
               touch "$GITHUB_WORKSPACE/.needs_commit"
           else
-              echo -e "${RED}❌ Erro Crítico: O Terraform não conseguiu gerar nem o arquivo de rascunho .tf.${NC}"
+              echo -e "${RED}❌ Critical error: terraform could not even produce the draft .tf file.${NC}"
               exit 1
           fi
 
@@ -341,7 +341,7 @@ run_terraform_process() {
           DESTROY_STATUS=$? # Captura o status do destroy
 
           if [ $DESTROY_STATUS -eq 0 ]; then
-              echo -e "${color}▶️ ${label} Destroy bem-sucedido. Iniciando limpeza do Backend Remoto...${NC}"
+              echo -e "${color}▶️ ${label} Destroy succeeded. Starting remote backend cleanup...${NC}"
 
               # Extrai a Key EXATA e a Tabela do DynamoDB que o Terraform está usando
               if [ -f ".terraform/terraform.tfstate" ]; then
@@ -350,12 +350,12 @@ run_terraform_process() {
 
                   if [ -n "$BACKEND_BUCKET" ] && [ -n "$S3_EXACT_KEY" ]; then
                       # 1. REMOVE DO S3 (Para a lógica de HEAD request do CloudMan funcionar)
-                      echo -e "${color}🗑️ ${label} Deletando arquivo: s3://${BACKEND_BUCKET}/${S3_EXACT_KEY}${NC}"
-                      aws s3 rm "s3://${BACKEND_BUCKET}/${S3_EXACT_KEY}" --profile backend || echo "⚠️ Aviso: Falha ao deletar arquivo no S3."
+                      echo -e "${color}🗑️ ${label} Deleting object: s3://${BACKEND_BUCKET}/${S3_EXACT_KEY}${NC}"
+                      aws s3 rm "s3://${BACKEND_BUCKET}/${S3_EXACT_KEY}" --profile backend || echo "⚠️ Warning: failed to delete the object in S3."
 
                       # 2. REMOVE DO DYNAMODB (Para o Terraform não quebrar no próximo Apply)
                       if [ -n "$DYNAMODB_TABLE" ] && [ "$DYNAMODB_TABLE" != "null" ]; then
-                          echo -e "${color}🔓 ${label} Removendo Lock do DynamoDB (Tabela: ${DYNAMODB_TABLE})...${NC}"
+                          echo -e "${color}🔓 ${label} Removing the DynamoDB lock (table: ${DYNAMODB_TABLE})...${NC}"
 
                           # >>> NOVO — o LockID real do Terraform é "<bucket>/<key>" (SEM sufixo).
                           # O "-md5" abaixo é só o cache de checksum de consistência do S3, não é
@@ -364,7 +364,7 @@ run_terraform_process() {
                               --table-name "$DYNAMODB_TABLE" \
                               --key "{\"LockID\": {\"S\": \"${BACKEND_BUCKET}/${S3_EXACT_KEY}\"}}" \
                               --region "$BACKEND_REGION" \
-                              --profile backend || echo "⚠️ Aviso: Falha ao deletar o lock real (ou já não existia)."
+                              --profile backend || echo "⚠️ Warning: failed to delete the real lock (or it was already gone)."
 
                           # O padrão de LockID do Terraform no S3 é sempre: <bucket>/<key>-md5
                           LOCK_ID="${BACKEND_BUCKET}/${S3_EXACT_KEY}-md5"
@@ -373,20 +373,20 @@ run_terraform_process() {
                               --table-name "$DYNAMODB_TABLE" \
                               --key "{\"LockID\": {\"S\": \"$LOCK_ID\"}}" \
                               --region "$BACKEND_REGION" \
-                              --profile backend || echo "⚠️ Aviso: Falha ao deletar item no DynamoDB ou item já inexistente."
+                              --profile backend || echo "⚠️ Warning: failed to delete the DynamoDB item, or it no longer existed."
                       fi
                   else
-                      echo -e "${color}⚠️ ${label} Bucket ou Key não encontrados. State remoto mantido.${NC}"
+                      echo -e "${color}⚠️ ${label} Bucket or key not found. Remote state kept.${NC}"
                   fi
               else
-                   echo -e "${color}⚠️ ${label} Arquivo de cache do Terraform ausente. State remoto mantido.${NC}"
+                   echo -e "${color}⚠️ ${label} Terraform cache file missing. Remote state kept.${NC}"
               fi
 
               # 3. Limpar arquivos locais
-              echo -e "${color}🧹 ${label} Removendo cache local do Terraform...${NC}"
+              echo -e "${color}🧹 ${label} Removing the local terraform cache...${NC}"
               rm -rf .terraform terraform.tfstate terraform.tfstate.backup .terraform.lock.hcl
           else
-              echo -e "${color}❌ ${label} Falha no Terraform Destroy. A limpeza remota NÃO foi executada.${NC}"
+              echo -e "${color}❌ ${label} Terraform destroy failed. Remote cleanup was NOT performed.${NC}"
               return $DESTROY_STATUS
           fi
         fi
@@ -404,12 +404,12 @@ MANIFEST_PATH="$MANIFEST_PATH_INPUT"
 
 # LOG CLARO PARA DEPURAÇÃO
 echo "========================================================="
-echo "📂 [LOG DE CAMINHO] MANIFESTO RECUPERADO PARA EXECUÇÃO:"
-echo "Caminho: $MANIFEST_PATH"
+echo "📂 [PATH] MANIFEST RECOVERED FOR EXECUTION:"
+echo "Path: $MANIFEST_PATH"
 echo "========================================================="
 
 if [ -z "$MANIFEST_PATH" ] || [ ! -f "$MANIFEST_PATH" ]; then
-  echo "❌ Erro Crítico: Caminho do manifest.json foi perdido entre os steps ou o arquivo sumiu."
+  echo "❌ Critical error: the manifest.json path was lost between steps, or the file is gone."
   exit 1
 fi
 
@@ -427,9 +427,9 @@ export BACKEND_BUCKET=$(jq -r '.backend_global_config.bucket // empty' "$MANIFES
 # porque o auth do TARGET roda lá dentro do laço de estágios.
 export CLOUDMAN_TRIGGERED_BY=$(jq -r '.triggered_by // empty' "$MANIFEST_PATH")
 
-echo "⚡ Ação Global: $ACTION"
-echo "👤 Disparado por: ${CLOUDMAN_TRIGGERED_BY:-(sem campo no manifesto — usando $GITHUB_ACTOR)}"
-echo "🔑 Configurando Backend Profile..."
+echo "⚡ Global action: $ACTION"
+echo "👤 Triggered by: ${CLOUDMAN_TRIGGERED_BY:-(no field in the manifest -- falling back to $GITHUB_ACTOR)}"
+echo "🔑 Setting up the backend profile..."
 
 # Cria o profile [backend] em ~/.aws/credentials
 auth_aws "{\"role_arn\": \"$BACKEND_ROLE\", \"region\": \"$BACKEND_REGION\"}" "backend"
@@ -440,7 +440,7 @@ debug_auth_status "BACKEND PROFILE CRIADO"
 # ---------------------------------------------------------
 EXTERNAL_REPOS=$(jq -c '.external_repositories // []' "$MANIFEST_PATH")
 if [ "$EXTERNAL_REPOS" != "[]" ] && [ "$EXTERNAL_REPOS" != "null" ]; then
-    echo "📦 Analisando dependências externas..."
+    echo "📦 Resolving external dependencies..."
     echo "$EXTERNAL_REPOS" | jq -c '.[]' | while read -r repo; do
         REPO_NAME=$(echo "$repo" | jq -r '.repo_name')
         ORG=$(echo "$repo" | jq -r '.org')
@@ -451,7 +451,7 @@ if [ "$EXTERNAL_REPOS" != "[]" ] && [ "$EXTERNAL_REPOS" != "null" ]; then
         REPO_URL="https://x-access-token:${GH_CLONE_TOKEN}@github.com/${ORG}/${REPO_NAME}.git"
 
         if [ ! -d "$FULL_TARGET_DIR" ]; then
-            echo "⬇️  Iniciando Sparse-Checkout de $ORG/$REPO_NAME..."
+            echo "⬇️  Starting sparse checkout of $ORG/$REPO_NAME..."
             git clone --depth 1 -b "$BRANCH" --filter=blob:none --no-checkout "$REPO_URL" "$FULL_TARGET_DIR"
             cd "$FULL_TARGET_DIR"
             git sparse-checkout init --cone
@@ -459,7 +459,7 @@ if [ "$EXTERNAL_REPOS" != "[]" ] && [ "$EXTERNAL_REPOS" != "null" ]; then
             git checkout "$BRANCH"
             cd - > /dev/null
         else
-            echo "🔄 Atualizando pastas em $REPO_NAME..."
+            echo "🔄 Updating folders in $REPO_NAME..."
             (cd "$FULL_TARGET_DIR" && git sparse-checkout set $FOLDERS && git pull origin "$BRANCH")
         fi
     done
@@ -484,7 +484,7 @@ for (( i=0; i<$TOTAL_STAGES; i++ )); do
     # Separador simples = output sempre visível, sem depender de dobra.
     echo ""
     echo "=========================================================="
-    echo "🚀 Estágio: $STAGE_NAME"
+    echo "🚀 Stage: $STAGE_NAME"
     echo "=========================================================="
 
     pids=""
@@ -498,7 +498,7 @@ for (( i=0; i<$TOTAL_STAGES; i++ )); do
         additional_auth=$(echo "$state" | jq -c '.additional_auth // []')
 
         if [ ! -d "$path" ]; then
-             echo "⚠️  Diretório $path não existe. Pulando."
+             echo "⚠️  Directory $path does not exist. Skipping."
              continue
         fi
         if [ -d ".external_modules" ]; then
@@ -522,9 +522,9 @@ for (( i=0; i<$TOTAL_STAGES; i++ )); do
     fi
 
     if [ $failed -ne 0 ]; then
-        echo "::error::Falha no estágio $STAGE_NAME"
+        echo "::error::Stage $STAGE_NAME failed"
         exit 1
     fi
 
-    echo "✅ Estágio concluído: $STAGE_NAME"
+    echo "✅ Stage finished: $STAGE_NAME"
 done

@@ -1,10 +1,10 @@
 #!/bin/bash
 
 function auth_oci() {
-    echo "⭕ Autenticando Oracle Cloud..."
+    echo "⭕ Authenticating Oracle Cloud..."
 
     if [ -z "$OCI_PRIVATE_KEY" ]; then
-         echo "❌ Erro: Secrets OCI faltando." >&2
+         echo "❌ Error: OCI secrets are missing." >&2
          return 1
     fi
 

@@ -11,7 +11,7 @@ function get_github_oidc_token() {
     local jwt=$(echo $response | jq -r '.value')
     
     if [ "$jwt" == "null" ] || [ -z "$jwt" ]; then
-        echo "❌ Erro ao obter OIDC Token do GitHub." >&2
+        echo "❌ Failed to obtain the OIDC token from GitHub." >&2
         return 1
     fi
     echo "$jwt"

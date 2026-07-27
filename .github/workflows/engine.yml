@@ -7,6 +7,19 @@ on:
         required: false
         type: string
         default: "us-east-1"
+      stage:
+        # Qual BACKEND do CloudMan este pipeline procura (Gatekeeper + audiência
+        # OIDC). Eixo separado da VERSÃO do engine, que é o `@ref` do `uses:` no
+        # workflow do cliente -- os dois costumam andar juntos, mas manter
+        # separado permite rodar uma versão nova contra um backend antigo
+        # durante uma migração.
+        #
+        # Default "dev" de propósito: até existir outro backend, todo cliente
+        # (inclusive os reais) autentica pelo de dev, que é o comportamento em
+        # vigor. Este input não muda nada sozinho.
+        required: false
+        type: string
+        default: "dev"
   workflow_dispatch:
   push:
     paths:
@@ -112,11 +125,37 @@ jobs:
         id: gatekeeper
         if: steps.manifest_check.outputs.needs_private_access == 'true'
         shell: bash
+        env:
+          # Por env, não interpolado direto no shell: o valor vem do workflow do
+          # cliente e cairia dentro de um `case` sem passar por aspas.
+          STAGE_INPUT: ${{ inputs.stage }}
         run: |
-          # 1. Roteamento Dinâmico (Dev vs Prod) baseado na branch
-          STAGE="dev"
-          GATEKEEPER_URL="https://dev.v2.cloudman.pro/st/GithubGateKeeper-dev"
-          AUDIENCE="https://github.com/cloudmandevv2"
+          # 1. Backend do CloudMan, por estágio.
+          #
+          # O comentário que vivia aqui dizia "Roteamento Dinâmico (Dev vs Prod)
+          # baseado na branch" e a linha seguinte era STAGE="dev" fixo. Nunca foi
+          # dinâmico -- e não poderia ser por branch: em workflow reutilizável
+          # `github.ref` é a ref do CHAMADOR, não a deste arquivo. Por isso o
+          # estágio agora CHEGA como input, em vez de ser adivinhado.
+          #
+          # Tabela explícita, mesma convenção (e mesmo motivo) do
+          # GATEWAY_URL_BY_STAGE do frontend: estágio não mapeado FALHA ALTO em
+          # vez de cair num default. Um cliente de 'test' autenticando calado no
+          # Gatekeeper errado é precisamente o que a tabela existe pra impedir.
+          STAGE="${STAGE_INPUT:-dev}"
+
+          case "$STAGE" in
+            dev)
+              GATEKEEPER_URL="https://dev.v2.cloudman.pro/st/GithubGateKeeper-dev"
+              AUDIENCE="https://github.com/cloudmandevv2"
+              ;;
+            *)
+              echo "❌ Estágio '$STAGE' não tem backend mapeado neste engine."
+              echo "   Mapeados hoje: dev. Acrescente o caso acima ao criar o estágio."
+              exit 1
+              ;;
+          esac
+
           echo "🚀 Detectado ambiente: $STAGE"
           echo "🔗 Acionando Gatekeeper em: $GATEKEEPER_URL"
 

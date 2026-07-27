@@ -323,6 +323,15 @@ jobs:
               local action=$2
               local auth_json=$3
               local provider=$4
+              # Credenciais de nuvens ESTRANGEIRAS que este state também usa, além
+              # da própria ($auth_json). Existe porque um state deixou de ser de um
+              # provider só: um state AWS pode legitimamente escrever um
+              # cloudflare_dns_record (domínio registrado na Cloudflare apontando
+              # pra um recurso AWS), e aí o apply falha por falta de token num
+              # código que está correto.
+              # Default "[]" mantém compatível com manifesto antigo, que não traz
+              # o campo -- o laço abaixo simplesmente não itera.
+              local additional_auth=${5:-[]}
               local label="[$path]"
 
               local color=$BLUE
@@ -388,6 +397,50 @@ jobs:
                           exit 1
                       fi
                       export CLOUDFLARE_API_TOKEN="$token"
+                  fi
+
+                  # Credenciais ADICIONAIS (nuvens estrangeiras usadas por este state).
+                  #
+                  # Mantido SEPARADO do bloco acima de propósito: aquele é o caminho
+                  # do provider próprio, já em produção, e não muda aqui. A pequena
+                  # duplicação é o preço de não mexer no que funciona.
+                  #
+                  # `< <(...)` e não `... | while`: um pipe roda o laço em SUBSHELL,
+                  # e os `export` morreriam com ela -- o terraform rodaria sem os
+                  # tokens, sem erro nenhum no log.
+                  if [ -n "$additional_auth" ] && [ "$additional_auth" != "[]" ]; then
+                      while IFS= read -r extra; do
+                          [ -z "$extra" ] && continue
+                          local extra_provider=$(echo "$extra" | jq -r '.provider')
+                          local extra_secret=$(echo "$extra" | jq -r '.secret_name // empty')
+
+                          if [ -z "$extra_secret" ]; then
+                              local extra_acc=$(echo "$extra" | jq -r '.account_id')
+                              local extra_up=$(echo "$extra_provider" | tr '[:lower:]' '[:upper:]')
+                              extra_secret="AUTH_${extra_up}_${extra_acc}"
+                          fi
+
+                          echo "🔑 Credencial adicional ($extra_provider): $extra_secret"
+                          local extra_token=$(echo "$SECRETS_CONTEXT" | jq -r --arg key "$extra_secret" '.[$key]')
+
+                          if [ "$extra_token" == "null" ] || [ -z "$extra_token" ]; then
+                              echo "❌ Erro: Secret '$extra_secret' não encontrado (exigido por $path)."
+                              exit 1
+                          fi
+
+                          case "$extra_provider" in
+                              cloudflare)
+                                  export CLOUDFLARE_API_TOKEN="$extra_token"
+                                  ;;
+                              *)
+                                  # Falha alto: seguir sem a variável faria o apply
+                                  # quebrar depois, com uma mensagem do provider que
+                                  # não aponta pra cá.
+                                  echo "❌ Erro: provider adicional '$extra_provider' não tem variável de ambiente mapeada neste engine."
+                                  exit 1
+                                  ;;
+                          esac
+                      done < <(echo "$additional_auth" | jq -c '.[]')
                   fi
 
                   local script_file="$AUTH_SCRIPTS/${provider}.sh"
@@ -536,7 +589,15 @@ jobs:
           export BACKEND_REGION=$(jq -r '.backend_global_config.region' "$MANIFEST_PATH")
           export BACKEND_BUCKET=$(jq -r '.backend_global_config.bucket // empty' "$MANIFEST_PATH")
 
+          # >>> NOVO — quem disparou, pro RoleSessionName (= coluna "User name" do
+          # CloudTrail). Ver o bloco grande em scripts/auth/aws.sh. O `// empty`
+          # importa: manifesto gerado antes deste campo existir devolve string
+          # vazia e o aws.sh cai no $GITHUB_ACTOR sozinho. `export` é obrigatório
+          # porque o auth do TARGET roda lá dentro do laço de estágios.
+          export CLOUDMAN_TRIGGERED_BY=$(jq -r '.triggered_by // empty' "$MANIFEST_PATH")
+
           echo "⚡ Ação Global: $ACTION"
+          echo "👤 Disparado por: ${CLOUDMAN_TRIGGERED_BY:-(sem campo no manifesto — usando $GITHUB_ACTOR)}"
           echo "🔑 Configurando Backend Profile..."
 
           # Cria o profile [backend] em ~/.aws/credentials
@@ -602,6 +663,8 @@ jobs:
                   path=$(echo "$state" | jq -r '.path')
                   provider=$(echo "$state" | jq -r '.provider')
                   target_auth=$(echo "$state" | jq -c '.target_auth')
+                  # `// []` cobre o manifesto antigo, que não traz o campo.
+                  additional_auth=$(echo "$state" | jq -c '.additional_auth // []')
 
                   if [ ! -d "$path" ]; then
                        echo "⚠️  Diretório $path não existe. Pulando."
@@ -612,10 +675,10 @@ jobs:
                   fi
 
                   if [ "$IS_PARALLEL" == "true" ]; then
-                      run_terraform_process "$path" "$ACTION" "$target_auth" "$provider" &
+                      run_terraform_process "$path" "$ACTION" "$target_auth" "$provider" "$additional_auth" &
                       pids="$pids $!"
                   else
-                      run_terraform_process "$path" "$ACTION" "$target_auth" "$provider"
+                      run_terraform_process "$path" "$ACTION" "$target_auth" "$provider" "$additional_auth"
                       if [ $? -ne 0 ]; then failed=1; break; fi
                   fi
               done <<< "$STATES_JSON"

@@ -27,16 +27,7 @@
 set -eo pipefail
 export LC_ALL=C.UTF-8   # >>> NOVO — garante que `grep -P` (usado no backstop de lock) funcione, independente do locale padrão do runner
 
-# >>> DIAGNÓSTICO (temporário) — banner de versão + heartbeat + carimbo de hora
-# (este no _stream_cmd). Se nem o heartbeat sair ao vivo, o problema não é o
-# script: é a entrega do Actions ou o navegador. Remover quando resolvido.
-ENGINE_BUILD="2026-07-25 / diag"
-echo "🏷️  engine.yml build: $ENGINE_BUILD"
-echo "🕐 início do step: $(date -u '+%H:%M:%S') UTC"
-
-( while true; do echo "⏱️  [heartbeat] $(date -u '+%H:%M:%S')Z — step vivo"; sleep 15; done ) &
-HEARTBEAT_PID=$!
-trap 'kill $HEARTBEAT_PID 2>/dev/null' EXIT
+echo "🕐 Step started at $(date -u '+%H:%M:%S') UTC"
 
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'

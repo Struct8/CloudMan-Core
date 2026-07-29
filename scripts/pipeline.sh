@@ -44,7 +44,7 @@ NC='\033[0m'
 RUN_TAG="gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 sudo hostname "$RUN_TAG" 2>/dev/null || true
 
-ENGINE_PATH=$(readlink -f .cloudman-engine)
+ENGINE_PATH=$(readlink -f .struct8-engine)
 AUTH_SCRIPTS="$ENGINE_PATH/scripts/auth"
 
 if [ ! -d "$AUTH_SCRIPTS" ]; then
@@ -87,12 +87,12 @@ debug_auth_status() {
 # progresso ("Still creating... [10s elapsed]") o terraform emite mesmo sem
 # TTY, então não se perde liveness aqui.
 #
-# O arquivo fica no diretório do próprio state (./.cloudman-live.log), então
+# O arquivo fica no diretório do próprio state (./.struct8-live.log), então
 # é naturalmente isolado por path — seguro no modo parallel_execution.
 # Retorna o exit code REAL do comando (não o do tee).
 # ==============================================================================
 _stream_cmd() {
-    local logfile="./.cloudman-live.log"
+    local logfile="./.struct8-live.log"
     : > "$logfile"   # zera o log deste comando
 
     # ORDEM IMPORTA: o tee grava o arquivo CRU (sem carimbo) — o grep de lock
@@ -115,7 +115,7 @@ _stream_cmd() {
 # ==============================================================================
 run_tf_with_stale_lock_recovery() {
     local status lock_id who_str owner_run_id run_status
-    local logfile="./.cloudman-live.log"
+    local logfile="./.struct8-live.log"
 
     _stream_cmd "$@"
     status=$?
@@ -349,7 +349,7 @@ run_terraform_process() {
                   DYNAMODB_TABLE=$(jq -r '.backend.config.dynamodb_table // empty' .terraform/terraform.tfstate)
 
                   if [ -n "$BACKEND_BUCKET" ] && [ -n "$S3_EXACT_KEY" ]; then
-                      # 1. REMOVE DO S3 (Para a lógica de HEAD request do CloudMan funcionar)
+                      # 1. REMOVE DO S3 (Para a lógica de HEAD request do Struct8 funcionar)
                       echo -e "${color}🗑️ ${label} Deleting object: s3://${BACKEND_BUCKET}/${S3_EXACT_KEY}${NC}"
                       aws s3 rm "s3://${BACKEND_BUCKET}/${S3_EXACT_KEY}" --profile backend || echo "⚠️ Warning: failed to delete the object in S3."
 

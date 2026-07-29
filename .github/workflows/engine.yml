@@ -8,7 +8,7 @@ on:
         type: string
         default: "us-east-1"
       stage:
-        # Qual BACKEND do CloudMan este pipeline procura (Gatekeeper + audiência
+        # Qual BACKEND do Struct8 este pipeline procura (Gatekeeper + audiência
         # OIDC). Eixo separado da VERSÃO do engine, que é o `@ref` do `uses:` no
         # workflow do cliente -- os dois costumam andar juntos, mas manter
         # separado permite rodar uma versão nova contra um backend antigo
@@ -121,7 +121,7 @@ jobs:
           echo "needs_private_access=$NEEDS_ACCESS" >> $GITHUB_OUTPUT
           echo "manifest_path=$MANIFEST_PATH" >> $GITHUB_OUTPUT
 
-      - name: 🔑 CloudMan Auth Bridge
+      - name: 🔑 Struct8 Auth Bridge
         id: gatekeeper
         if: steps.manifest_check.outputs.needs_private_access == 'true'
         shell: bash
@@ -130,7 +130,7 @@ jobs:
           # cliente e cairia dentro de um `case` sem passar por aspas.
           STAGE_INPUT: ${{ inputs.stage }}
         run: |
-          # 1. Backend do CloudMan, por estágio.
+          # 1. Backend do Struct8, por estágio.
           #
           # O comentário que vivia aqui dizia "Roteamento Dinâmico (Dev vs Prod)
           # baseado na branch" e a linha seguinte era STAGE="dev" fixo. Nunca foi
@@ -156,7 +156,7 @@ jobs:
               # `https://github.com/<org>` namespace and only ever issues a run
               # the URL of its OWN organization:
               #
-              #   Can't issue ID_TOKEN for audience 'https://github.com/CloudManPro'
+              #   Can't issue ID_TOKEN for audience 'https://github.com/<other-org>'
               #
               # An org URL could therefore only ever serve clients inside that one
               # organization. The value below sits outside the reserved namespace,
@@ -168,7 +168,7 @@ jobs:
               #
               # None of this surfaced for months because this whole step only
               # runs when the manifest declares a PRIVATE external repository.
-              # Until 2026-07-28 CloudManMainV2 was (wrongly) public, so the
+              # Until 2026-07-28 the shared repository was (wrongly) public, so the
               # step's `if:` skipped everything.
               GATEKEEPER_URL="https://dev.app.struct8.com/st/GithubGateKeeper-dev"
               AUDIENCE="https://struct8.com/gitops"
@@ -188,7 +188,7 @@ jobs:
           # parameters silently and issues its DEFAULT audience instead, which is
           # the owner URL (`https://github.com/<owner>`). With `aud=` this line
           # asked for one audience for years and always got the default -- and it
-          # matched by pure accident while the repos lived under the CloudManPro
+          # matched by pure accident while the repos lived under the previous
           # org. Moving to the Struct8 org made the default `.../Struct8` and the
           # Lambda started rejecting the JWT with "Audience doesn't match".
           # Fail LOUDLY when GitHub refuses to issue the token. The old code piped
@@ -236,15 +236,20 @@ jobs:
           echo "✅ Authenticated successfully against $STAGE!"
           echo "token=$TOKEN" >> $GITHUB_OUTPUT
 
-      - name: 📥 Checkout CloudMan Engine
+      - name: 📥 Checkout Struct8 Engine
         uses: actions/checkout@v4
         with:
-          repository: CloudManPro/cloudman-core
-          path: .cloudman-engine
+          # Canonical name. This named the PREVIOUS organization's repository
+          # and only worked through GitHub's rename redirect. A redirect is not
+          # a safe thing to depend on: it dies the moment anyone creates a new
+          # repository under the old name, and the failure is silent -- you get
+          # someone else's repository, not an error.
+          repository: Struct8/CloudMan-Core
+          path: .struct8-engine
           ref: main
-          # LÓGICA CRÍTICA:
-          # Se o gatekeeper rodou, usa o token dele.
-          # Se pulou, usa o GITHUB_TOKEN padrão (funciona se a Engine for pública ou interna à org)
+          # CRITICAL: use the Gatekeeper's token when that step ran; otherwise
+          # fall back to GITHUB_TOKEN, which is enough while the engine is
+          # public or internal to the org.
           token: ${{ steps.gatekeeper.outputs.token || secrets.GITHUB_TOKEN }}
 
       - name: 🛠️ Setup Terraform
@@ -264,7 +269,7 @@ jobs:
           # >>> O manifest_path vem por env, nao inline, para nao interpolar valor
           # do GitHub direto no shell (evita injecao via conteudo do caminho).
           MANIFEST_PATH_INPUT: ${{ steps.manifest_check.outputs.manifest_path }}
-        run: bash .cloudman-engine/scripts/pipeline.sh
+        run: bash .struct8-engine/scripts/pipeline.sh
       # >>> NOVO — STEP INTEIRO. Camada que resolve de verdade o caso principal
       # (apply/destroy cancelado ou com timeout). É um step SEPARADO, que só roda
       # depois que o step anterior já foi morto pelo GitHub Actions (SIGINT em t=0,

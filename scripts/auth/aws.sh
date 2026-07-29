@@ -13,13 +13,13 @@ function auth_aws() {
     # ==========================================================================
     # NOME DA SESSÃO = coluna "User name" do CloudTrail
     # ==========================================================================
-    # Era o literal fixo "CloudMan-${type}", então TODA ação de TODO cliente
+    # Era o literal fixo "Struct8-${type}", então TODA ação de TODO cliente
     # aparecia igual no CloudTrail -- sem dizer quem disparou nem de qual run.
     # (Isso custou caro na investigação dos DeleteNatGateway: deu pra ver o quê
     # e quando, mas o "quem" teve que ser correlacionado à mão com a lista de
     # runs do GitHub.)
     #
-    # Precedência: usuário do CloudMan (vem do manifest, exportado pelo
+    # Precedência: usuário do Struct8 (vem do manifest, exportado pelo
     # engine.yml) > ator do GitHub > genérico. Manifesto antigo, sem o campo,
     # simplesmente cai no passo 2 -- nada quebra.
     local raw_actor="${CLOUDMAN_TRIGGERED_BY:-${GITHUB_ACTOR:-CloudMan}}"

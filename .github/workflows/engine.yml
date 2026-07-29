@@ -150,27 +150,28 @@ jobs:
               # left behind when the app moved to `app.struct8.com`. The curl
               # below died with exit 6 (couldn't resolve host).
               #
-              # Audience: GitHub RESERVES the `https://github.com/<org>` namespace
-              # and only ever issues the URL of the org that OWNS the repository.
-              # Asking for another org's URL is refused with HTTP 400:
+              # Audience: names the SERVICE this token is for, so it cannot be
+              # replayed against another one. Deliberately a CONSTANT, and
+              # deliberately NOT an org URL -- GitHub reserves the
+              # `https://github.com/<org>` namespace and only ever issues a run
+              # the URL of its OWN organization:
               #
               #   Can't issue ID_TOKEN for audience 'https://github.com/CloudManPro'
               #
-              # So this MUST be the client repository's own org. It works today
-              # because every client repo lives under Struct8; a client in their
-              # own organization would fail the request above, loudly. Serving
-              # those requires a CloudMan-owned audience (outside the reserved
-              # namespace) on both ends -- here and in the Lambda.
+              # An org URL could therefore only ever serve clients inside that one
+              # organization. The value below sits outside the reserved namespace,
+              # so GitHub issues it to ANY client org. It does not resolve in DNS
+              # and does not need to.
               #
-              # The GithubGateKeeper-dev Lambda validates this exact string in its
-              # ALLOWED_AUDIENCE. Change one side and the other must follow.
+              # The Gatekeeper validates it in ALLOWED_AUDIENCES, which still
+              # accepts the previous org URL so engines mid-upgrade keep working.
               #
               # None of this surfaced for months because this whole step only
               # runs when the manifest declares a PRIVATE external repository.
               # Until 2026-07-28 CloudManMainV2 was (wrongly) public, so the
               # step's `if:` skipped everything.
               GATEKEEPER_URL="https://dev.app.struct8.com/st/GithubGateKeeper-dev"
-              AUDIENCE="https://github.com/Struct8"
+              AUDIENCE="https://struct8.com/gitops"
               ;;
             *)
               echo "❌ Stage '$STAGE' has no backend mapped in this engine."

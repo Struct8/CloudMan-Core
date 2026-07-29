@@ -146,8 +146,22 @@ jobs:
 
           case "$STAGE" in
             dev)
-              GATEKEEPER_URL="https://dev.v2.cloudman.pro/st/GithubGateKeeper-dev"
-              AUDIENCE="https://github.com/cloudmandevv2"
+              # Host: `dev.v2.cloudman.pro` NO LONGER EXISTS (NXDOMAIN) -- it was
+              # left behind when the app moved to `app.struct8.com`. The curl
+              # below died with exit 6 (couldn't resolve host).
+              #
+              # Audience: the DEPLOYED GithubGateKeeper-dev Lambda validates
+              # `https://github.com/CloudManPro` (its ALLOWED_AUDIENCE). The old
+              # `cloudmandevv2` value is the previous GitHub App slug and would
+              # fail JWT validation right after -- fixing only the URL was not
+              # enough.
+              #
+              # None of this surfaced for months because this whole step only
+              # runs when the manifest declares a PRIVATE external repository.
+              # Until 2026-07-28 CloudManMainV2 was (wrongly) public, so the
+              # step's `if:` skipped everything.
+              GATEKEEPER_URL="https://dev.app.struct8.com/st/GithubGateKeeper-dev"
+              AUDIENCE="https://github.com/CloudManPro"
               ;;
             *)
               echo "❌ Stage '$STAGE' has no backend mapped in this engine."

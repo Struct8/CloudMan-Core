@@ -150,18 +150,27 @@ jobs:
               # left behind when the app moved to `app.struct8.com`. The curl
               # below died with exit 6 (couldn't resolve host).
               #
-              # Audience: the DEPLOYED GithubGateKeeper-dev Lambda validates
-              # `https://github.com/CloudManPro` (its ALLOWED_AUDIENCE). The old
-              # `cloudmandevv2` value is the previous GitHub App slug. Note this
-              # value only started MATTERING once the request below began asking
-              # for it correctly -- see the `audience=` comment there.
+              # Audience: GitHub RESERVES the `https://github.com/<org>` namespace
+              # and only ever issues the URL of the org that OWNS the repository.
+              # Asking for another org's URL is refused with HTTP 400:
+              #
+              #   Can't issue ID_TOKEN for audience 'https://github.com/CloudManPro'
+              #
+              # So this MUST be the client repository's own org. It works today
+              # because every client repo lives under Struct8; a client in their
+              # own organization would fail the request above, loudly. Serving
+              # those requires a CloudMan-owned audience (outside the reserved
+              # namespace) on both ends -- here and in the Lambda.
+              #
+              # The GithubGateKeeper-dev Lambda validates this exact string in its
+              # ALLOWED_AUDIENCE. Change one side and the other must follow.
               #
               # None of this surfaced for months because this whole step only
               # runs when the manifest declares a PRIVATE external repository.
               # Until 2026-07-28 CloudManMainV2 was (wrongly) public, so the
               # step's `if:` skipped everything.
               GATEKEEPER_URL="https://dev.app.struct8.com/st/GithubGateKeeper-dev"
-              AUDIENCE="https://github.com/CloudManPro"
+              AUDIENCE="https://github.com/Struct8"
               ;;
             *)
               echo "❌ Stage '$STAGE' has no backend mapped in this engine."

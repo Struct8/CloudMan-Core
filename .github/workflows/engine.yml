@@ -152,9 +152,9 @@ jobs:
               #
               # Audience: the DEPLOYED GithubGateKeeper-dev Lambda validates
               # `https://github.com/CloudManPro` (its ALLOWED_AUDIENCE). The old
-              # `cloudmandevv2` value is the previous GitHub App slug and would
-              # fail JWT validation right after -- fixing only the URL was not
-              # enough.
+              # `cloudmandevv2` value is the previous GitHub App slug. Note this
+              # value only started MATTERING once the request below began asking
+              # for it correctly -- see the `audience=` comment there.
               #
               # None of this surfaced for months because this whole step only
               # runs when the manifest declares a PRIVATE external repository.
@@ -174,8 +174,15 @@ jobs:
           echo "🔗 Calling the Gatekeeper at: $GATEKEEPER_URL"
 
           # 2. Pega o token OIDC do GitHub usando a audiência dinâmica
+          # The query parameter is `audience`, NOT `aud`. GitHub ignores unknown
+          # parameters silently and issues its DEFAULT audience instead, which is
+          # the owner URL (`https://github.com/<owner>`). With `aud=` this line
+          # asked for one audience for years and always got the default -- and it
+          # matched by pure accident while the repos lived under the CloudManPro
+          # org. Moving to the Struct8 org made the default `.../Struct8` and the
+          # Lambda started rejecting the JWT with "Audience doesn't match".
           ID_TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&aud=$AUDIENCE" | jq -r '.value')
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUDIENCE" | jq -r '.value')
 
           # 3. Faz a chamada POST para o API Gateway correto
           # Nota: O header Content-Type é obrigatório aqui!

@@ -26,12 +26,35 @@ on:
       - '**/manifest.json'
       - '**/main.tf'
 
-# >>> NOVO — Camada "concurrency": evita que duas runs do pipeline cheguem a
-# competir pelo mesmo lock. O GitHub enfileira a segunda run em vez de deixar
-# as duas rodarem juntas e brigarem pelo DynamoDB.
-concurrency:
-  group: terraform-${{ github.repository }}-${{ github.ref }}
-  cancel-in-progress: false
+# NO `concurrency` HERE, deliberately.
+#
+# There used to be one, grouped by `repository + ref`, meant to stop two runs
+# from fighting over the same DynamoDB lock. It was the wrong key and it cost
+# more than it bought:
+#
+#   - Wrong granularity. Every state in a repository shares one branch, so
+#     unrelated states -- different Terraform states, different locks, zero real
+#     contention -- were serialized against each other for no reason.
+#
+#   - It DROPPED deploys. GitHub allows only ONE pending run per concurrency
+#     group: when a third run arrives, the previously pending one is CANCELLED,
+#     not queued behind it. Trigger three states in quick succession and the
+#     middle one disappears without an error anywhere.
+#
+# The real lock is the DynamoDB one, and it is already per state -- which is the
+# granularity that actually matters. Two runs on the SAME state now fail with
+# "Error acquiring the state lock" instead of queueing. That is a deliberate
+# trade: a visible, re-runnable failure beats a silently cancelled deploy.
+#
+# A stale lock (owner run already finished) is still recovered automatically --
+# see run_tf_with_stale_lock_recovery in scripts/pipeline.sh, which confirms the
+# owner's status through the API before forcing the unlock.
+#
+# Want queueing back WITHOUT the two problems above? It cannot be expressed
+# here: workflow-level `concurrency` only sees the `github`, `inputs` and `vars`
+# contexts, and the state path is only known after the manifest step runs. It
+# would take splitting this into two jobs and keying a job-level `concurrency`
+# off `needs.<job>.outputs.<path>`.
 
 permissions:
   id-token: write

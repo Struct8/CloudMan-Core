@@ -181,8 +181,25 @@ jobs:
           # matched by pure accident while the repos lived under the CloudManPro
           # org. Moving to the Struct8 org made the default `.../Struct8` and the
           # Lambda started rejecting the JWT with "Audience doesn't match".
-          ID_TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUDIENCE" | jq -r '.value')
+          # Fail LOUDLY when GitHub refuses to issue the token. The old code piped
+          # curl straight into `jq -r '.value'`, so a refusal became the literal
+          # string "null", got POSTed to the Gatekeeper, and came back as
+          # "invalid OIDC identity" -- blaming the Lambda for a request that never
+          # produced a token in the first place.
+          OIDC_RESPONSE=$(curl -s -w '\n%{http_code}' \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUDIENCE")
+          OIDC_HTTP=$(echo "$OIDC_RESPONSE" | tail -n1)
+          OIDC_BODY=$(echo "$OIDC_RESPONSE" | sed '$d')
+          ID_TOKEN=$(echo "$OIDC_BODY" | jq -r '.value // empty')
+
+          if [ -z "$ID_TOKEN" ]; then
+            # Safe to print: there is no token in this branch, by definition.
+            echo "❌ GitHub refused to issue an OIDC token (HTTP $OIDC_HTTP)."
+            echo "   Requested audience: $AUDIENCE"
+            echo "   Response: $OIDC_BODY"
+            exit 1
+          fi
 
           # 3. Faz a chamada POST para o API Gateway correto
           # Nota: O header Content-Type é obrigatório aqui!

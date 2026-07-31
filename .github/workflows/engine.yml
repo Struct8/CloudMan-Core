@@ -350,6 +350,62 @@ jobs:
           # do GitHub direto no shell (evita injecao via conteudo do caminho).
           MANIFEST_PATH_INPUT: ${{ steps.manifest_check.outputs.manifest_path }}
         run: bash .struct8-engine/scripts/pipeline.sh
+
+      # >>> Publica o resultado do plan como ARTEFATO, não como commit.
+      #
+      # WHY THE PATHS ARE FLATTENED FIRST
+      #
+      # upload-artifact roots the archive at the common ancestor of what it
+      # matched. With a single state that ancestor IS the state's own folder, so
+      # the archive would contain a bare `plan_result.json.gz` with the folder
+      # name gone -- and the folder is the only thing that says WHICH state the
+      # plan belongs to. Two states in one run would then be indistinguishable.
+      # Copying to a staging directory under a name derived from the folder puts
+      # that identity somewhere the archive cannot drop.
+      #
+      # The reader rebuilds the same name from the folder it wants, so the two
+      # sides have to agree on this transformation -- see the artifact lookup in
+      # AgentV2's `get_github_file_content`.
+      - name: 📦 Stage Plan Results
+        if: always()
+        id: stage_plans
+        shell: bash
+        run: |
+          set -e
+          STAGE_DIR="$RUNNER_TEMP/plan-artifacts"
+          rm -rf "$STAGE_DIR"
+          mkdir -p "$STAGE_DIR"
+
+          count=0
+          while IFS= read -r found; do
+            rel="${found#./}"
+            folder="$(dirname "$rel")"
+            # A state at the repository root has no folder to name it after.
+            # `_root` keeps the name well-formed instead of producing `..json.gz`.
+            if [ "$folder" = "." ]; then flat="_root"; else flat="${folder//\//__}"; fi
+            cp "$found" "$STAGE_DIR/${flat}.json.gz"
+            count=$((count + 1))
+            echo "  📄 $folder"
+          done < <(find . -name 'plan_result.json.gz' -not -path './.git/*' -not -path './.struct8-engine/*')
+
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          if [ "$count" -gt 0 ]; then
+            echo "📦 Staged $count plan result(s) for upload."
+          fi
+
+      # retention-days: 1 porque este arquivo é lido uma vez, logo depois do run,
+      # e depois disso é lixo -- guardar mais tempo só ocuparia cota de quem é
+      # dono do repositório. compression-level: 0 porque o conteúdo JÁ é gzip;
+      # deflatar de novo gastaria CPU para não encolher nada.
+      - name: 📤 Publish Plan Result
+        if: always() && steps.stage_plans.outputs.count != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: plan-result
+          path: ${{ runner.temp }}/plan-artifacts
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: ignore
       # >>> NOVO — STEP INTEIRO. Camada que resolve de verdade o caso principal
       # (apply/destroy cancelado ou com timeout). É um step SEPARADO, que só roda
       # depois que o step anterior já foi morto pelo GitHub Actions (SIGINT em t=0,
@@ -461,51 +517,43 @@ jobs:
           fi
 
           # 1b. RESULTADO DO PLAN / DRIFT (lido pelo diagrama, não pelo Terraform)
-          # O arquivo já sai do pipeline.sh com os valores sensíveis redigidos --
-          # ver o bloco de redação lá. Aqui ele só é publicado.
-          # Este push não re-dispara o engine: o gatilho é `paths: manifest.json
-          # / main.tf`, e plan_result.json.gz não casa com nenhum dos dois. O
-          # [skip ci] fica pela mesma razão dos commits acima -- barrar qualquer
-          # outra automação do repositório do cliente que reaja a push.
-          if [ -f "$GITHUB_WORKSPACE/.needs_plan_commit" ]; then
-            echo "📄 Plan result generated. Publishing it for CloudMan to read..."
-            # QUOTED, so git does the matching and not bash. Unquoted, `./**/x`
-            # is expanded by bash, which without globstar treats `**` as a plain
-            # `*` -- it matches one level down, and because it DID match, the
-            # deeper paths are dropped silently. Git's own pathspec lets `*`
-            # cross `/`, so this reaches every folder. Both lines below must have
-            # the same reach: if the removal went deeper than the add, a state
-            # nested two levels down would lose its old file without gaining the
-            # new one.
-            git add -- '*plan_result.json.gz'
+          #
+          # The result itself NO LONGER LIVES HERE. It is published as a workflow
+          # artifact (see the upload step earlier in this job), because it is
+          # read once, right after the run, and is worthless a few edits later --
+          # a repository is the wrong home for something with that lifetime. The
+          # customer's history is theirs; it should not accumulate our scratch.
+          #
+          # What remains is removing what earlier engines DID commit here. Left
+          # behind, those files are a plan frozen at whatever the last run
+          # produced -- and the reader still knows the old paths, so a stale plan
+          # would be served wearing the face of a current one. Both names are
+          # swept: `.json` from before compression, `.gz` from the brief window
+          # when the compressed file was still committed.
+          #
+          # QUOTED, so git does the matching and not bash. Unquoted, `./**/x` is
+          # expanded by bash, which without globstar treats `**` as a plain `*`
+          # -- it matches one level down, and because it DID match, the deeper
+          # paths are dropped silently. Git's own pathspec lets `*` cross `/`.
+          #
+          # NOT --cached: that only unstages a file, leaving it on disk as
+          # untracked. This step runs while states in the same repository can be
+          # publishing in parallel (see the note on `concurrency` at the top of
+          # this file), so a losing run's retry rebases -- which checks out the
+          # winner's commit internally, and git refuses to check out over an
+          # untracked file that commit would create. A `--cached` removal here
+          # reliably broke the next run's rebase.
+          #
+          # --ignore-unmatch makes all of this a no-op from the second run on,
+          # and in repositories that never carried either file, so the common
+          # case stages nothing and never reaches a commit or a push.
+          git rm --quiet --ignore-unmatch -- '*plan_result.json' '*plan_result.json.gz' || true
 
-            # The uncompressed predecessor has to LEAVE the repository, not just
-            # stop being written. Left behind, it is a plan frozen at whatever
-            # the last uncompressed run produced, sitting at the exact path the
-            # reader falls back to when it finds no .gz -- so a stale plan would
-            # be served wearing the face of a current one. The pathspec cannot
-            # hit the new file: it anchors on the `.json` ending, and the new one
-            # ends in `.gz`. --ignore-unmatch makes this a no-op from the second
-            # run on, and in repositories that never had the old file.
-            #
-            # NOT --cached: that only unstages the file, leaving it sitting on
-            # disk as untracked. This step runs while states in the same
-            # repository can be publishing in parallel (see the note on
-            # `concurrency` at the top of this file), so a losing run's retry
-            # rebases -- which checks out the winner's commit internally, and
-            # git refuses to check out over an untracked file that commit would
-            # create. That is exactly what an untracked leftover here is once
-            # another state's run already deleted the same path upstream, so a
-            # `--cached` removal here reliably broke the next run's rebase.
-            git rm --quiet --ignore-unmatch -- '*plan_result.json' || true
-
-            if ! git diff --staged --quiet; then
-              git commit -m "chore: plan result for CloudMan [skip ci]"
-              push_with_retry "plan result"
-              echo "✅ Plan result pushed to the repository."
-            else
-              echo "Plan result unchanged since the last run."
-            fi
+          if ! git diff --staged --quiet; then
+            echo "🧹 Removing plan results committed by an earlier engine..."
+            git commit -m "chore: drop committed plan results, now published as artifacts [skip ci]"
+            push_with_retry "plan result cleanup"
+            echo "✅ Old plan results removed from the repository."
           fi
 
           # 2. LÓGICA DO PASSO 4 (LIMPEZA PÓS-APPLY)

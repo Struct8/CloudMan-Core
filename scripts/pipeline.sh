@@ -391,10 +391,12 @@ run_terraform_process() {
                 }
               ' cloudman.plan.raw.json > plan_result.json && gzip -9 -f plan_result.json; then
                 echo -e "${color}✅ ${label} plan_result.json.gz ready (sensitive values redacted).${NC}"
-                touch "$GITHUB_WORKSPACE/.needs_plan_commit"
+                # No flag file to raise: the workflow finds these by name and
+                # uploads them as an artifact, so leaving the file where it was
+                # written IS the signal. Nothing here reaches the repository.
               else
                 # Sem redação confiável, NADA é publicado. Falhar de forma visível
-                # é preferível a commitar um arquivo que pode conter segredo.
+                # é preferível a publicar um arquivo que pode conter segredo.
                 echo -e "${RED}❌ ${label} Could not redact the plan JSON; refusing to publish it.${NC}"
                 rm -f plan_result.json plan_result.json.gz
               fi

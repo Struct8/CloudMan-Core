@@ -91,9 +91,22 @@ jobs:
         id: manifest_check
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Piso, usado quando o manifesto nao diz nada.
+          ENGINE_REF_INPUT: ${{ inputs.engine_ref }}
         shell: bash
         run: |
           echo "🔍 Identifying which folder triggered the pipeline..."
+
+          # Which SCRIPTS version this run executes.
+          #
+          # Read from the MANIFEST, which the app rewrites on every operation, so
+          # it carries the stage of whoever triggered THIS run. That is what lets
+          # two users of the same repository run different engine versions --
+          # `jobs.<id>.uses` is fixed at link time and takes no expression, so the
+          # workflow file cannot vary per run, but this checkout can.
+          #
+          # The input is the floor for callers whose manifest predates the field.
+          ENGINE_REF_DEFAULT="${ENGINE_REF_INPUT:-main}"
 
           # 1. Tenta achar o manifesto na pasta que teve o código alterado
           MANIFEST_PATH=$(git diff --name-only HEAD^ HEAD 2>/dev/null | grep "manifest.json" | head -n 1 || true)
@@ -111,12 +124,14 @@ jobs:
           if [ -z "$MANIFEST_PATH" ]; then
             echo "⚠️ No manifest found. Assuming the default flow (false)."
             echo "needs_private_access=false" >> $GITHUB_OUTPUT
+            echo "engine_ref=$ENGINE_REF_DEFAULT" >> $GITHUB_OUTPUT
             exit 0
           fi
 
           if [ ! -s "$MANIFEST_PATH" ]; then
              echo "⚠️ manifest.json exists but is empty."
              echo "needs_private_access=false" >> $GITHUB_OUTPUT
+             echo "engine_ref=$ENGINE_REF_DEFAULT" >> $GITHUB_OUTPUT
              exit 0
           fi
 
@@ -156,9 +171,30 @@ jobs:
 
           echo "📊 Gatekeeper analysis result: $NEEDS_ACCESS"
 
+          ENGINE_REF=$(jq -r '.engine_ref // empty' "$MANIFEST_PATH")
+          [ -z "$ENGINE_REF" ] && ENGINE_REF="$ENGINE_REF_DEFAULT"
+
+          # Allowlist, not free choice. The manifest lives in the CLIENT's
+          # repository, so this value is client-editable. `repository:` below is
+          # fixed, so the worst case is running another version of OUR code and
+          # never someone else's -- but an unknown ref would still mean checking
+          # out whatever the manifest names. Same convention as the stage table:
+          # refuse loudly instead of resolving something nobody chose.
+          case "$ENGINE_REF" in
+            dev|main) ;;
+            *)
+              echo "❌ Engine channel '$ENGINE_REF' is not one this engine serves."
+              echo "   Served today: dev, main."
+              exit 1
+              ;;
+          esac
+
+          echo "⚙️ Engine scripts channel: $ENGINE_REF"
+
           # SALVANDO NA MEMÓRIA PARA O RESTO DO PIPELINE
           echo "needs_private_access=$NEEDS_ACCESS" >> $GITHUB_OUTPUT
           echo "manifest_path=$MANIFEST_PATH" >> $GITHUB_OUTPUT
+          echo "engine_ref=$ENGINE_REF" >> $GITHUB_OUTPUT
 
       - name: 🔑 Struct8 Auth Bridge
         id: gatekeeper
@@ -290,7 +326,7 @@ jobs:
           #
           # Defaults to `main`, so a caller that says nothing keeps exactly the
           # behaviour this had when the value was hardcoded.
-          ref: ${{ inputs.engine_ref }}
+          ref: ${{ steps.manifest_check.outputs.engine_ref || inputs.engine_ref }}
           # CRITICAL: use the Gatekeeper's token when that step ran; otherwise
           # fall back to GITHUB_TOKEN, which is enough while the engine is
           # public or internal to the org.

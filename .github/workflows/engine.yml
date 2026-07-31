@@ -269,7 +269,20 @@ jobs:
           # someone else's repository, not an error.
           repository: Struct8/CloudMan-Core
           path: .struct8-engine
-          ref: main
+          # Pin the scripts to the SAME commit as this workflow file.
+          #
+          # This said `ref: main`, hardcoded, which split the engine in half: the
+          # client's `uses: ...engine.yml@<ref>` chose THIS file, but scripts/
+          # always came from main regardless. Pointing a client at the `dev`
+          # channel therefore delivered the new workflow running the OLD scripts,
+          # with no error anywhere -- so any change under scripts/ was untestable
+          # through the dev channel, and appeared simply not to happen.
+          #
+          # `github.job_workflow_sha` is the commit of the reusable workflow being
+          # executed, so both halves are always the same commit. The fallback
+          # covers running this file directly (workflow_dispatch / push), where
+          # the job is not a reusable-workflow call and the context is empty.
+          ref: ${{ github.job_workflow_sha || 'main' }}
           # CRITICAL: use the Gatekeeper's token when that step ran; otherwise
           # fall back to GITHUB_TOKEN, which is enough while the engine is
           # public or internal to the org.

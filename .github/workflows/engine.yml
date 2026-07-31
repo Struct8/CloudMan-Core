@@ -20,6 +20,22 @@ on:
         required: false
         type: string
         default: "dev"
+      engine_ref:
+        # Qual versão dos SCRIPTS este pipeline executa.
+        #
+        # Precisa ser dito explicitamente porque um workflow reutilizável NÃO
+        # consegue descobrir a própria ref: `github.ref` é a do CHAMADOR, e
+        # `github.job_workflow_sha` não é exposto ao `${{ }}` do `with:` (testado
+        # -- resolve vazio). Sem este input o checkout abaixo ficava fixo em
+        # `main`, e aí o `uses: ...@<ref>` do cliente escolhia só ESTE arquivo:
+        # o cliente recebia o workflow novo rodando os scripts velhos, sem erro
+        # em lugar nenhum. Mudança em scripts/ virava intestável.
+        #
+        # Quem gera o workflow do cliente já conhece o valor (é o mesmo do
+        # `uses: ...@<ref>`) e deve emitir os dois juntos.
+        required: false
+        type: string
+        default: "main"
   workflow_dispatch:
   push:
     paths:
@@ -269,20 +285,12 @@ jobs:
           # someone else's repository, not an error.
           repository: Struct8/CloudMan-Core
           path: .struct8-engine
-          # Pin the scripts to the SAME commit as this workflow file.
+          # The scripts half of the engine. See the `engine_ref` input for why the
+          # caller has to state this instead of it being derived here.
           #
-          # This said `ref: main`, hardcoded, which split the engine in half: the
-          # client's `uses: ...engine.yml@<ref>` chose THIS file, but scripts/
-          # always came from main regardless. Pointing a client at the `dev`
-          # channel therefore delivered the new workflow running the OLD scripts,
-          # with no error anywhere -- so any change under scripts/ was untestable
-          # through the dev channel, and appeared simply not to happen.
-          #
-          # `github.job_workflow_sha` is the commit of the reusable workflow being
-          # executed, so both halves are always the same commit. The fallback
-          # covers running this file directly (workflow_dispatch / push), where
-          # the job is not a reusable-workflow call and the context is empty.
-          ref: ${{ github.job_workflow_sha || 'main' }}
+          # Defaults to `main`, so a caller that says nothing keeps exactly the
+          # behaviour this had when the value was hardcoded.
+          ref: ${{ inputs.engine_ref }}
           # CRITICAL: use the Gatekeeper's token when that step ran; otherwise
           # fall back to GITHUB_TOKEN, which is enough while the engine is
           # public or internal to the org.

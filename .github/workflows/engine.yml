@@ -407,6 +407,47 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
+          # Pushing from here RACES. States in one repository run in parallel --
+          # see the note about `concurrency` at the top of this file -- so two runs
+          # can reach this step at the same time. A bare `git push` loses that race
+          # with a non-fast-forward rejection, and under `set -e` that kills the
+          # whole run AFTER the terraform work already succeeded.
+          #
+          # Rebase rather than merge: each run adds one commit touching only its own
+          # state folder, so replaying it on top of whatever landed first is exactly
+          # right and leaves no merge commits in the client's history.
+          #
+          # A conflict here would mean two runs writing the SAME file, which the
+          # per-state layout should make impossible. If it happens the rebase is
+          # aborted and the step fails loudly instead of guessing.
+          push_with_retry() {
+              local label="$1" attempt=1 max=5
+              local branch="${GITHUB_REF_NAME:-main}"
+
+              until git push; do
+                  if [ "$attempt" -ge "$max" ]; then
+                      echo "❌ ${label}: still rejected after ${max} attempts."
+                      return 1
+                  fi
+
+                  echo "🔁 ${label}: another run reached the branch first. Rebasing (${attempt}/${max})..."
+
+                  # The client checkout is shallow (fetch-depth: 2), so the rebase
+                  # base may simply not be present. Deepen first; on a complete
+                  # clone --deepen errors, hence the fallback.
+                  git fetch --deepen=20 origin "$branch" 2>/dev/null || git fetch origin "$branch"
+
+                  if ! git rebase "origin/$branch"; then
+                      git rebase --abort || true
+                      echo "❌ ${label}: conflict while rebasing onto origin/$branch."
+                      return 1
+                  fi
+
+                  attempt=$((attempt + 1))
+                  sleep $((attempt * 3))
+              done
+          }
+
           # 1. LÓGICA DO PASSO 2 (GERAÇÃO DE IMPORT)
           if [ -f "$GITHUB_WORKSPACE/.needs_commit" ]; then
             echo "📥 Import operation detected. Saving the generated resources to the repository..."
@@ -414,7 +455,7 @@ jobs:
 
             if ! git diff --staged --quiet; then
               git commit -m "chore: generated terraform awaiting CloudMan review [skip ci]"
-              git push
+              push_with_retry "import code"
               echo "✅ Import code pushed to the repository."
             fi
           fi
@@ -432,7 +473,7 @@ jobs:
 
             if ! git diff --staged --quiet; then
               git commit -m "chore: plan result for CloudMan [skip ci]"
-              git push
+              push_with_retry "plan result"
               echo "✅ Plan result pushed to the repository."
             else
               echo "Plan result unchanged since the last run."
@@ -448,7 +489,7 @@ jobs:
 
             if ! git diff --staged --quiet; then
               git commit -m "chore: cleanup import.tf and json after successful apply [skip ci]"
-              git push
+              push_with_retry "post-apply cleanup"
               echo "✅ Leftover files removed from the repository."
             else
               echo "No leftover files to clean up in git."

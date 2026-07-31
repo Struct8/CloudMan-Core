@@ -362,6 +362,26 @@ jobs:
             fi
           fi
 
+          # 1b. RESULTADO DO PLAN / DRIFT (lido pelo diagrama, não pelo Terraform)
+          # O arquivo já sai do pipeline.sh com os valores sensíveis redigidos --
+          # ver o bloco de redação lá. Aqui ele só é publicado.
+          # Este push não re-dispara o engine: o gatilho é `paths: manifest.json
+          # / main.tf`, e plan_result.json não casa com nenhum dos dois. O
+          # [skip ci] fica pela mesma razão dos commits acima -- barrar qualquer
+          # outra automação do repositório do cliente que reaja a push.
+          if [ -f "$GITHUB_WORKSPACE/.needs_plan_commit" ]; then
+            echo "📄 Plan result generated. Publishing it for CloudMan to read..."
+            git add ./**/plan_result.json
+
+            if ! git diff --staged --quiet; then
+              git commit -m "chore: plan result for CloudMan [skip ci]"
+              git push
+              echo "✅ Plan result pushed to the repository."
+            else
+              echo "Plan result unchanged since the last run."
+            fi
+          fi
+
           # 2. LÓGICA DO PASSO 4 (LIMPEZA PÓS-APPLY)
           if [ -f "$GITHUB_WORKSPACE/.needs_cleanup" ]; then
             echo "🧹 Apply finished. Removing the import files from the repository..."

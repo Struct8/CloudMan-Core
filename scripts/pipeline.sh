@@ -296,8 +296,100 @@ run_terraform_process() {
         # ---------------------------------------------------------
         echo -e "${color}▶️ ${label} Running terraform $action...${NC}"
 
-        if [ "$action" == "plan" ]; then
-          run_tf_with_stale_lock_recovery terraform plan -input=false
+        if [ "$action" == "plan" ] || [ "$action" == "drift" ]; then
+          # `drift` roda o MESMO plan, com uma pergunta diferente: -refresh-only
+          # compara o state com a nuvem e ignora o que o código pede, então o que
+          # sai é só o que mudou por fora. Sem ele, o plano responde as duas
+          # coisas de uma vez e não dá pra separar quem causou o quê.
+          PLAN_EXTRA_FLAGS=""
+          if [ "$action" == "drift" ]; then
+            PLAN_EXTRA_FLAGS="-refresh-only"
+          fi
+
+          # -out grava o plano num arquivo pra ele poder ser relido como JSON.
+          # NÃO usar -detailed-exitcode: ele faz "há mudanças" virar exit 2, o que
+          # marcaria como FALHA todo plan que encontrasse algo -- exatamente o caso
+          # normal. O comportamento de saída do plan continua o de antes.
+          run_tf_with_stale_lock_recovery terraform plan -input=false $PLAN_EXTRA_FLAGS -out=cloudman.tfplan
+          PLAN_STATUS=$?
+
+          if [ $PLAN_STATUS -eq 0 ] && [ -f "cloudman.tfplan" ]; then
+            echo -e "${color}📄 ${label} Converting the plan to JSON for the front end...${NC}"
+
+            if terraform show -json cloudman.tfplan > cloudman.plan.raw.json 2>/dev/null; then
+              # ---------------------------------------------------------------
+              # REDAÇÃO — roda ANTES de qualquer commit, e é o motivo deste bloco
+              # existir. `terraform show -json` NÃO mascara valor sensível: ele
+              # entrega o valor e apenas o SINALIZA em before_sensitive/
+              # after_sensitive. Como este arquivo é commitado no repositório do
+              # cliente, gravá-lo cru colocaria segredo no histórico do git, onde
+              # apagar depois não resolve.
+              #
+              # Duas defesas somadas:
+              # 1. Só sobrevivem os campos que o front-end lê. prior_state,
+              #    planned_values e configuration carregam o estado inteiro da
+              #    infraestrutura e nada aqui os consome -- some com eles corta a
+              #    maior parte da exposição de uma vez.
+              # 2. Toda folha marcada como sensível vira "__REDACTED__", em
+              #    before e after, incluindo dentro de bloco aninhado e lista.
+              #
+              # LIMITE 1 (alcance): isto cobre o que o PROVIDER marcou como
+              # sensível. Segredo guardado num campo comum (ex.: senha colada num
+              # user_data) não é sinalizado por ninguém e passa. Nenhuma redação
+              # genérica resolve isso -- quem escreve segredo em campo comum
+              # precisa de sensitive/Secrets Manager.
+              #
+              # LIMITE 2 (fidelidade): os dois lados recebem o MESMO marcador,
+              # então uma mudança que acontece só dentro de campo sensível fica
+              # indistinguível de "não mudou" para quem lê o arquivo depois --
+              # uma troca de senha não aparece como alteração. Preservar esse
+              # sinal exigiria percorrer before/after em paralelo e marcar os
+              # lados de forma diferente quando divergem. Fica em aberto de
+              # propósito: hoje o diagrama só desenha o badge por recurso e não
+              # renderiza diferença campo-a-campo, então nada é perdido na tela.
+              # Quem for exibir campo-a-campo precisa resolver isto ANTES, senão
+              # a tela afirma "sem alteração" sobre algo que não sabe.
+              # ---------------------------------------------------------------
+              if jq -e '
+                def redact($val; $sens):
+                  if $sens == true then "__REDACTED__"
+                  elif ($sens | type) == "object" and ($val | type) == "object" then
+                    reduce ($val | keys_unsorted[]) as $k
+                      ({}; .[$k] = redact($val[$k]; ($sens[$k] // false)))
+                  elif ($sens | type) == "array" and ($val | type) == "array" then
+                    [ range(0; $val | length) as $i
+                      | redact($val[$i]; (($sens[$i]) // false)) ]
+                  else $val
+                  end;
+
+                def redact_change:
+                  .before = redact(.before; (.before_sensitive // false))
+                  | .after = redact(.after; (.after_sensitive // false));
+
+                {
+                  format_version:    .format_version,
+                  terraform_version: .terraform_version,
+                  resource_changes:  [ (.resource_changes // [])[] | .change |= redact_change ],
+                  resource_drift:    [ (.resource_drift   // [])[] | .change |= redact_change ]
+                }
+              ' cloudman.plan.raw.json > plan_result.json; then
+                echo -e "${color}✅ ${label} plan_result.json ready (sensitive values redacted).${NC}"
+                touch "$GITHUB_WORKSPACE/.needs_plan_commit"
+              else
+                # Sem redação confiável, NADA é publicado. Falhar de forma visível
+                # é preferível a commitar um arquivo que pode conter segredo.
+                echo -e "${RED}❌ ${label} Could not redact the plan JSON; refusing to publish it.${NC}"
+                rm -f plan_result.json
+              fi
+            else
+              echo -e "${YELLOW}⚠️ ${label} Could not convert the plan to JSON. The plan itself ran fine.${NC}"
+            fi
+          fi
+
+          # O .tfplan e o JSON cru carregam os valores NÃO redigidos. Somem sempre,
+          # inclusive quando algum passo acima falhou, pra não sobrar no workspace
+          # nem serem varridos por um `git add` de outro step.
+          rm -f cloudman.tfplan cloudman.plan.raw.json
 
         elif [ "$action" == "apply" ]; then
           echo -e "${color}▶️ ${label} Running terraform apply...${NC}"

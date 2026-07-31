@@ -350,6 +350,23 @@ run_terraform_process() {
               # Quem for exibir campo-a-campo precisa resolver isto ANTES, senão
               # a tela afirma "sem alteração" sobre algo que não sabe.
               # ---------------------------------------------------------------
+              #
+              # WHY IT IS PUBLISHED COMPRESSED
+              #
+              # The reader is the diagram, never a human browsing the repository,
+              # and it goes through GitHub's contents API -- which returns an
+              # EMPTY body for files over 1 MB. That limit is silent: the caller
+              # gets HTTP 200 with no content and reports "the plan is not ready
+              # yet", so a plan too big to fetch is indistinguishable from a run
+              # still in flight. Real captures are already 150-300 KB, so gzip
+              # (~15x on plan JSON) moves the ceiling far enough out to stop
+              # being a concern, and shrinks what the client's history carries
+              # by the same factor.
+              #
+              # `&&` and not a pipe: in a pipeline the exit status is gzip's, so
+              # `jq` failing to redact would be masked and the guard below --
+              # which exists to never publish unredacted values -- would never
+              # fire. Keeping them as separate commands keeps jq's status.
               if jq -e '
                 def redact($val; $sens):
                   if $sens == true then "__REDACTED__"
@@ -372,14 +389,14 @@ run_terraform_process() {
                   resource_changes:  [ (.resource_changes // [])[] | .change |= redact_change ],
                   resource_drift:    [ (.resource_drift   // [])[] | .change |= redact_change ]
                 }
-              ' cloudman.plan.raw.json > plan_result.json; then
-                echo -e "${color}✅ ${label} plan_result.json ready (sensitive values redacted).${NC}"
+              ' cloudman.plan.raw.json > plan_result.json && gzip -9 -f plan_result.json; then
+                echo -e "${color}✅ ${label} plan_result.json.gz ready (sensitive values redacted).${NC}"
                 touch "$GITHUB_WORKSPACE/.needs_plan_commit"
               else
                 # Sem redação confiável, NADA é publicado. Falhar de forma visível
                 # é preferível a commitar um arquivo que pode conter segredo.
                 echo -e "${RED}❌ ${label} Could not redact the plan JSON; refusing to publish it.${NC}"
-                rm -f plan_result.json
+                rm -f plan_result.json plan_result.json.gz
               fi
             else
               echo -e "${YELLOW}⚠️ ${label} Could not convert the plan to JSON. The plan itself ran fine.${NC}"

@@ -464,12 +464,30 @@ jobs:
           # O arquivo já sai do pipeline.sh com os valores sensíveis redigidos --
           # ver o bloco de redação lá. Aqui ele só é publicado.
           # Este push não re-dispara o engine: o gatilho é `paths: manifest.json
-          # / main.tf`, e plan_result.json não casa com nenhum dos dois. O
+          # / main.tf`, e plan_result.json.gz não casa com nenhum dos dois. O
           # [skip ci] fica pela mesma razão dos commits acima -- barrar qualquer
           # outra automação do repositório do cliente que reaja a push.
           if [ -f "$GITHUB_WORKSPACE/.needs_plan_commit" ]; then
             echo "📄 Plan result generated. Publishing it for CloudMan to read..."
-            git add ./**/plan_result.json
+            # QUOTED, so git does the matching and not bash. Unquoted, `./**/x`
+            # is expanded by bash, which without globstar treats `**` as a plain
+            # `*` -- it matches one level down, and because it DID match, the
+            # deeper paths are dropped silently. Git's own pathspec lets `*`
+            # cross `/`, so this reaches every folder. Both lines below must have
+            # the same reach: if the removal went deeper than the add, a state
+            # nested two levels down would lose its old file without gaining the
+            # new one.
+            git add -- '*plan_result.json.gz'
+
+            # The uncompressed predecessor has to LEAVE the repository, not just
+            # stop being written. Left behind, it is a plan frozen at whatever
+            # the last uncompressed run produced, sitting at the exact path the
+            # reader falls back to when it finds no .gz -- so a stale plan would
+            # be served wearing the face of a current one. The pathspec cannot
+            # hit the new file: it anchors on the `.json` ending, and the new one
+            # ends in `.gz`. --ignore-unmatch makes this a no-op from the second
+            # run on, and in repositories that never had the old file.
+            git rm --quiet --cached --ignore-unmatch -- '*plan_result.json' || true
 
             if ! git diff --staged --quiet; then
               git commit -m "chore: plan result for CloudMan [skip ci]"

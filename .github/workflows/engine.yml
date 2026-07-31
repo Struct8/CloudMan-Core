@@ -487,7 +487,17 @@ jobs:
             # hit the new file: it anchors on the `.json` ending, and the new one
             # ends in `.gz`. --ignore-unmatch makes this a no-op from the second
             # run on, and in repositories that never had the old file.
-            git rm --quiet --cached --ignore-unmatch -- '*plan_result.json' || true
+            #
+            # NOT --cached: that only unstages the file, leaving it sitting on
+            # disk as untracked. This step runs while states in the same
+            # repository can be publishing in parallel (see the note on
+            # `concurrency` at the top of this file), so a losing run's retry
+            # rebases -- which checks out the winner's commit internally, and
+            # git refuses to check out over an untracked file that commit would
+            # create. That is exactly what an untracked leftover here is once
+            # another state's run already deleted the same path upstream, so a
+            # `--cached` removal here reliably broke the next run's rebase.
+            git rm --quiet --ignore-unmatch -- '*plan_result.json' || true
 
             if ! git diff --staged --quiet; then
               git commit -m "chore: plan result for CloudMan [skip ci]"

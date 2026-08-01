@@ -147,6 +147,44 @@ run_tf_with_stale_lock_recovery() {
 }
 
 # ==============================================================================
+# Hands a file to the workflow's publish step.
+#
+# WHY THIS INDIRECTION EXISTS
+#
+# The workflow uploads whatever lands in this directory, without knowing what any
+# of it is. That matters because `engine.yml` is ONE file shared by every channel
+# and every customer, while this script is checked out per channel -- so anything
+# encoded in the workflow can only change for everyone at once. Publishing a new
+# kind of file later is a change here, in the channel being developed, and never
+# a change there.
+#
+# WHY THE NAME CARRIES THE FOLDER
+#
+# The archive cannot: upload-artifact roots it at the common ancestor of what it
+# matched, which for a single state IS that state's folder -- so the folder name,
+# the only thing saying WHICH state a file belongs to, would be gone. Encoding it
+# in the filename puts it somewhere the archive cannot drop. The reader rebuilds
+# the same name; see `artifact_entry_name` in AgentV2.
+# ==============================================================================
+publish_engine_artifact() {
+    local src_dir="$1" file="$2"
+    local out="${RUNNER_TEMP:-/tmp}/struct8-artifacts"
+
+    local flat="${src_dir#./}"
+    flat="${flat%/}"
+    # A state at the repository root has no folder to name it after; `_root`
+    # keeps the name well-formed instead of producing a leading dot.
+    if [ -z "$flat" ] || [ "$flat" = "." ]; then
+        flat="_root"
+    else
+        flat="${flat//\//__}"
+    fi
+
+    mkdir -p "$out"
+    cp "$file" "$out/${flat}.${file}"
+}
+
+# ==============================================================================
 # FUNÇÃO PRINCIPAL: Execução do Terraform
 # ==============================================================================
 run_terraform_process() {
@@ -391,9 +429,10 @@ run_terraform_process() {
                 }
               ' cloudman.plan.raw.json > plan_result.json && gzip -9 -f plan_result.json; then
                 echo -e "${color}✅ ${label} plan_result.json.gz ready (sensitive values redacted).${NC}"
-                # No flag file to raise: the workflow finds these by name and
-                # uploads them as an artifact, so leaving the file where it was
-                # written IS the signal. Nothing here reaches the repository.
+                # Nothing here reaches the customer's repository. The file is
+                # handed to the workflow's publish step instead, which uploads it
+                # without knowing what it is.
+                publish_engine_artifact "$path" plan_result.json.gz
               else
                 # Sem redação confiável, NADA é publicado. Falhar de forma visível
                 # é preferível a publicar um arquivo que pode conter segredo.

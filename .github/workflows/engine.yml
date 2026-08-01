@@ -351,58 +351,35 @@ jobs:
           MANIFEST_PATH_INPUT: ${{ steps.manifest_check.outputs.manifest_path }}
         run: bash .struct8-engine/scripts/pipeline.sh
 
-      # >>> Publica o resultado do plan como ARTEFATO, não como commit.
+      # >>> Publica o que os SCRIPTS decidiram publicar. Nada aqui sabe o que é.
       #
-      # WHY THE PATHS ARE FLATTENED FIRST
+      # This step carries no knowledge of any particular file -- not its name,
+      # not which folder it came from, not whether it should exist at all. It
+      # uploads whatever `publish_engine_artifact` (in the scripts) left in the
+      # directory below.
       #
-      # upload-artifact roots the archive at the common ancestor of what it
-      # matched. With a single state that ancestor IS the state's own folder, so
-      # the archive would contain a bare `plan_result.json.gz` with the folder
-      # name gone -- and the folder is the only thing that says WHICH state the
-      # plan belongs to. Two states in one run would then be indistinguishable.
-      # Copying to a staging directory under a name derived from the folder puts
-      # that identity somewhere the archive cannot drop.
+      # That emptiness is the point. This file is ONE workflow shared by every
+      # channel and every customer, so anything encoded here can only change for
+      # everyone at once -- and a channel exists precisely so that it does not
+      # have to. The scripts are checked out per channel, so keeping the decision
+      # there is what lets `dev` publish something new while `main` does not,
+      # from the same workflow, with no second job and no extra billed minute.
       #
-      # The reader rebuilds the same name from the folder it wants, so the two
-      # sides have to agree on this transformation -- see the artifact lookup in
-      # AgentV2's `get_github_file_content`.
-      - name: 📦 Stage Plan Results
+      # Adding a new published file later is a change in the scripts of the
+      # channel being developed. It never comes back here.
+      #
+      # `if-no-files-found: ignore` is what makes a channel that publishes
+      # nothing a silent no-op rather than a warning. retention-days: 1 because
+      # these are read once, right after the run, and are worthless afterwards --
+      # keeping them longer would only spend the repository owner's quota.
+      # compression-level: 0 because the scripts already compress what they
+      # stage; deflating it again would spend CPU to shrink nothing.
+      - name: 📤 Publish Engine Output
         if: always()
-        id: stage_plans
-        shell: bash
-        run: |
-          set -e
-          STAGE_DIR="$RUNNER_TEMP/plan-artifacts"
-          rm -rf "$STAGE_DIR"
-          mkdir -p "$STAGE_DIR"
-
-          count=0
-          while IFS= read -r found; do
-            rel="${found#./}"
-            folder="$(dirname "$rel")"
-            # A state at the repository root has no folder to name it after.
-            # `_root` keeps the name well-formed instead of producing `..json.gz`.
-            if [ "$folder" = "." ]; then flat="_root"; else flat="${folder//\//__}"; fi
-            cp "$found" "$STAGE_DIR/${flat}.json.gz"
-            count=$((count + 1))
-            echo "  📄 $folder"
-          done < <(find . -name 'plan_result.json.gz' -not -path './.git/*' -not -path './.struct8-engine/*')
-
-          echo "count=$count" >> "$GITHUB_OUTPUT"
-          if [ "$count" -gt 0 ]; then
-            echo "📦 Staged $count plan result(s) for upload."
-          fi
-
-      # retention-days: 1 porque este arquivo é lido uma vez, logo depois do run,
-      # e depois disso é lixo -- guardar mais tempo só ocuparia cota de quem é
-      # dono do repositório. compression-level: 0 porque o conteúdo JÁ é gzip;
-      # deflatar de novo gastaria CPU para não encolher nada.
-      - name: 📤 Publish Plan Result
-        if: always() && steps.stage_plans.outputs.count != '0'
         uses: actions/upload-artifact@v4
         with:
-          name: plan-result
-          path: ${{ runner.temp }}/plan-artifacts
+          name: engine-output
+          path: ${{ runner.temp }}/struct8-artifacts
           retention-days: 1
           compression-level: 0
           if-no-files-found: ignore

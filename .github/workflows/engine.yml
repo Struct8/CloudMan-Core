@@ -180,11 +180,18 @@ jobs:
           # never someone else's -- but an unknown ref would still mean checking
           # out whatever the manifest names. Same convention as the stage table:
           # refuse loudly instead of resolving something nobody chose.
+          #
+          # The ladder, lowest to highest: devlocal -> dev -> test -> alpha ->
+          # main. Each is a branch here, each account is pinned to one by its
+          # Cognito stage, and promoting is a merge forward. `devlocal` and `dev`
+          # are separate on purpose: `devlocal` is whoever is running the
+          # frontend from localhost, `dev` is the deployed dev environment, and
+          # they must be able to hold different code at the same time.
           case "$ENGINE_REF" in
-            dev|main) ;;
+            devlocal|dev|test|alpha|main) ;;
             *)
               echo "❌ Engine channel '$ENGINE_REF' is not one this engine serves."
-              echo "   Served today: dev, main."
+              echo "   Served today: devlocal, dev, test, alpha, main."
               exit 1
               ;;
           esac
@@ -196,6 +203,22 @@ jobs:
           echo "manifest_path=$MANIFEST_PATH" >> $GITHUB_OUTPUT
           echo "engine_ref=$ENGINE_REF" >> $GITHUB_OUTPUT
 
+      # THE ONE STEP THAT CANNOT BECOME A SCRIPT
+      #
+      # Everything else that carries changeable logic has moved to
+      # `.struct8-engine/scripts/`, so a channel can evolve it without touching
+      # this file. This step cannot follow, and the reason is an ordering
+      # cycle rather than a preference: the token it produces is what the engine
+      # CHECKOUT below authenticates with, so it has to run before the scripts
+      # exist on disk. A script cannot bootstrap the checkout that fetches it.
+      #
+      # It works today with the client repository's own token as a fallback,
+      # because this engine repository is public -- but leaning on that would
+      # mean a change of visibility silently breaks every customer, and this
+      # engine has already had a repository flip to private once.
+      #
+      # So it stays here, and the cost is real: a change to it lands on everyone
+      # at once. Keep it to obtaining a token, and keep policy in inputs.
       - name: 🔑 Struct8 Auth Bridge
         id: gatekeeper
         if: steps.manifest_check.outputs.needs_private_access == 'true'
@@ -401,152 +424,15 @@ jobs:
           RUN_TAG: "gh-${{ github.run_id }}-${{ github.run_attempt }}"
           DEFAULT_REGION: ${{ inputs.default_region || 'us-east-1' }}
         run: |
-          MANIFEST_PATH="${{ steps.manifest_check.outputs.manifest_path }}"
-          [ -f "$MANIFEST_PATH" ] || exit 0
+          # The engine checkout may not have happened -- this step runs precisely
+          # WHEN SOMETHING FAILED, and the failure could BE that checkout. Without
+          # this guard the recovery step would itself fail, on every run that died
+          # early, reporting a missing file instead of the real cause.
+          [ -f .struct8-engine/scripts/release-locks.sh ] || exit 0
 
-          jq -c '.pipeline_stages[].states[]' "$MANIFEST_PATH" | while read -r state; do
-              path=$(echo "$state" | jq -r '.path')
-              cache_file="$path/.terraform/terraform.tfstate"
-              [ -f "$cache_file" ] || continue   # esse path nem chegou a dar init
-
-              bucket=$(jq -r '.backend.config.bucket // empty' "$cache_file")
-              key=$(jq -r '.backend.config.key // empty' "$cache_file")
-              table=$(jq -r '.backend.config.dynamodb_table // empty' "$cache_file")
-              region=$(jq -r '.backend.config.region // empty' "$cache_file")
-              [ -n "$bucket" ] && [ -n "$key" ] && [ -n "$table" ] || continue
-
-              item=$(aws dynamodb get-item \
-                  --table-name "$table" \
-                  --key "{\"LockID\": {\"S\": \"${bucket}/${key}\"}}" \
-                  --region "${region:-$DEFAULT_REGION}" --profile backend 2>/dev/null)
-
-              who=$(echo "$item" | jq -r '.Item.Info.S // empty' | jq -r '.Who // empty' 2>/dev/null)
-
-              if [ "$who" == "runner@${RUN_TAG}" ]; then
-                  echo "🔓 Lock on ${bucket}/${key} belongs to this run (${RUN_TAG}). Releasing..."
-                  aws dynamodb delete-item --table-name "$table" \
-                      --key "{\"LockID\": {\"S\": \"${bucket}/${key}\"}}" \
-                      --region "${region:-$DEFAULT_REGION}" --profile backend
-              elif [ -n "$who" ]; then
-                  echo "ℹ️  Lock on ${bucket}/${key} belongs to '${who}' -- not mine, leaving it alone."
-              fi
-          done
-
+          MANIFEST_PATH="${{ steps.manifest_check.outputs.manifest_path }}" bash .struct8-engine/scripts/release-locks.sh
       - name: 💾 Push / Cleanup GitOps State
         if: success()
         shell: bash
         run: |
-          # Configura o bot do Github
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-
-          # Pushing from here RACES. States in one repository run in parallel --
-          # see the note about `concurrency` at the top of this file -- so two runs
-          # can reach this step at the same time. A bare `git push` loses that race
-          # with a non-fast-forward rejection, and under `set -e` that kills the
-          # whole run AFTER the terraform work already succeeded.
-          #
-          # Rebase rather than merge: each run adds one commit touching only its own
-          # state folder, so replaying it on top of whatever landed first is exactly
-          # right and leaves no merge commits in the client's history.
-          #
-          # A conflict here would mean two runs writing the SAME file, which the
-          # per-state layout should make impossible. If it happens the rebase is
-          # aborted and the step fails loudly instead of guessing.
-          push_with_retry() {
-              local label="$1" attempt=1 max=5
-              local branch="${GITHUB_REF_NAME:-main}"
-
-              until git push; do
-                  if [ "$attempt" -ge "$max" ]; then
-                      echo "❌ ${label}: still rejected after ${max} attempts."
-                      return 1
-                  fi
-
-                  echo "🔁 ${label}: another run reached the branch first. Rebasing (${attempt}/${max})..."
-
-                  # The client checkout is shallow (fetch-depth: 2), so the rebase
-                  # base may simply not be present. Deepen first; on a complete
-                  # clone --deepen errors, hence the fallback.
-                  git fetch --deepen=20 origin "$branch" 2>/dev/null || git fetch origin "$branch"
-
-                  if ! git rebase "origin/$branch"; then
-                      git rebase --abort || true
-                      echo "❌ ${label}: conflict while rebasing onto origin/$branch."
-                      return 1
-                  fi
-
-                  attempt=$((attempt + 1))
-                  sleep $((attempt * 3))
-              done
-          }
-
-          # 1. LÓGICA DO PASSO 2 (GERAÇÃO DE IMPORT)
-          if [ -f "$GITHUB_WORKSPACE/.needs_commit" ]; then
-            echo "📥 Import operation detected. Saving the generated resources to the repository..."
-            git add ./**/generated_resources.json
-
-            if ! git diff --staged --quiet; then
-              git commit -m "chore: generated terraform awaiting CloudMan review [skip ci]"
-              push_with_retry "import code"
-              echo "✅ Import code pushed to the repository."
-            fi
-          fi
-
-          # 1b. RESULTADO DO PLAN / DRIFT (lido pelo diagrama, não pelo Terraform)
-          #
-          # The result itself NO LONGER LIVES HERE. It is published as a workflow
-          # artifact (see the upload step earlier in this job), because it is
-          # read once, right after the run, and is worthless a few edits later --
-          # a repository is the wrong home for something with that lifetime. The
-          # customer's history is theirs; it should not accumulate our scratch.
-          #
-          # What remains is removing what earlier engines DID commit here. Left
-          # behind, those files are a plan frozen at whatever the last run
-          # produced -- and the reader still knows the old paths, so a stale plan
-          # would be served wearing the face of a current one. Both names are
-          # swept: `.json` from before compression, `.gz` from the brief window
-          # when the compressed file was still committed.
-          #
-          # QUOTED, so git does the matching and not bash. Unquoted, `./**/x` is
-          # expanded by bash, which without globstar treats `**` as a plain `*`
-          # -- it matches one level down, and because it DID match, the deeper
-          # paths are dropped silently. Git's own pathspec lets `*` cross `/`.
-          #
-          # NOT --cached: that only unstages a file, leaving it on disk as
-          # untracked. This step runs while states in the same repository can be
-          # publishing in parallel (see the note on `concurrency` at the top of
-          # this file), so a losing run's retry rebases -- which checks out the
-          # winner's commit internally, and git refuses to check out over an
-          # untracked file that commit would create. A `--cached` removal here
-          # reliably broke the next run's rebase.
-          #
-          # --ignore-unmatch makes all of this a no-op from the second run on,
-          # and in repositories that never carried either file, so the common
-          # case stages nothing and never reaches a commit or a push.
-          git rm --quiet --ignore-unmatch -- '*plan_result.json' '*plan_result.json.gz' || true
-
-          if ! git diff --staged --quiet; then
-            echo "🧹 Removing plan results committed by an earlier engine..."
-            git commit -m "chore: drop committed plan results, now published as artifacts [skip ci]"
-            push_with_retry "plan result cleanup"
-            echo "✅ Old plan results removed from the repository."
-          fi
-
-          # 2. LÓGICA DO PASSO 4 (LIMPEZA PÓS-APPLY)
-          if [ -f "$GITHUB_WORKSPACE/.needs_cleanup" ]; then
-            echo "🧹 Apply finished. Removing the import files from the repository..."
-
-            # O parâmetro -u no git add pega arquivos que foram deletados
-            git add -u ./**/import.tf ./**/generated_resources.json ./**/generated_resources.tf 2>/dev/null || true
-
-            if ! git diff --staged --quiet; then
-              git commit -m "chore: cleanup import.tf and json after successful apply [skip ci]"
-              push_with_retry "post-apply cleanup"
-              echo "✅ Leftover files removed from the repository."
-            else
-              echo "No leftover files to clean up in git."
-            fi
-          fi
-
-          echo "✅ Pipeline finalizado."
+          bash .struct8-engine/scripts/publish-gitops.sh

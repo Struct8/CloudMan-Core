@@ -281,6 +281,47 @@ run_terraform_process() {
             while IFS= read -r extra; do
                 [ -z "$extra" ] && continue
                 local extra_provider=$(echo "$extra" | jq -r '.provider')
+
+                # AWS não tem secret: a conta estrangeira é alcançada pelo MESMO
+                # OIDC do GitHub que este state já usa na conta dele, assumindo na
+                # outra conta a role Struct8-Gitops-{org}-{repo}. Sai daqui um
+                # profile nomeado `acct_<id>`, que é exatamente o nome que o
+                # `provider "aws"` aliasado do HCL procura -- os dois lados têm que
+                # concordar nessa string, então mudar o formato aqui exige mudar
+                # registerAccountProviderAlias no gerador AWS junto.
+                #
+                # Este ramo sai ANTES da busca de secret de propósito: passar por
+                # ela procuraria AUTH_AWS_<conta> no SECRETS_CONTEXT e abortaria o
+                # apply por uma secret que não existe nem deveria existir.
+                if [ "$extra_provider" == "aws" ]; then
+                    local extra_role=$(echo "$extra" | jq -r '.role_arn // empty')
+                    local extra_acct=$(echo "$extra" | jq -r '.account_id // empty')
+                    local extra_region=$(echo "$extra" | jq -r '.region // "us-east-1"')
+
+                    if [ -z "$extra_role" ] || [ -z "$extra_acct" ]; then
+                        echo "❌ Error: additional AWS credential without role_arn/account_id (required by $path)."
+                        exit 1
+                    fi
+
+                    echo "🔑 Additional credential (aws): account $extra_acct -> profile acct_${extra_acct}"
+                    auth_aws "{\"role_arn\": \"$extra_role\", \"region\": \"$extra_region\"}" "acct_${extra_acct}"
+
+                    # Confere que o profile ficou utilizável, em vez de deixar o
+                    # terraform descobrir depois. `auth_aws` monta as credenciais
+                    # com `local creds=$(aws sts ...)`, e o `local` MASCARA o
+                    # código de saída: um assume-role recusado não aborta nada --
+                    # o jq extrai vazio e o profile é gravado sem chave nenhuma.
+                    # Sem esta conferência, a falha mais provável deste caminho (a
+                    # conta destino ainda não conectada ao workspace) chegaria ao
+                    # usuário como um erro do provider AWS, sem dizer qual conta.
+                    if ! aws sts get-caller-identity --profile "acct_${extra_acct}" > /dev/null 2>&1; then
+                        echo "❌ Error: could not sign in to AWS account $extra_acct as $extra_role (required by $path)."
+                        echo "   Connect that account to this GitOps workspace before deploying a state that uses resources in it."
+                        exit 1
+                    fi
+                    continue
+                fi
+
                 local extra_secret=$(echo "$extra" | jq -r '.secret_name // empty')
 
                 if [ -z "$extra_secret" ]; then

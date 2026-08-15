@@ -407,8 +407,26 @@ run_terraform_process() {
               # Duas defesas somadas:
               # 1. Só sobrevivem os campos que o front-end lê. prior_state,
               #    planned_values e configuration carregam o estado inteiro da
-              #    infraestrutura e nada aqui os consome -- some com eles corta a
-              #    maior parte da exposição de uma vez.
+              #    infraestrutura -- some com eles corta a maior parte da
+              #    exposição de uma vez.
+              #
+              #    `timestamp` é um dos que o front-end lê, e a lista fechada o
+              #    estava derrubando: é a hora em que o Terraform CRIOU o plano, e
+              #    dela sai a tarja de idade no diagrama ("Plan há 2 horas"). Sem
+              #    ela o diagrama não tem como dizer o quanto a leitura de drift
+              #    envelheceu -- e a hora em que alguém baixou o arquivo não
+              #    responde isso, pode haver dias entre as duas. Escalar, não
+              #    carrega nada da infraestrutura: entra sem custo de exposição.
+              #
+              #    RESSALVA sobre prior_state, que continua fora: o front-end
+              #    passou a consumi-lo. `driftClassifier` lê dali os
+              #    `aws_security_group_rule` que este diagrama declara, para não
+              #    acusar como drift uma regra que a nuvem só espelha. Sem ele a
+              #    separação não acontece, e a aba Plan avisa disso em vez de
+              #    classificar errado. Devolver prior_state inteiro NÃO é a saída
+              #    -- seria republicar o estado completo, que é justamente o que
+              #    esta defesa corta. O que caberia é projetar dali só esses
+              #    recursos de regra.
               # 2. Toda folha marcada como sensível vira "__REDACTED__", em
               #    before e after, incluindo dentro de bloco aninhado e lista.
               #
@@ -465,6 +483,7 @@ run_terraform_process() {
                 {
                   format_version:    .format_version,
                   terraform_version: .terraform_version,
+                  timestamp:         .timestamp,
                   resource_changes:  [ (.resource_changes // [])[] | .change |= redact_change ],
                   resource_drift:    [ (.resource_drift   // [])[] | .change |= redact_change ]
                 }

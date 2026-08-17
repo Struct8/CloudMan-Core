@@ -54,6 +54,11 @@ fi
 
 chmod +x $AUTH_SCRIPTS/*.sh
 source "$AUTH_SCRIPTS/aws.sh"
+# Credencial efêmera de escrita no R2. Sourced, e não só presente na pasta:
+# `cloudflare.sh` define auth_cloudflare() e ninguém o carrega -- a
+# autenticação da Cloudflare que ROLA de verdade é o bloco inline mais abaixo.
+# Editar aquele arquivo achando que ele participa do fluxo não muda nada.
+source "$AUTH_SCRIPTS/r2.sh"
 
 # ==============================================================================
 # FUNÇÃO DE LOG DE DEBUG
@@ -266,6 +271,19 @@ run_terraform_process() {
                 exit 1
             fi
             export CLOUDFLARE_API_TOKEN="$token"
+
+            # Escrever OBJETO no R2 não passa por este token: o conteúdo entra
+            # pelo endpoint S3 da conta, que só aceita assinatura SigV4. Quando
+            # o HCL gerado pede esse par, ele é cunhado agora, vive alguns
+            # minutos e é revogado pelo trap -- ver scripts/auth/r2.sh.
+            #
+            # O trap é armado ANTES do mint, e não depois: uma falha no meio da
+            # criação já pode ter deixado o token de pé na conta.
+            if r2_state_needs_credentials; then
+                trap r2_revoke_ephemeral_credentials EXIT
+                r2_mint_ephemeral_credentials "$(echo "$auth_json" | jq -r '.account_id')" "$label"
+                r2_verify_credentials "$(echo "$auth_json" | jq -r '.account_id')"
+            fi
         fi
 
         # Credenciais ADICIONAIS (nuvens estrangeiras usadas por este state).

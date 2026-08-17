@@ -57,17 +57,25 @@ r2_state_needs_credentials() {
 # Pelo nome, e não por UUID fixo: os ids de permission group não são estáveis
 # entre contas, e um UUID errado produz token que a API aceita criar e que não
 # escreve nada -- falha três camadas adiante, no PutObject.
-# Devolve "id|nome". O nome vai junto porque, quando o endpoint S3 responde
-# AccessDenied, a primeira pergunta é qual grupo foi concedido -- e sem o nome
-# no log a resposta exige repetir a consulta à mão.
-r2_write_permission_group_id() {
+# Filtro dos grupos de permissão que servem para escrever OBJETO no R2.
+#
+# `R2 Storage`, e não só `R2`: a conta expõe também `Workers R2 Data Catalog
+# Write`, que é o catálogo de dados (Iceberg/SQL) e não o armazenamento. Um
+# filtro por "R2" + "write" pega esse primeiro -- foi o que aconteceu, e o
+# token saiu com permissão para a coisa errada.
+#
+# Leitura JUNTO da escrita, e não só escrita: o `aws_s3_object` faz HeadObject
+# em todo refresh para comparar o etag. Sem leitura, o primeiro `plan` sobre um
+# objeto já existente para em AccessDenied.
+R2_PG_FILTER='.result[]
+  | select(.name | test("R2 Storage"; "i"))
+  | select(.name | test("catalog"; "i") | not)
+  | select(.name | test("write|edit|read"; "i"))'
+
+r2_storage_permission_groups() {
     local account_id=$1
     curl -sf -X GET "$CF_API/accounts/${account_id}/tokens/permission_groups" \
-        -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-    | jq -r '[.result[]
-              | select(.name | test("R2"; "i"))
-              | select(.name | test("write|edit"; "i"))
-             ] | first | "\(.id)|\(.name)" // empty'
+        -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}"
 }
 
 # Cunha o par e exporta. Falha alto: seguir sem credencial faria o apply parar
@@ -78,16 +86,19 @@ r2_mint_ephemeral_credentials() {
 
     echo "🔑 ${label} This state writes objects to R2 — minting a short-lived credential..."
 
-    local pg_pair pg_id pg_name
-    pg_pair=$(r2_write_permission_group_id "$account_id")
-    if [ -z "$pg_pair" ]; then
-        echo "❌ Error: no R2 write permission group is visible to this Cloudflare token." >&2
+    local pg_response pg_json pg_names
+    pg_response=$(r2_storage_permission_groups "$account_id")
+    pg_json=$(echo "$pg_response" | jq -c "[ $R2_PG_FILTER | {id} ]")
+    pg_names=$(echo "$pg_response" | jq -r "[ $R2_PG_FILTER | .name ] | join(\", \")")
+
+    if [ "$pg_json" == "[]" ] || [ -z "$pg_json" ]; then
+        echo "❌ Error: no R2 Storage permission group is visible to this Cloudflare token." >&2
         echo "   The account token needs 'API Tokens: Edit' to mint credentials, and R2 permissions to grant them." >&2
+        echo "   R2-ish groups the account does expose:" >&2
+        echo "$pg_response" | jq -r '.result[] | select(.name | test("R2"; "i")) | "     \(.name)"' >&2
         return 1
     fi
-    pg_id=${pg_pair%%|*}
-    pg_name=${pg_pair#*|}
-    echo "   Permission group: ${pg_name} (${pg_id})"
+    echo "   Permission groups: ${pg_names}"
 
     # `expires_on` é cinto de segurança, não o mecanismo: quem revoga é o trap
     # do chamador, em minutos. Isto cobre o caso em que o runner morre de um
@@ -98,7 +109,7 @@ r2_mint_ephemeral_credentials() {
     local payload
     payload=$(jq -n \
         --arg name "struct8-r2-${RUN_TAG:-manual}" \
-        --arg pg "$pg_id" \
+        --argjson pg "$pg_json" \
         --arg acc "com.cloudflare.api.account.${account_id}" \
         --arg exp "$expires_on" \
         '{
@@ -106,7 +117,7 @@ r2_mint_ephemeral_credentials() {
             expires_on: $exp,
             policies: [{
                 effect: "allow",
-                permission_groups: [{ id: $pg }],
+                permission_groups: $pg,
                 resources: { ($acc): "*" }
             }]
         }')
@@ -164,16 +175,19 @@ r2_verify_credentials() {
         return 0
     fi
 
-    # AWS_SESSION_TOKEN e AWS_PROFILE limpos JUNTO das duas chaves. O job usa
-    # OIDC para alcançar a conta AWS do backend, então essas variáveis costumam
-    # estar no ambiente -- e a CLI manda o session token junto do par que eu
-    # passo aqui, o que produz SignatureDoesNotMatch com uma credencial
-    # perfeitamente boa. Sobrescrever só as duas chaves não basta.
+    # `env -u`, e NÃO `AWS_PROFILE=`. Atribuir vazio não desliga a variável: ela
+    # continua definida, e o aws-cli sai com
+    # `The config profile () could not be found` sem nunca chegar ao R2.
+    #
+    # AWS_SESSION_TOKEN entra na mesma lista porque o job alcança a conta AWS do
+    # backend por OIDC: com ele no ambiente, a CLI assina com o par que eu passo
+    # E manda o session token junto, o que o R2 recusa como
+    # SignatureDoesNotMatch -- credencial boa, assinatura inválida.
     local saida rc
     local tentativa=1
     while [ $tentativa -le 4 ]; do
         set +e
-        saida=$(AWS_PROFILE= AWS_SESSION_TOKEN= \
+        saida=$(env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE -u AWS_SESSION_TOKEN \
                 AWS_ACCESS_KEY_ID="$TF_VAR_r2_access_key_id" \
                 AWS_SECRET_ACCESS_KEY="$TF_VAR_r2_secret_access_key" \
                 AWS_REGION=auto AWS_DEFAULT_REGION=auto \

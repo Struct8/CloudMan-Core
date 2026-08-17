@@ -620,9 +620,16 @@ run_terraform_process() {
               echo -e "${YELLOW}⚠️ ${label} Could not convert the plan to JSON. The plan itself ran fine.${NC}"
               publish_plan_failure "$path" show "./.struct8-show.log"
             fi
-          else
+          elif [ $PLAN_STATUS -ne 0 ]; then
             echo -e "${RED}❌ ${label} terraform plan failed.${NC}"
             publish_plan_failure "$path" plan "./.struct8-live.log"
+          else
+            # Saiu zero e não deixou o arquivo do plano. Sem log: o `awk` não
+            # acharia marca de erro nenhuma num plan que passou, e cairia nas
+            # últimas linhas de uma saída bem-sucedida -- texto que não explica
+            # nada a quem lê. O estágio sozinho diz mais.
+            echo -e "${RED}❌ ${label} terraform plan reported success but wrote no plan file.${NC}"
+            publish_plan_failure "$path" plan ""
           fi
 
           # O .tfplan e o JSON cru carregam os valores NÃO redigidos. Somem sempre,

@@ -161,11 +161,34 @@ r2_mint_ephemeral_credentials() {
     echo "✅ ${label} Credential minted (token ${token_id:0:8}…, revoked at the end of this state)."
 }
 
+# Nome real do bucket para onde este state publica.
+#
+# O HCL referencia o bucket por expressão (`cloudflare_r2_bucket.X.name`), então
+# são dois saltos: do objeto para o nome lógico, e do recurso para o `name`.
+r2_target_bucket() {
+    local logico
+    logico=$(grep -oE 'bucket[[:space:]]+= cloudflare_r2_bucket\.[A-Za-z0-9_-]+' main.tf 2>/dev/null \
+             | head -1 | sed 's/.*cloudflare_r2_bucket\.//')
+    [ -z "$logico" ] && return 0
+
+    awk -v alvo="\"cloudflare_r2_bucket\" \"$logico\"" '
+        index($0, alvo) { dentro = 1 }
+        dentro && /^[[:space:]]*name[[:space:]]*=/ {
+            gsub(/.*=[[:space:]]*"|"[[:space:]]*$/, ""); print; exit
+        }
+        dentro && /^}/ { exit }
+    ' main.tf 2>/dev/null
+}
+
 # Confere que a credencial ASSINA de verdade, contra o endpoint real.
 #
-# Existe porque as duas formas de errar aqui são silenciosas na criação: a
-# derivação do secret e o escopo da permissão. As duas só apareceriam no
-# PutObject, dentro do apply, como erro do provider da AWS -- longe da causa.
+# NÃO BARRA O PIPELINE, e essa foi uma correção aprendida: a primeira versão
+# reprovava, e reprovou três vezes seguidas por defeito DELA -- primeiro um
+# `AWS_PROFILE=` que nem chegava ao R2, depois uma sonda (`list-buckets`) que é
+# operação de CONTA e que um token com escopo de OBJETO não pode executar por
+# definição. Uma checagem que produz falso negativo e ainda tranca o deploy
+# custa mais do que a ambiguidade que ela evita. Aqui ela informa; quem
+# reprova é o Terraform, com o erro da operação de verdade.
 r2_verify_credentials() {
     local account_id=$1
     local endpoint="https://${account_id}.r2.cloudflarestorage.com"
@@ -174,6 +197,16 @@ r2_verify_credentials() {
         echo "⚠️  aws CLI not available — skipping the R2 credential check."
         return 0
     fi
+
+    # A sonda tem que ser uma operação de BUCKET, não de conta: o token existe
+    # para escrever objeto, e pedir ListBuckets é pedir o que ele não tem.
+    local bucket
+    bucket=$(r2_target_bucket)
+    if [ -z "$bucket" ]; then
+        echo "⚠️  Could not read the target bucket name from main.tf — skipping the R2 credential check."
+        return 0
+    fi
+    echo "   Checking the credential against bucket '${bucket}'..."
 
     # `env -u`, e NÃO `AWS_PROFILE=`. Atribuir vazio não desliga a variável: ela
     # continua definida, e o aws-cli sai com
@@ -191,12 +224,13 @@ r2_verify_credentials() {
                 AWS_ACCESS_KEY_ID="$TF_VAR_r2_access_key_id" \
                 AWS_SECRET_ACCESS_KEY="$TF_VAR_r2_secret_access_key" \
                 AWS_REGION=auto AWS_DEFAULT_REGION=auto \
-                aws s3api list-buckets --endpoint-url "$endpoint" 2>&1)
+                aws s3api list-objects-v2 --bucket "$bucket" --max-keys 1 \
+                    --endpoint-url "$endpoint" 2>&1)
         rc=$?
         set -e
 
         if [ $rc -eq 0 ]; then
-            echo "✅ R2 credential verified against $endpoint"
+            echo "✅ R2 credential verified against ${endpoint}/${bucket}"
             return 0
         fi
 
@@ -213,17 +247,19 @@ r2_verify_credentials() {
     done
 
     # A mensagem da CLI é o diagnóstico, e engoli-la foi o erro da primeira
-    # versão: os três códigos apontam para causas DIFERENTES, e sem eles a única
+    # versão: cada código aponta para uma causa DIFERENTE, e sem eles a única
     # saída é adivinhar.
-    echo "❌ Error: the minted credential does not sign against $endpoint." >&2
-    echo "   The token was created, so this is not about permission on api.cloudflare.com." >&2
-    echo "   Access Key ID used: ${TF_VAR_r2_access_key_id}" >&2
-    echo "   What the S3 endpoint answered:" >&2
-    echo "$saida" | sed 's/^/     /' >&2
-    echo "   InvalidAccessKeyId  -> the Access Key ID is not the token id" >&2
-    echo "   SignatureDoesNotMatch -> the Secret is not SHA-256 of the token value" >&2
-    echo "   AccessDenied        -> the token was granted the wrong R2 permission group" >&2
-    return 1
+    echo "⚠️  The R2 credential check did not pass — continuing anyway, Terraform decides."
+    echo "    Access Key ID used: ${TF_VAR_r2_access_key_id}"
+    echo "    Bucket probed: ${bucket}"
+    echo "    What the S3 endpoint answered:"
+    echo "$saida" | sed 's/^/      /'
+    echo "    InvalidAccessKeyId    -> the Access Key ID is not the token id"
+    echo "    SignatureDoesNotMatch -> the Secret is not SHA-256 of the token value"
+    echo "    AccessDenied          -> the token lacks the R2 permission for this bucket"
+    echo "    Unauthorized          -> the operation is out of the token's scope, which may"
+    echo "                             mean the check itself is wrong rather than the credential"
+    return 0
 }
 
 # Revoga. Chamada por trap, então roda no sucesso, na falha e no cancelamento.

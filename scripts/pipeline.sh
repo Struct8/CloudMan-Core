@@ -119,11 +119,18 @@ _stream_cmd() {
 # A saída ao vivo (console + arquivo) é feita pelo _stream_cmd acima.
 # ==============================================================================
 run_tf_with_stale_lock_recovery() {
-    local status lock_id who_str owner_run_id run_status
+    local status=0 lock_id who_str owner_run_id run_status
     local logfile="./.struct8-live.log"
 
-    _stream_cmd "$@"
-    status=$?
+    # `|| status=$?`, e não `_stream_cmd` solto seguido de `status=$?`: com o
+    # `set -eo pipefail` da linha 27, um comando que falha fora de uma condição
+    # derruba o shell NA HORA. A linha do `status=$?` nunca chegava a rodar com
+    # valor diferente de zero, e portanto TODO o resto desta função -- a
+    # recuperação de lock travado inteira -- era código inalcançável. Medido num
+    # shell isolado com esta mesma estrutura (função -> pipeline -> `return
+    # ${PIPESTATUS[0]}` -> subshell), não deduzido: com o comando falhando, nada
+    # abaixo dele imprime; com o comando passando, tudo imprime.
+    _stream_cmd "$@" || status=$?
 
     if [ $status -ne 0 ] && grep -q "Error acquiring the state lock" "$logfile"; then
         lock_id=$(grep -oP '^\s*ID:\s+\K\S+'  "$logfile" | head -n1)
@@ -141,8 +148,8 @@ run_tf_with_stale_lock_recovery() {
         if [ "$run_status" == "completed" ]; then
             echo "♻️  Run #$owner_run_id has finished (confirmed via the API). Forcing unlock and retrying..."
             terraform force-unlock -force "$lock_id"
-            _stream_cmd "$@"
-            status=$?
+            status=0
+            _stream_cmd "$@" || status=$?
         else
             echo "⏳ Run #$owner_run_id is still '$run_status' -- the lock is real and active. Leaving it alone."
         fi
@@ -187,6 +194,71 @@ publish_engine_artifact() {
 
     mkdir -p "$out"
     cp "$file" "$out/${flat}.${file}"
+}
+
+# ==============================================================================
+# Publica o MOTIVO de um plan que não produziu resultado.
+#
+# POR QUE O ARQUIVO DE FALHA TEM O MESMO NOME DO DE SUCESSO
+#
+# Quem lê (`get_plan_result_from_artifact`, no AgentV2) procura a entrada
+# `<pasta>.plan_result.json.gz` e, não encontrando, VOLTA até 5 artefatos e
+# devolve a primeira que encontrar. Uma execução que falha sem publicar nada não
+# produz "ainda não há resultado" no diagrama: produz o plano da execução
+# ANTERIOR, entregue como se fosse a resposta de agora. Publicar a falha sob o
+# mesmo nome é o que interrompe essa varredura. Um nome novo não interromperia --
+# deixaria o sucesso velho no caminho e ainda exigiria mudança no leitor.
+#
+# O QUE VAI NA MENSAGEM, E O QUE NÃO VAI
+#
+# Só o bloco de erro do próprio Terraform (a caixa que começa em `╷`), limitado a
+# 60 linhas; sem caixa nenhuma, as últimas 40 linhas do log. O log INTEIRO fica
+# de fora de propósito: este arquivo é legível por quem lê as Actions do
+# repositório, e o log carrega tudo o que o comando imprimiu antes de falhar.
+# Isso reduz a exposição, não a elimina -- o bloco de erro pode citar valor de
+# atributo, porque é o Terraform que escolhe o que mostrar ali.
+#
+# A execução continua falhando como antes. Este arquivo não é um jeito de a falha
+# passar: é o que conta ao diagrama que ela aconteceu.
+# ==============================================================================
+publish_plan_failure() {
+    local src_dir="$1" stage="$2" logfile="$3"
+    local message=""
+
+    if [ -n "$logfile" ] && [ -f "$logfile" ]; then
+        # Da primeira marca de erro até o fim. `head -n`, e não `head -c`: cortar
+        # por byte parte caractere UTF-8 no meio, e o que sobra não é texto.
+        message=$(awk '/^╷/ || /Error:/ { found = 1 } found' "$logfile" | head -n 60)
+        if [ -z "$message" ]; then
+            message=$(tail -n 40 "$logfile")
+        fi
+    fi
+
+    # Os mesmos campos que o front-end já lê no arquivo de sucesso, com os dois
+    # arrays vazios -- sem eles o explicador avisa "o plano não tem
+    # resource_changes", que é verdade e não é a informação. `timestamp` é a hora
+    # da FALHA: é dela que sai a tarja de idade, e é o que distingue esta leitura
+    # de um plano velho.
+    if jq -n \
+        --arg stage "$stage" \
+        --arg message "$message" \
+        --arg run_url "${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{
+            timestamp:        $ts,
+            cloudman_error:   { stage: $stage, message: $message, run_url: $run_url },
+            resource_changes: [],
+            resource_drift:   []
+        }' > plan_result.json && gzip -9 -f plan_result.json; then
+        publish_engine_artifact "$src_dir" plan_result.json.gz
+        echo -e "${YELLOW}📄 [${src_dir}] plan_result.json.gz published with the failure reason (stage: ${stage}).${NC}"
+    else
+        # Dentro de um `if` de propósito: uma falha AQUI não pode derrubar o
+        # shell, senão o passo que só avisava passaria a interromper a execução.
+        echo -e "${RED}❌ [${src_dir}] Could not write the plan failure file.${NC}"
+    fi
+
+    rm -f plan_result.json plan_result.json.gz
 }
 
 # ==============================================================================
@@ -245,9 +317,24 @@ run_terraform_process() {
         # ele DEVE usar o profile 'backend' para operações de estado (S3/Dynamo),
         # ignorando as variáveis de ambiente que vamos carregar no passo 2.
 
-        terraform init -reconfigure -input=false \
+        # Via `_stream_cmd` pelo mesmo motivo que o plan: é ele que grava o log
+        # de onde a mensagem de erro é lida. Sem isso, um init que falha por
+        # credencial ou backend chegava ao diagrama como plano velho, igual a
+        # todas as outras falhas.
+        INIT_STATUS=0
+        _stream_cmd terraform init -reconfigure -input=false \
             -backend-config="profile=backend" \
-            -backend-config="region=$BACKEND_REGION"
+            -backend-config="region=$BACKEND_REGION" || INIT_STATUS=$?
+
+        if [ $INIT_STATUS -ne 0 ]; then
+            # Só plan e drift: é o arquivo que ESSAS duas ações publicam e que o
+            # diagrama lê. Publicá-lo a partir de um apply faria a próxima
+            # leitura de plan atribuir a um plan uma falha que não foi dele.
+            if [ "$action" == "plan" ] || [ "$action" == "drift" ]; then
+                publish_plan_failure "$path" init "./.struct8-live.log"
+            fi
+            exit $INIT_STATUS
+        fi
 
         # ---------------------------------------------------------
         # PASSO 2: PREPARAÇÃO DO TARGET
@@ -407,13 +494,21 @@ run_terraform_process() {
           # NÃO usar -detailed-exitcode: ele faz "há mudanças" virar exit 2, o que
           # marcaria como FALHA todo plan que encontrasse algo -- exatamente o caso
           # normal. O comportamento de saída do plan continua o de antes.
-          run_tf_with_stale_lock_recovery terraform plan -input=false $PLAN_EXTRA_FLAGS -out=cloudman.tfplan
-          PLAN_STATUS=$?
+          #
+          # `|| PLAN_STATUS=$?` é o que torna a falha CAPTURÁVEL -- ver a mesma
+          # correção em run_tf_with_stale_lock_recovery. Antes disto o shell
+          # morria no plan que falhava e a linha abaixo nunca via valor diferente
+          # de zero.
+          PLAN_STATUS=0
+          run_tf_with_stale_lock_recovery terraform plan -input=false $PLAN_EXTRA_FLAGS -out=cloudman.tfplan || PLAN_STATUS=$?
 
           if [ $PLAN_STATUS -eq 0 ] && [ -f "cloudman.tfplan" ]; then
             echo -e "${color}📄 ${label} Converting the plan to JSON for the front end...${NC}"
 
-            if terraform show -json cloudman.tfplan > cloudman.plan.raw.json 2>/dev/null; then
+            # stderr num arquivo, e não em /dev/null: é a única cópia da razão
+            # pela qual a conversão falhou, e sem ela o diagrama receberia um
+            # aviso sem o motivo. Continua fora do console, como antes.
+            if terraform show -json cloudman.tfplan > cloudman.plan.raw.json 2>./.struct8-show.log; then
               # ---------------------------------------------------------------
               # REDAÇÃO — roda ANTES de qualquer commit, e é o motivo deste bloco
               # existir. `terraform show -json` NÃO mascara valor sensível: ele
@@ -516,16 +611,29 @@ run_terraform_process() {
                 # é preferível a publicar um arquivo que pode conter segredo.
                 echo -e "${RED}❌ ${label} Could not redact the plan JSON; refusing to publish it.${NC}"
                 rm -f plan_result.json plan_result.json.gz
+                # Sem log: a falha é da própria redação, e a saída do jq não
+                # diria nada ao usuário. O estágio é a informação inteira -- o
+                # plano rodou e não foi publicado por segurança.
+                publish_plan_failure "$path" redact ""
               fi
             else
               echo -e "${YELLOW}⚠️ ${label} Could not convert the plan to JSON. The plan itself ran fine.${NC}"
+              publish_plan_failure "$path" show "./.struct8-show.log"
             fi
+          else
+            echo -e "${RED}❌ ${label} terraform plan failed.${NC}"
+            publish_plan_failure "$path" plan "./.struct8-live.log"
           fi
 
           # O .tfplan e o JSON cru carregam os valores NÃO redigidos. Somem sempre,
           # inclusive quando algum passo acima falhou, pra não sobrar no workspace
           # nem serem varridos por um `git add` de outro step.
-          rm -f cloudman.tfplan cloudman.plan.raw.json
+          rm -f cloudman.tfplan cloudman.plan.raw.json .struct8-show.log
+
+          # A execução continua falhando como antes -- publicar o motivo não é um
+          # jeito de a falha passar. Sai DEPOIS do rm acima, senão o .tfplan não
+          # redigido ficaria no workspace.
+          if [ $PLAN_STATUS -ne 0 ]; then exit $PLAN_STATUS; fi
 
         elif [ "$action" == "apply" ]; then
           echo -e "${color}▶️ ${label} Running terraform apply...${NC}"

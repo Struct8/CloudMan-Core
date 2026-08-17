@@ -57,6 +57,9 @@ r2_state_needs_credentials() {
 # Pelo nome, e não por UUID fixo: os ids de permission group não são estáveis
 # entre contas, e um UUID errado produz token que a API aceita criar e que não
 # escreve nada -- falha três camadas adiante, no PutObject.
+# Devolve "id|nome". O nome vai junto porque, quando o endpoint S3 responde
+# AccessDenied, a primeira pergunta é qual grupo foi concedido -- e sem o nome
+# no log a resposta exige repetir a consulta à mão.
 r2_write_permission_group_id() {
     local account_id=$1
     curl -sf -X GET "$CF_API/accounts/${account_id}/tokens/permission_groups" \
@@ -64,7 +67,7 @@ r2_write_permission_group_id() {
     | jq -r '[.result[]
               | select(.name | test("R2"; "i"))
               | select(.name | test("write|edit"; "i"))
-             ] | first | .id // empty'
+             ] | first | "\(.id)|\(.name)" // empty'
 }
 
 # Cunha o par e exporta. Falha alto: seguir sem credencial faria o apply parar
@@ -75,13 +78,16 @@ r2_mint_ephemeral_credentials() {
 
     echo "🔑 ${label} This state writes objects to R2 — minting a short-lived credential..."
 
-    local pg_id
-    pg_id=$(r2_write_permission_group_id "$account_id")
-    if [ -z "$pg_id" ]; then
+    local pg_pair pg_id pg_name
+    pg_pair=$(r2_write_permission_group_id "$account_id")
+    if [ -z "$pg_pair" ]; then
         echo "❌ Error: no R2 write permission group is visible to this Cloudflare token." >&2
         echo "   The account token needs 'API Tokens: Edit' to mint credentials, and R2 permissions to grant them." >&2
         return 1
     fi
+    pg_id=${pg_pair%%|*}
+    pg_name=${pg_pair#*|}
+    echo "   Permission group: ${pg_name} (${pg_id})"
 
     # `expires_on` é cinto de segurança, não o mecanismo: quem revoga é o trap
     # do chamador, em minutos. Isto cobre o caso em que o runner morre de um
@@ -158,18 +164,51 @@ r2_verify_credentials() {
         return 0
     fi
 
-    if AWS_PROFILE= \
-       AWS_ACCESS_KEY_ID="$TF_VAR_r2_access_key_id" \
-       AWS_SECRET_ACCESS_KEY="$TF_VAR_r2_secret_access_key" \
-       AWS_REGION=auto \
-       aws s3api list-buckets --endpoint-url "$endpoint" >/dev/null 2>&1; then
-        echo "✅ R2 credential verified against $endpoint"
-        return 0
-    fi
+    # AWS_SESSION_TOKEN e AWS_PROFILE limpos JUNTO das duas chaves. O job usa
+    # OIDC para alcançar a conta AWS do backend, então essas variáveis costumam
+    # estar no ambiente -- e a CLI manda o session token junto do par que eu
+    # passo aqui, o que produz SignatureDoesNotMatch com uma credencial
+    # perfeitamente boa. Sobrescrever só as duas chaves não basta.
+    local saida rc
+    local tentativa=1
+    while [ $tentativa -le 4 ]; do
+        set +e
+        saida=$(AWS_PROFILE= AWS_SESSION_TOKEN= \
+                AWS_ACCESS_KEY_ID="$TF_VAR_r2_access_key_id" \
+                AWS_SECRET_ACCESS_KEY="$TF_VAR_r2_secret_access_key" \
+                AWS_REGION=auto AWS_DEFAULT_REGION=auto \
+                aws s3api list-buckets --endpoint-url "$endpoint" 2>&1)
+        rc=$?
+        set -e
 
+        if [ $rc -eq 0 ]; then
+            echo "✅ R2 credential verified against $endpoint"
+            return 0
+        fi
+
+        # Token recém-criado não fica visível no endpoint S3 no mesmo instante.
+        # Só vale esperar por erro de credencial desconhecida -- assinatura
+        # errada ou permissão negada não melhoram com o tempo.
+        if echo "$saida" | grep -qi "InvalidAccessKeyId\|does not exist"; then
+            echo "⏳ Credential not visible at the S3 endpoint yet (attempt ${tentativa}/4)..."
+            sleep 5
+            tentativa=$((tentativa + 1))
+            continue
+        fi
+        break
+    done
+
+    # A mensagem da CLI é o diagnóstico, e engoli-la foi o erro da primeira
+    # versão: os três códigos apontam para causas DIFERENTES, e sem eles a única
+    # saída é adivinhar.
     echo "❌ Error: the minted credential does not sign against $endpoint." >&2
-    echo "   The token was created, so this is not a permission problem on api.cloudflare.com." >&2
-    echo "   Check the R2 permission group granted, and the Access Key derivation in scripts/auth/r2.sh." >&2
+    echo "   The token was created, so this is not about permission on api.cloudflare.com." >&2
+    echo "   Access Key ID used: ${TF_VAR_r2_access_key_id}" >&2
+    echo "   What the S3 endpoint answered:" >&2
+    echo "$saida" | sed 's/^/     /' >&2
+    echo "   InvalidAccessKeyId  -> the Access Key ID is not the token id" >&2
+    echo "   SignatureDoesNotMatch -> the Secret is not SHA-256 of the token value" >&2
+    echo "   AccessDenied        -> the token was granted the wrong R2 permission group" >&2
     return 1
 }
 

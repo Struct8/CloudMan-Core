@@ -268,7 +268,24 @@ jobs:
               # runs when the manifest declares a PRIVATE external repository.
               # Until 2026-07-28 the shared repository was (wrongly) public, so the
               # step's `if:` skipped everything.
-              GATEKEEPER_URL="https://dev.app.struct8.com/st/GithubGateKeeper-dev"
+              # TEMPORARIO -- REVERTER PARA dev.app ASSIM QUE O APPLY PASSAR.
+              #
+              # Um apply renomeou o no cldmn_subdomain de `app` para `appb`, e o Terraform
+              # propagou o nome para os tres lugares onde ele aparece: destruiu o registro
+              # DNS de dev.app.struct8.com, substituiu o certificado ACM e trocou o alias do
+              # CloudFront. Este curl passou a morrer com exit 6.
+              #
+              # Isso trava a propria correcao: o conserto e aplicar o diagrama, e o apply
+              # roda por este workflow, que precisa deste host para pegar o token.
+              # appb e a MESMA distribuicao, com a MESMA rota -- medido: responde 400 a um
+              # POST vazio, ou seja, a Lambda atende.
+              #
+              # A REVERSAO NAO E COSMETICA: o mesmo apply que restaura dev.app DESTROI
+              # dev.appb. Deixar esta linha aqui troca um host morto por outro.
+              #
+              # Segunda vez que este host some por baixo deste arquivo -- a primeira foi
+              # dev.v2.cloudman.pro, no comentario acima.
+              GATEKEEPER_URL="https://dev.appb.struct8.com/st/GithubGateKeeper-dev"
               AUDIENCE="https://struct8.com/gitops"
               ;;
             *)

@@ -809,6 +809,92 @@ if [ "$EXTERNAL_REPOS" != "[]" ] && [ "$EXTERNAL_REPOS" != "null" ]; then
 fi
 
 # ---------------------------------------------------------
+# ANDAMENTO POR STATE
+# ---------------------------------------------------------
+# Para onde contar em que state o pipeline esta, enquanto ele corre. Vem do
+# manifesto, e nao de uma configuracao aqui: quem monta o manifesto ja sabe com
+# qual Worker aquele canvas fala, entao dev, test e producao acertam o proprio
+# sem nada para manter sincronizado.
+#
+# Vazio -- manifesto antigo, ou frontend sem Worker configurado -- e o
+# comportamento de sempre: nao reporta nada.
+PROGRESS_URL=$(jq -r '.progress_url // empty' "$MANIFEST_PATH")
+
+# Conta ao Struct8 que um state comecou ou terminou.
+#
+# Ate aqui o canvas do cliente sabia duas coisas: que empurrou, e que terminou.
+# O meio -- que passa de vinte minutos num apply de EKS -- nao tinha como ser
+# contado, entao os recursos do estagio inteiro ficavam com a mesma marca de "em
+# execucao" do primeiro ao ultimo segundo. Cada chamada daqui apaga a marca de um
+# recurso na tela, ou pinta de vermelho o que quebrou.
+#
+# O Worker resolve sozinho de qual canvas e de qual no e este run, cruzando
+# repositorio e sha com o registro que o navegador gravou no momento do push. Por
+# isso nao vai identidade nenhuma daqui -- e nem poderia: o par (repositorio, sha)
+# ele tira do TOKEN, nunca do corpo, e e isso que impede um repositorio qualquer
+# de escrever progresso no canvas de outra pessoa.
+#
+# NUNCA derruba o deploy. Sem `progress_url` nao faz nada; sem token tambem nao;
+# e a chamada tem timeout curto com o erro engolido. Este script roda sob `set -e`,
+# e um relatorio perdido custa uma animacao, nao uma execucao.
+report_state_progress() {
+    if [ -z "$PROGRESS_URL" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+        return 0
+    fi
+
+    local state_path="$1" status="$2" index="$3" total="$4"
+    local token="" corpo=""
+
+    # Token OIDC deste run, com audiencia PROPRIA do relatorio de andamento --
+    # diferente da `https://struct8.com/gitops` que o GateKeeper valida. Separar as
+    # duas e o que impede um token pedido para contar progresso de ser
+    # reapresentado ao GateKeeper para cunhar um token de repositorio.
+    #
+    # `audience`, e nao `aud`: o GitHub ignora parametro desconhecido em silencio e
+    # emite a audiencia PADRAO -- ver o caso registrado no engine.yml.
+    #
+    # Pedido a cada relatorio, e nao uma vez no inicio: o token do Actions vale
+    # minutos e um apply de EKS passa de vinte. Quem responde e o servico local do
+    # runner, entao a chamada e barata perto de qualquer terraform.
+    token=$(curl -sS -m 5 \
+        -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+        "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://struct8.com/run-progress" \
+        2>/dev/null | jq -r '.value // empty' 2>/dev/null) || return 0
+
+    if [ -z "$token" ]; then
+        return 0
+    fi
+
+    # Corpo enxuto de proposito: repositorio, sha e link do run saem do token, do
+    # lado do Worker. Mandar de novo aqui nao adiantaria nada -- ele ignora o que
+    # vier no corpo para esses tres.
+    corpo=$(jq -n \
+        --arg state "$state_path" \
+        --arg status "$status" \
+        --argjson index "$index" \
+        --argjson total "$total" \
+        '{
+            state:  $state,
+            status: $status,
+            index:  $index,
+            total:  $total
+        }' 2>/dev/null) || return 0
+
+    curl -sS -m 5 -o /dev/null \
+        -X POST \
+        -H "Authorization: Bearer ${token}" \
+        -H 'Content-Type: application/json' \
+        -d "$corpo" \
+        "$PROGRESS_URL" 2>/dev/null || true
+
+    return 0
+}
+
+if [ -n "$PROGRESS_URL" ]; then
+    echo "📡 Reporting per-state progress to the canvas."
+fi
+
+# ---------------------------------------------------------
 # EXECUÇÃO DOS ESTÁGIOS
 # ---------------------------------------------------------
 TOTAL_STAGES=$(jq '.pipeline_stages | length' "$MANIFEST_PATH")
@@ -817,6 +903,11 @@ for (( i=0; i<$TOTAL_STAGES; i++ )); do
     STAGE_NAME=$(jq -r ".pipeline_stages[$i].stage_name" "$MANIFEST_PATH")
     IS_PARALLEL=$(jq -r ".pipeline_stages[$i].parallel_execution" "$MANIFEST_PATH")
     STATES_JSON=$(jq -c ".pipeline_stages[$i].states[]" "$MANIFEST_PATH")
+    # Posicao do state dentro do estagio, para o canvas poder dizer "3 de 7".
+    # O laco abaixo usa here-string (`<<<`), e nao pipe: ele roda neste mesmo
+    # shell, entao o contador sobrevive a cada volta.
+    STATE_TOTAL=$(jq ".pipeline_stages[$i].states | length" "$MANIFEST_PATH")
+    STATE_INDEX=0
 
     # >>> NÃO usar "::group::" aqui. O `::group::` renderiza a seção RECOLHIDA
     # por padrão no painel do Actions — como todo o terraform (init/plan/apply/
@@ -835,6 +926,7 @@ for (( i=0; i<$TOTAL_STAGES; i++ )); do
 
     while read -r state; do
         path=$(echo "$state" | jq -r '.path')
+        STATE_INDEX=$((STATE_INDEX + 1))
         provider=$(echo "$state" | jq -r '.provider')
         target_auth=$(echo "$state" | jq -c '.target_auth')
         # `// []` cobre o manifesto antigo, que não traz o campo.
@@ -849,11 +941,23 @@ for (( i=0; i<$TOTAL_STAGES; i++ )); do
         fi
 
         if [ "$IS_PARALLEL" == "true" ]; then
+            # Sem relatorio de andamento no ramo paralelo: os processos sao
+            # esperados em bloco no `wait` abaixo, que devolve o codigo de saida
+            # sem dizer de qual pasta ele veio -- nao ha como atribuir o desfecho
+            # ao state certo, e atribuir ao errado apagaria a marca de um recurso
+            # que ainda esta sendo criado. O Struct8 sempre emite
+            # `parallel_execution: false`, entao este ramo nao e o caminho comum.
             run_terraform_process "$path" "$ACTION" "$target_auth" "$provider" "$additional_auth" &
             pids="$pids $!"
         else
+            report_state_progress "$path" "running" "$STATE_INDEX" "$STATE_TOTAL"
             run_terraform_process "$path" "$ACTION" "$target_auth" "$provider" "$additional_auth"
-            if [ $? -ne 0 ]; then failed=1; break; fi
+            if [ $? -ne 0 ]; then
+                report_state_progress "$path" "failed" "$STATE_INDEX" "$STATE_TOTAL"
+                failed=1
+                break
+            fi
+            report_state_progress "$path" "ok" "$STATE_INDEX" "$STATE_TOTAL"
         fi
     done <<< "$STATES_JSON"
 

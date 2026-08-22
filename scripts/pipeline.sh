@@ -932,9 +932,221 @@ _drain_parallel_batch() {
     PAR_IDX=()
 }
 
+# ==============================================================================
+# ESCALONAMENTO POR DEPENDENCIA
+# ==============================================================================
+# O laco de estagios abaixo e uma sequencia de barreiras: uma entrada de
+# `pipeline_stages` so comeca quando a anterior terminou INTEIRA. Com as entradas
+# saindo uma por onda topologica, isso faz um state esperar por gente da rodada
+# anterior com quem ele nao tem relacao nenhuma -- dois ramos independentes
+# andam no passo do mais lento dos dois.
+#
+# Aqui os states das entradas viram um conjunto so, e cada um parte assim que os
+# do `depends_on` DELE terminaram. Mesmas ligacoes, mesma ordem respeitada,
+# menos espera.
+#
+# Vale quando o manifesto pede (`pipeline_schedule.mode == "dependency"`). Sem o
+# campo, nada muda: o manifesto continua trazendo as ondas e o laco de sempre as
+# executa. E o que mantem um engine antigo correto diante de um manifesto novo.
+#
+# POR QUE O CODIGO DE SAIDA VEM DE ARQUIVO, E NAO DE `wait`
+#
+# `wait` sem -n bloqueia ate UM pid especifico terminar, que e justamente o que
+# nao se pode fazer aqui: o proximo a liberar vaga e desconhecido. `wait -n -p`
+# resolveria, mas so existe no bash 5.1+, e este script nao escolhe o runner.
+# Cada job gravando o proprio codigo de saida num arquivo funciona em qualquer
+# bash, e nao depende de quando o shell recolhe o filho.
+SCH_PATH=()
+SCH_PROVIDER=()
+SCH_TARGET_AUTH=()
+SCH_ADD_AUTH=()
+SCH_DEPS=()
+SCH_STATUS=()
+SCH_PID=()
+SCH_DONE_DIR=""
+SCH_RODANDO=0
+
+# 0 quando todo o `depends_on` do state $1 ja terminou com sucesso.
+#
+# Dependencia que nao esta no conjunto e ignorada: o state nao foi enviado neste
+# push, nunca vai reportar, e esperar por ele penduraria o run ate o timeout do
+# Actions. Quem monta o manifesto ja descarta essas, e isto e a segunda linha.
+_deps_satisfeitas() {
+    local idx="$1" dep k achado
+    while IFS= read -r dep; do
+        [ -z "$dep" ] && continue
+        achado=""
+        for k in "${!SCH_PATH[@]}"; do
+            if [ "${SCH_PATH[$k]}" == "$dep" ]; then
+                achado="$k"
+                break
+            fi
+        done
+        [ -z "$achado" ] && continue
+        [ "${SCH_STATUS[$achado]}" == "ok" ] || return 1
+    done <<< "${SCH_DEPS[$idx]}"
+    return 0
+}
+
+# Recolhe quem terminou desde a ultima passada e reporta cada um pelo nome.
+# Devolve 0 se recolheu alguem -- e o sinal de que vale tentar lancar mais sem
+# dormir de novo.
+_recolher_terminados() {
+    local k arquivo codigo recolheu=1
+    for k in "${!SCH_STATUS[@]}"; do
+        [ "${SCH_STATUS[$k]}" == "running" ] || continue
+        arquivo="$SCH_DONE_DIR/$k"
+        [ -f "$arquivo" ] || continue
+
+        codigo=$(cat "$arquivo" 2>/dev/null || echo 1)
+        case "$codigo" in ''|*[!0-9]*) codigo=1 ;; esac
+        wait "${SCH_PID[$k]}" 2>/dev/null || true
+        SCH_RODANDO=$((SCH_RODANDO - 1))
+
+        if [ "$codigo" -eq 0 ]; then
+            SCH_STATUS[$k]="ok"
+            report_state_progress "${SCH_PATH[$k]}" "ok" "$((k + 1))" "${#SCH_PATH[@]}"
+            echo "✅ State finished: ${SCH_PATH[$k]}"
+        else
+            SCH_STATUS[$k]="failed"
+            report_state_progress "${SCH_PATH[$k]}" "failed" "$((k + 1))" "${#SCH_PATH[@]}"
+            echo "::error::State ${SCH_PATH[$k]} failed"
+            failed=1
+        fi
+        recolheu=0
+    done
+    return $recolheu
+}
+
+run_dependency_schedule() {
+    local state path k lancados pendentes max_parallel
+
+    max_parallel=$(jq -r '.pipeline_schedule.max_parallel // empty' "$MANIFEST_PATH")
+    case "$max_parallel" in ''|*[!0-9]*) max_parallel=0 ;; esac
+
+    # Todos os states de todas as entradas, na ordem em que aparecem. As entradas
+    # continuam sendo as ondas; aqui a divisao delas nao interessa -- quem ordena
+    # e o `depends_on`.
+    #
+    # Tudo o que o lancamento precisa sai do JSON AQUI, uma vez por state. Deixar
+    # para extrair na hora de lancar poria tres `jq` dentro do laco de decisao,
+    # que roda a cada volta e para cada candidato.
+    while read -r state; do
+        [ -z "$state" ] && continue
+        SCH_PATH+=("$(echo "$state" | jq -r '.path')")
+        SCH_PROVIDER+=("$(echo "$state" | jq -r '.provider')")
+        SCH_TARGET_AUTH+=("$(echo "$state" | jq -c '.target_auth')")
+        SCH_ADD_AUTH+=("$(echo "$state" | jq -c '.additional_auth // []')")
+        SCH_DEPS+=("$(echo "$state" | jq -r '(.depends_on // [])[]')")
+        SCH_STATUS+=("pending")
+        SCH_PID+=("")
+    done <<< "$(jq -c '.pipeline_stages[].states[]' "$MANIFEST_PATH")"
+
+    if [ "${#SCH_PATH[@]}" -eq 0 ]; then
+        echo "⚠️  Nenhum state no manifesto. Nada a fazer."
+        return 0
+    fi
+
+    SCH_DONE_DIR=$(mktemp -d)
+    failed=0
+
+    echo ""
+    echo "=========================================================="
+    echo "🚀 ${#SCH_PATH[@]} states, escalonados por dependência (até $max_parallel por vez)"
+    echo "=========================================================="
+
+    while true; do
+        lancados=0
+
+        # Nada novo comeca depois de uma falha. O que ja esta rodando termina --
+        # `terraform apply` nao e interrompivel com seguranca -- e o run acaba.
+        if [ $failed -eq 0 ]; then
+            for k in "${!SCH_STATUS[@]}"; do
+                [ "${SCH_STATUS[$k]}" == "pending" ] || continue
+                if [ "$max_parallel" -gt 0 ] && [ "$SCH_RODANDO" -ge "$max_parallel" ]; then
+                    break
+                fi
+                _deps_satisfeitas "$k" || continue
+
+                path="${SCH_PATH[$k]}"
+
+                if [ ! -d "$path" ]; then
+                    echo "⚠️  Directory $path does not exist. Skipping."
+                    # Conta como concluido, e nao como pendente: quem depende dele
+                    # nunca sairia do lugar, e o run morreria no guarda de ciclo
+                    # apontando um ciclo que nao existe.
+                    SCH_STATUS[$k]="ok"
+                    continue
+                fi
+                if [ -d ".external_modules" ]; then
+                    ln -sfn "$(readlink -f .external_modules)" "$path/.external_modules"
+                fi
+
+                report_state_progress "$path" "running" "$((k + 1))" "${#SCH_PATH[@]}"
+                echo "▶️  State starting: $path"
+                (
+                    # `set +e` aqui dentro: com o `set -e` da linha 27 o subshell
+                    # morreria no terraform que falhou, sem gravar o arquivo, e o
+                    # laco ficaria esperando um state que ja acabou.
+                    set +e
+                    run_terraform_process "$path" "$ACTION" \
+                        "${SCH_TARGET_AUTH[$k]}" "${SCH_PROVIDER[$k]}" "${SCH_ADD_AUTH[$k]}"
+                    echo "$?" > "$SCH_DONE_DIR/$k"
+                ) &
+                SCH_PID[$k]=$!
+                SCH_STATUS[$k]="running"
+                SCH_RODANDO=$((SCH_RODANDO + 1))
+                lancados=$((lancados + 1))
+            done
+        fi
+
+        if [ "$SCH_RODANDO" -eq 0 ] && [ "$lancados" -eq 0 ]; then
+            break
+        fi
+
+        # Uma passada de recolhimento libera vaga sem dormir. Sem ninguem para
+        # recolher, um segundo de espera nao pesa perto de um terraform.
+        if ! _recolher_terminados; then
+            sleep 1
+        fi
+    done
+
+    rm -rf "$SCH_DONE_DIR"
+
+    pendentes=0
+    for k in "${!SCH_STATUS[@]}"; do
+        [ "${SCH_STATUS[$k]}" == "pending" ] && pendentes=$((pendentes + 1))
+    done
+
+    if [ $failed -ne 0 ]; then
+        echo "::error::Pipeline failed"
+        exit 1
+    fi
+
+    if [ "$pendentes" -gt 0 ]; then
+        # Sem falha, sem ninguem rodando, e ainda sobrou gente esperando: o
+        # `depends_on` tem um ciclo. O canvas recusa ciclo antes de gerar o
+        # manifesto, entao chegar aqui e manifesto vindo de outra origem -- e o
+        # unico jeito honesto de terminar e recusando.
+        echo "::error::$pendentes state(s) never became runnable -- depends_on has a cycle"
+        exit 1
+    fi
+
+    echo "✅ Pipeline finished: ${#SCH_PATH[@]} states"
+}
+
 # ---------------------------------------------------------
 # EXECUÇÃO DOS ESTÁGIOS
 # ---------------------------------------------------------
+# Qual dos dois percursos. Ausente = por rodada, que e o que o manifesto de
+# qualquer versao anterior pede, e o que este script sempre fez.
+SCHEDULE_MODE=$(jq -r '.pipeline_schedule.mode // "stages"' "$MANIFEST_PATH")
+
+if [ "$SCHEDULE_MODE" == "dependency" ]; then
+    run_dependency_schedule
+    exit 0
+fi
+
 TOTAL_STAGES=$(jq '.pipeline_stages | length' "$MANIFEST_PATH")
 
 for (( i=0; i<$TOTAL_STAGES; i++ )); do

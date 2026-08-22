@@ -894,6 +894,44 @@ if [ -n "$PROGRESS_URL" ]; then
     echo "📡 Reporting per-state progress to the canvas."
 fi
 
+# Which state each background job belongs to.
+#
+# `wait` gives back an exit code and nothing else -- it does not say which
+# directory the job was working in. These three lists are what turns that exit
+# code back into a state, and they are the reason the parallel branch can report
+# progress at all. Index k of the three describes one job.
+PAR_PIDS=()
+PAR_PATHS=()
+PAR_IDX=()
+
+# Waits for every job launched so far and reports each one by name.
+#
+# Called twice: when the batch fills up to `max_parallel`, and once more after
+# the loop for whatever is left. A batch waits for its slowest member, which is
+# the price of not depending on `wait -n -p` -- that flag would give a sliding
+# window, and it only exists in bash 5.1+.
+#
+# Sets `failed` (a global of the stage loop) instead of returning it: the caller
+# already reads that variable to decide whether the stage as a whole is over.
+_drain_parallel_batch() {
+    local k
+    for k in "${!PAR_PIDS[@]}"; do
+        # Condition context on purpose: with `set -e` a bare `wait` on a job that
+        # exited non-zero would end the script here, and the state that failed
+        # would never be reported -- the node would keep a running badge on a run
+        # that is already over.
+        if wait "${PAR_PIDS[$k]}"; then
+            report_state_progress "${PAR_PATHS[$k]}" "ok" "${PAR_IDX[$k]}" "$STATE_TOTAL"
+        else
+            report_state_progress "${PAR_PATHS[$k]}" "failed" "${PAR_IDX[$k]}" "$STATE_TOTAL"
+            failed=1
+        fi
+    done
+    PAR_PIDS=()
+    PAR_PATHS=()
+    PAR_IDX=()
+}
+
 # ---------------------------------------------------------
 # EXECUÇÃO DOS ESTÁGIOS
 # ---------------------------------------------------------
@@ -908,6 +946,13 @@ for (( i=0; i<$TOTAL_STAGES; i++ )); do
     # shell, entao o contador sobrevive a cada volta.
     STATE_TOTAL=$(jq ".pipeline_stages[$i].states | length" "$MANIFEST_PATH")
     STATE_INDEX=0
+    # How many states of this entry may run at once. Absent or junk means no
+    # ceiling, which is what an older manifest asks for: run the whole entry.
+    MAX_PARALLEL=$(jq -r ".pipeline_stages[$i].max_parallel // empty" "$MANIFEST_PATH")
+    case "$MAX_PARALLEL" in ''|*[!0-9]*) MAX_PARALLEL=0 ;; esac
+    PAR_PIDS=()
+    PAR_PATHS=()
+    PAR_IDX=()
 
     # >>> NÃO usar "::group::" aqui. O `::group::` renderiza a seção RECOLHIDA
     # por padrão no painel do Actions — como todo o terraform (init/plan/apply/
@@ -921,7 +966,6 @@ for (( i=0; i<$TOTAL_STAGES; i++ )); do
     echo "🚀 Stage: $STAGE_NAME"
     echo "=========================================================="
 
-    pids=""
     failed=0
 
     while read -r state; do
@@ -941,14 +985,24 @@ for (( i=0; i<$TOTAL_STAGES; i++ )); do
         fi
 
         if [ "$IS_PARALLEL" == "true" ]; then
-            # Sem relatorio de andamento no ramo paralelo: os processos sao
-            # esperados em bloco no `wait` abaixo, que devolve o codigo de saida
-            # sem dizer de qual pasta ele veio -- nao ha como atribuir o desfecho
-            # ao state certo, e atribuir ao errado apagaria a marca de um recurso
-            # que ainda esta sendo criado. O Struct8 sempre emite
-            # `parallel_execution: false`, entao este ramo nao e o caminho comum.
+            # Reported before launching, and the launch is recorded so the exit
+            # code can be traced back to this directory. Without that pairing the
+            # canvas had to go dark for the whole parallel run: attributing an
+            # outcome to the wrong state would clear the badge of a resource that
+            # is still being created.
+            report_state_progress "$path" "running" "$STATE_INDEX" "$STATE_TOTAL"
             run_terraform_process "$path" "$ACTION" "$target_auth" "$provider" "$additional_auth" &
-            pids="$pids $!"
+            PAR_PIDS+=("$!")
+            PAR_PATHS+=("$path")
+            PAR_IDX+=("$STATE_INDEX")
+
+            if [ "$MAX_PARALLEL" -gt 0 ] && [ "${#PAR_PIDS[@]}" -ge "$MAX_PARALLEL" ]; then
+                _drain_parallel_batch
+                # Nothing new is started once something has failed. What is
+                # already running finishes -- `terraform apply` cannot be
+                # interrupted safely -- and the stage ends right after.
+                if [ $failed -ne 0 ]; then break; fi
+            fi
         else
             report_state_progress "$path" "running" "$STATE_INDEX" "$STATE_TOTAL"
             run_terraform_process "$path" "$ACTION" "$target_auth" "$provider" "$additional_auth"
@@ -962,10 +1016,7 @@ for (( i=0; i<$TOTAL_STAGES; i++ )); do
     done <<< "$STATES_JSON"
 
     if [ "$IS_PARALLEL" == "true" ]; then
-        for pid in $pids; do
-            wait $pid
-            if [ $? -ne 0 ]; then failed=1; fi
-        done
+        _drain_parallel_batch
     fi
 
     if [ $failed -ne 0 ]; then

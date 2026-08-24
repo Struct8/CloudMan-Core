@@ -322,9 +322,17 @@ run_terraform_process() {
         # credencial ou backend chegava ao diagrama como plano velho, igual a
         # todas as outras falhas.
         INIT_STATUS=0
-        _stream_cmd terraform init -reconfigure -input=false \
-            -backend-config="profile=backend" \
-            -backend-config="region=$BACKEND_REGION" || INIT_STATUS=$?
+        if [ "$action" == "scan" ]; then
+            # A scan is not Terraform. Its folder holds the manifest and the
+            # scope and no `.tf` at all, so there is no configuration for init
+            # to initialise. It also neither reads nor writes state, which is
+            # what makes it the one action here that does not need the backend.
+            echo -e "${color}⏭️  ${label} Scan: no Terraform in this folder, skipping init.${NC}"
+        else
+            _stream_cmd terraform init -reconfigure -input=false \
+                -backend-config="profile=backend" \
+                -backend-config="region=$BACKEND_REGION" || INIT_STATUS=$?
+        fi
 
         if [ $INIT_STATUS -ne 0 ]; then
             # Só plan e drift: é o arquivo que ESSAS duas ações publicam e que o
@@ -648,7 +656,12 @@ run_terraform_process() {
           APPLY_STATUS=$?
 
         # INÍCIO DA NOVA LÓGICA DE IMPORT (GERAÇÃO PARA REVISÃO)
-        elif [ "$action" == "import" ]; then
+        # TWO NAMES, ONE PASS. `import` is the original name and the old Import
+        # tab still sends it. `read` is what the account-scan journey sends, and
+        # it is the accurate one: this branch WRITES NO STATE -- it reads the
+        # resources named in the import blocks and produces a draft. The step
+        # that writes is `apply`, over those same blocks.
+        elif [ "$action" == "import" ] || [ "$action" == "read" ]; then
           echo -e "${color}📥 ${label} Generating import draft...${NC}"
 
           # 1. Limpeza preventiva absoluta
@@ -677,6 +690,39 @@ run_terraform_process() {
               echo -e "${RED}❌ Critical error: terraform could not even produce the draft .tf file.${NC}"
               exit 1
           fi
+
+        elif [ "$action" == "scan" ]; then
+          echo -e "${color}🔎 ${label} Listing the account...${NC}"
+
+          # In Node rather than bash with jq, because what comes out is a JSON
+          # with two layers and what consumes it is TypeScript: keeping the shape
+          # in one language is what stops the two ends from drifting apart.
+          # `node` ships with the GitHub runner, but the check stays -- without
+          # it the failure would surface as "the scan produced no inventory",
+          # which points at the wrong thing.
+          if ! command -v node > /dev/null 2>&1; then
+            echo -e "${RED}❌ Critical error: node is not on this runner, and the scan needs it.${NC}"
+            exit 1
+          fi
+
+          rm -f scan_inventory.json
+
+          # No `|| true`: the script already records, inside the inventory, every
+          # service the credentials could not read, and carries on. So a non-zero
+          # exit means it did not reach the end -- and a partial inventory passing
+          # for a complete one is the worst outcome this action has.
+          node "$ENGINE_PATH/scripts/scan-account.mjs" --out scan_inventory.json
+
+          if [ ! -f scan_inventory.json ]; then
+            echo -e "${RED}❌ Critical error: the scan produced no inventory file.${NC}"
+            exit 1
+          fi
+
+          SCAN_COUNT=$(jq '.items | length' scan_inventory.json 2>/dev/null || echo "?")
+          SCAN_ERRORS=$(jq '.errors | length' scan_inventory.json 2>/dev/null || echo "?")
+          echo -e "${color}📄 ${label} ${SCAN_COUNT} resource(s) listed, ${SCAN_ERRORS} service(s) unreadable.${NC}"
+
+          touch "$GITHUB_WORKSPACE/.needs_scan_commit"
 
         elif [ "$action" == "destroy" ]; then
 
@@ -732,6 +778,16 @@ run_terraform_process() {
               echo -e "${color}❌ ${label} Terraform destroy failed. Remote cleanup was NOT performed.${NC}"
               return $DESTROY_STATUS
           fi
+
+        else
+          # NO SILENT FALL-THROUGH. Until this branch existed, an action the
+          # engine does not know -- a typo, or a name the app began sending
+          # before the engine learned it -- ran init and target auth, matched
+          # nothing in this chain, and the run finished GREEN having done
+          # nothing at all. The app was then left waiting for a file that was
+          # never going to arrive, with no failure anywhere to point at.
+          echo -e "${RED}❌ Unknown action '$action'. This engine serves: plan, drift, apply, destroy, import, read, scan.${NC}"
+          exit 1
         fi
     )
 

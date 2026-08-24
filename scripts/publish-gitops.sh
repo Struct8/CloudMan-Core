@@ -63,7 +63,15 @@ push_with_retry() {
 # 1. LÓGICA DO PASSO 2 (GERAÇÃO DE IMPORT)
 if [ -f "$GITHUB_WORKSPACE/.needs_commit" ]; then
   echo "📥 Import operation detected. Saving the generated resources to the repository..."
-  git add ./**/generated_resources.json
+  # QUOTED, for the reason spelled out in the `git rm` block below: unquoted,
+  # bash expands `./**/x` itself, and without globstar it treats `**` as a
+  # single `*`. While nothing matches one level down the pattern reaches git
+  # untouched and git's own matching crosses `/`, so this worked by accident.
+  # The moment something DOES match at depth 1, bash hands git that one path and
+  # the deeper ones are dropped in silence -- which is exactly the account-import
+  # layout, `<account>/_import/<node>/`, three levels down. Measured, not
+  # reasoned: with a depth-1 match present, the depth-3 file was not staged.
+  git add -- '*generated_resources.json'
 
   if ! git diff --staged --quiet; then
     git commit -m "chore: generated terraform awaiting CloudMan review [skip ci]"
@@ -110,6 +118,24 @@ if ! git diff --staged --quiet; then
   git commit -m "chore: drop committed plan results, now published as artifacts [skip ci]"
   push_with_retry "plan result cleanup"
   echo "✅ Old plan results removed from the repository."
+fi
+
+# 1c. THE ACCOUNT SCAN'S INVENTORY
+#
+# Committed to the repository rather than published as an artifact like
+# plan_result: Struct8 fetches this through the same call that already fetches
+# generated_resources, and an artifact is not reachable by it. Unlike a plan, it
+# also does not go stale on the next edit -- it is the list of what exists in the
+# account, and it is the input to the screen where states get separated.
+if [ -f "$GITHUB_WORKSPACE/.needs_scan_commit" ]; then
+  echo "🔎 Scan finished. Saving the inventory to the repository..."
+  git add -- '*scan_inventory.json'
+
+  if ! git diff --staged --quiet; then
+    git commit -m "chore: account scan inventory awaiting CloudMan review [skip ci]"
+    push_with_retry "scan inventory"
+    echo "✅ Scan inventory pushed to the repository."
+  fi
 fi
 
 # 2. LÓGICA DO PASSO 4 (LIMPEZA PÓS-APPLY)

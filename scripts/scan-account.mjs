@@ -122,6 +122,56 @@ const tagsOf = (list) =>
 	} while (token);
 }
 
+// ------------------------------- layer 1a bis: instances that no longer exist
+//
+// A terminated instance keeps its tags, and the tagging index keeps answering
+// for it -- for about an hour after it dies. The comment above says the read
+// pass settles this: an id that no longer resolves fails its import block and
+// is reported.
+//
+// THAT IS NOT ENOUGH, and the reason is a rule on the other side. Struct8 stops
+// the import when fewer resources come back than were selected, because a
+// diagram holding part of a network looks no different from one holding all of
+// it. So dead instances in the index do not arrive as warnings next to a
+// working import -- they STOP it. Measured on 2026-08-24 in mx-central-1: two
+// live instances, four dead ones, "the reading returned 12 of the 16 resources
+// selected", and no diagram. Clicking Read again selected the same four.
+//
+// `terminated` and `shutting-down` are the two states with nothing to import.
+// A `stopped` instance is an ordinary instance that happens to be off, and
+// imports like any other -- asking for the live states by name, rather than
+// excluding the dead ones, would have dropped it.
+//
+// A failure here keeps every instance instead of dropping every instance. This
+// scan is allowed to offer too much; it is not allowed to hide what exists.
+{
+	const hasInstances = items.some((i) => /:instance\/i-/.test(i.arn));
+	if (hasInstances) {
+		const live = aws('ec2', 'describe-instances', [
+			'--filters',
+			'Name=instance-state-name,Values=pending,running,stopping,stopped'
+		]);
+		if (live) {
+			const alive = new Set(
+				(live.Reservations ?? []).flatMap((r) => (r.Instances ?? []).map((i) => i.InstanceId))
+			);
+			const dead = [];
+			for (let i = items.length - 1; i >= 0; i--) {
+				const id = items[i].arn.match(/:instance\/(i-[0-9a-f]+)/)?.[1];
+				if (id && !alive.has(id)) dead.push(...items.splice(i, 1));
+			}
+			if (dead.length) {
+				// Named, not just counted: a scan that silently returns less than the
+				// account holds is the failure this whole script exists to avoid.
+				console.error(
+					`scan-account: ${dead.length} instance(s) gone, left out: ` +
+						dead.map((d) => d.tags?.Name ?? d.arn.split('/').pop()).join(', ')
+				);
+			}
+		}
+	}
+}
+
 // ------------------------------------- layer 1b: the network family, by vpc-id
 //
 // `vpc-id` is a first-class filter on every EC2 listing, and unlike a tag it does

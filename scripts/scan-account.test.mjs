@@ -48,7 +48,18 @@ const ANSWERS = {
 		{
 			ResourceTagMappingList: [
 				{ ResourceARN: `arn:aws:eks:${R}:${A}:cluster/eks-k8hub`, Tags: [{ Key: 'Name', Value: 'eks-k8hub' }] },
-				{ ResourceARN: 'arn:aws:s3:::s3-loki-billing-pay', Tags: [] }
+				{ ResourceARN: 'arn:aws:s3:::s3-loki-billing-pay', Tags: [] },
+				// Two instances carrying the same Name tag. The tagging index keeps
+				// answering for a terminated one for about an hour, so this is what a
+				// region looks like shortly after someone replaced a machine.
+				{
+					ResourceARN: `arn:aws:ec2:${R}:${A}:instance/i-0aaaaaaaaaaaaaaaa`,
+					Tags: [{ Key: 'Name', Value: 'nat-instance-teste' }]
+				},
+				{
+					ResourceARN: `arn:aws:ec2:${R}:${A}:instance/i-0dddddddddddddddd`,
+					Tags: [{ Key: 'Name', Value: 'nat-instance-teste' }]
+				}
 			],
 			PaginationToken: 'page2'
 		},
@@ -118,6 +129,11 @@ const ANSWERS = {
 			]
 		}
 	],
+	// Only the live one comes back: the scan asks for the importable states by
+	// name, so a terminated instance is simply absent from the answer.
+	'ec2 describe-instances': [
+		{ Reservations: [{ Instances: [{ InstanceId: 'i-0aaaaaaaaaaaaaaaa' }] }] }
+	],
 	// The one the credentials cannot read.
 	'ec2 describe-security-groups': 'THROWS',
 	'sts get-caller-identity': [{ Account: A }]
@@ -175,6 +191,20 @@ try {
 		JSON.stringify(arns)
 	);
 	check('a bucket with no tags still came', arns.includes('arn:aws:s3:::s3-loki-billing-pay'));
+
+	// The rule that stops the import is on the other side: Struct8 refuses a read
+	// that returns fewer resources than were selected. So an instance offered here
+	// and unimportable there does not degrade the result -- it blocks it.
+	check(
+		'the live instance came',
+		arns.includes(`arn:aws:ec2:${R}:${A}:instance/i-0aaaaaaaaaaaaaaaa`),
+		JSON.stringify(arns)
+	);
+	check(
+		'the terminated one was left out, even sharing a Name tag with the live one',
+		!arns.includes(`arn:aws:ec2:${R}:${A}:instance/i-0dddddddddddddddd`),
+		JSON.stringify(arns)
+	);
 
 	// -------------------------------------------------------------- layer 1b
 	check('the VPC came, named by its tag', out.items.some((i) => i.tags?.Name === 'EKS-k8hub'));

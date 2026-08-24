@@ -717,26 +717,38 @@ run_terraform_process() {
             else
               echo -e "${color}🧹 ${label} Repairing the generated HCL...${NC}"
               node "$SANITIZER" generated_resources.tf || true
-              # QUEM PARA A SÉRIE É O SANEADOR, não este número: ele sai com 1
-              # assim que não tem mais o que tirar, e o `|| break` abaixo é o
-              # fim de verdade. O teto existe só como rede contra um laço que
-              # não converge, e por isso é alto: cada passe custa um `terraform
-              # plan` contra a conta, mas parar cedo custa o rascunho inteiro.
-              # Quatro bastaram para uma VPC de 12 recursos com 6 tipos; uma
-              # conta com 50 tipos traz mais classes de erro, e o corte seria
-              # invisível -- o rascunho voltaria parcial sem dizer por quê.
+
+              # O LAÇO RODA EM `terraform validate`, NÃO EM `plan`.
+              #
+              # É a mesma autoridade: `ConflictsWith`, `RequiredWith` e os
+              # validadores de valor são checados na validação de schema do SDK,
+              # que acontece ANTES de qualquer chamada de API. Medido contra os
+              # seis erros desta conta, o `validate` pega todos os seis, com o
+              # texto idêntico ao do plan -- e roda sem credencial nenhuma.
+              #
+              # A diferença é o preço de um passe. Cada `plan` relia a conta
+              # inteira, o que fazia o teto de passes virar risco de verdade:
+              # cortar cedo devolvia um rascunho parcial, e cortar tarde custava
+              # minutos por rodada. Um `validate` não fala com a AWS, então o
+              # teto pode ser alto sem custar nada.
+              #
+              # Quem termina a série continua sendo o saneador, que sai com 1
+              # assim que não tem mais o que tirar.
+              REPAIR_PASSES=0
               for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
-                # Sem `-generate-config-out` de propósito: ele recusa sobrescrever
-                # um arquivo que existe, e daqui em diante a configuração É o
-                # arquivo que acabou de ser saneado.
-                if terraform plan -out=import.tfplan -input=false > draft_plan.log 2>&1; then
-                  DRAFT_STATUS=0
-                  echo -e "${color}✅ Draft repaired on pass ${attempt}.${NC}"
-                  break
-                fi
+                if terraform validate > draft_plan.log 2>&1; then break; fi
+                REPAIR_PASSES=$attempt
                 node "$SANITIZER" generated_resources.tf draft_plan.log || break
               done
-              if [ "$DRAFT_STATUS" -ne 0 ]; then
+
+              # O plano volta a ser tirado UMA vez, agora que a configuração
+              # passa na validação. Sem `-generate-config-out` de propósito: ele
+              # recusa sobrescrever um arquivo que existe, e daqui em diante a
+              # configuração É o arquivo que acabou de ser saneado.
+              if terraform plan -out=import.tfplan -input=false > draft_plan.log 2>&1; then
+                DRAFT_STATUS=0
+                echo -e "${color}✅ Draft repaired in ${REPAIR_PASSES} local pass(es).${NC}"
+              else
                 cat draft_plan.log
                 echo -e "${YELLOW}⚠️ Warning: the draft still has HCL errors after the repair passes.${NC}"
               fi

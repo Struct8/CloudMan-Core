@@ -32,7 +32,23 @@
 //
 //   2. ERROR-DRIVEN: whatever survives, Terraform itself names. Each diagnostic
 //      carries the resource address and the offending attribute, so the caller
-//      re-plans, hands the log back, and this drops exactly what was named.
+//      re-runs Terraform, hands the log back, and this drops what was named.
+//
+//      WHY ASKING BEATS KNOWING. The rules being broken -- `ConflictsWith`,
+//      `RequiredWith`, `ExactlyOneOf`, and every `validation.*` -- live in the
+//      provider's Go structs and are published NOWHERE machine-readable. The
+//      13 MB of `terraform providers schema -json` carries none of them: an
+//      attribute there has type, optional, computed, required, sensitive,
+//      deprecated, description and write_only, and that is all. So a rulebook
+//      would have to be scraped from provider source and would rot on every
+//      release, silently. The provider is the only complete authority, and it
+//      speaks only in diagnostics.
+//
+//      AND ASKING IS FREE: those checks run in the SDK's schema validation,
+//      before any API call, so `terraform validate` reports them all -- with no
+//      credentials and no request to the account. That is what the caller
+//      loops on. A `plan` is spent once, at the end, on what validation cannot
+//      see: a value that differs from the account's.
 //
 // WHAT IT REFUSES TO DO is guess at zero-valued numbers and booleans in bulk.
 // `source_dest_check = false` is what makes a NAT instance forward packets, and
@@ -41,7 +57,7 @@
 //
 // Usage:
 //   node sanitize-generated-config.mjs <config.tf>              # pass 1
-//   node sanitize-generated-config.mjs <config.tf> <plan.log>   # pass 2
+//   node sanitize-generated-config.mjs <config.tf> <terraform.log> # pass 2
 //
 // Exit codes: 0 = the file was changed, 1 = nothing to change (or bad input).
 // The caller uses that to stop looping instead of re-planning for no reason.

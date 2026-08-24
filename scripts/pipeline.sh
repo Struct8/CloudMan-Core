@@ -672,7 +672,7 @@ run_terraform_process() {
           # esperada e tratada no passo 2b -- não é motivo para derrubar o
           # pipeline. O log vai para arquivo porque 2b precisa lê-lo.
           DRAFT_STATUS=0
-          terraform plan -no-color -generate-config-out=generated_resources.tf -out=import.tfplan -input=false > draft_plan.log 2>&1 || DRAFT_STATUS=$?
+          terraform plan -generate-config-out=generated_resources.tf -out=import.tfplan -input=false > draft_plan.log 2>&1 || DRAFT_STATUS=$?
           cat draft_plan.log
 
           # 2a. OS BLOCOS DE IMPORT VÊM DE UMA VARREDURA, E UMA VARREDURA É UMA
@@ -693,7 +693,7 @@ run_terraform_process() {
               echo -e "${YELLOW}⚠️ Some of the resources picked no longer exist in the account, and were left out of the draft.${NC}"
               rm -f generated_resources.tf
               DRAFT_STATUS=0
-              terraform plan -no-color -generate-config-out=generated_resources.tf -out=import.tfplan -input=false > draft_plan.log 2>&1 || DRAFT_STATUS=$?
+              terraform plan -generate-config-out=generated_resources.tf -out=import.tfplan -input=false > draft_plan.log 2>&1 || DRAFT_STATUS=$?
               cat draft_plan.log
               if [ "$DRAFT_STATUS" -eq 0 ]; then break; fi
             done
@@ -721,7 +721,7 @@ run_terraform_process() {
                 # Sem `-generate-config-out` de propósito: ele recusa sobrescrever
                 # um arquivo que existe, e daqui em diante a configuração É o
                 # arquivo que acabou de ser saneado.
-                if terraform plan -no-color -out=import.tfplan -input=false > draft_plan.log 2>&1; then
+                if terraform plan -out=import.tfplan -input=false > draft_plan.log 2>&1; then
                   DRAFT_STATUS=0
                   echo -e "${color}✅ Draft repaired on pass ${attempt}.${NC}"
                   break
@@ -747,7 +747,7 @@ run_terraform_process() {
             if [ -f "$INLINER" ] && command -v node > /dev/null 2>&1 && command -v aws > /dev/null 2>&1; then
               cp generated_resources.tf generated_resources.tf.prev
               if terraform show -json import.tfplan > draft_plan.json 2>/dev/null && node "$INLINER" generated_resources.tf draft_plan.json; then
-                if terraform plan -no-color -out=import.tfplan -input=false > draft_plan.log 2>&1; then
+                if terraform plan -out=import.tfplan -input=false > draft_plan.log 2>&1; then
                   echo -e "${color}📝 ${label} The user-data of the imported instances is in the draft, and gets committed with it.${NC}"
                 else
                   # Sem plano não há JSON, e o rascunho anterior pelo menos tinha
@@ -755,7 +755,7 @@ run_terraform_process() {
                   cat draft_plan.log
                   echo -e "${YELLOW}⚠️ Warning: the draft stopped planning once the user-data was written in. Keeping the version without it.${NC}"
                   mv generated_resources.tf.prev generated_resources.tf
-                  terraform plan -no-color -out=import.tfplan -input=false > draft_plan.log 2>&1 || true
+                  terraform plan -out=import.tfplan -input=false > draft_plan.log 2>&1 || true
                 fi
               fi
               rm -f generated_resources.tf.prev draft_plan.json

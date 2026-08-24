@@ -164,8 +164,10 @@ function walk(decide) {
  *   \x1b[31m│\x1b[0m \x1b[0m\x1b[1m\x1b[31mError: \x1b[0m...
  *
  * so any attempt to read it from the left stops inside `\x1b[31m`, on the `3`.
- * The caller passes `-no-color` too; this is here because a log is a log and
- * nobody notices when a parser quietly matches nothing.
+ *
+ * `-no-color` would also fix the parsing, and was tried: it takes the colours
+ * and the box away from the person reading the run, which is a worse trade than
+ * stripping them here. The colours were never the defect.
  *
  * @param text raw log contents
  */

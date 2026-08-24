@@ -675,6 +675,30 @@ run_terraform_process() {
           terraform plan -generate-config-out=generated_resources.tf -out=import.tfplan -input=false > draft_plan.log 2>&1 || DRAFT_STATUS=$?
           cat draft_plan.log
 
+          # 2a. OS BLOCOS DE IMPORT VÊM DE UMA VARREDURA, E UMA VARREDURA É UMA
+          # FOTO. Entre a pessoa escolher os recursos e a importação rodar, algo
+          # pode ter sido apagado -- e o Terraform então para. Não aquele
+          # recurso: a rodada inteira. Uma instância que sumiu derruba o
+          # rascunho das outras onze.
+          #
+          # Tirar o bloco não esconde a diferença: sobram menos recursos do que
+          # os pedidos, e o canvas compara os dois números e para nisso. A
+          # configuração é regerada do zero porque ela foi escrita com o recurso
+          # que não existe mais.
+          PRUNER="$ENGINE_PATH/scripts/prune-missing-imports.mjs"
+          if [ "$DRAFT_STATUS" -ne 0 ] && [ -f "$PRUNER" ] && [ -f imports.tf ] && command -v node > /dev/null 2>&1; then
+            for round in 1 2; do
+              grep -q 'Cannot import non-existent remote object' draft_plan.log || break
+              node "$PRUNER" imports.tf draft_plan.log || break
+              echo -e "${YELLOW}⚠️ Some of the resources picked no longer exist in the account, and were left out of the draft.${NC}"
+              rm -f generated_resources.tf
+              DRAFT_STATUS=0
+              terraform plan -generate-config-out=generated_resources.tf -out=import.tfplan -input=false > draft_plan.log 2>&1 || DRAFT_STATUS=$?
+              cat draft_plan.log
+              if [ "$DRAFT_STATUS" -eq 0 ]; then break; fi
+            done
+          fi
+
           # 2b. O RASCUNHO SÓ SERVE SE O ARQUIVO DE PLANO FOR ESCRITO. Sem ele
           # não há JSON, e o que chega ao front-end é o aviso do passo 3 -- que
           # se lê como "não achei nada" e não como "isto falhou".

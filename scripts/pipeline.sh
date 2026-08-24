@@ -665,12 +665,78 @@ run_terraform_process() {
           echo -e "${color}📥 ${label} Generating import draft...${NC}"
 
           # 1. Limpeza preventiva absoluta
-          rm -f generated_resources.tf import.tfplan generated_resources.json
+          rm -f generated_resources.tf generated_resources.tf.prev import.tfplan generated_resources.json draft_plan.log draft_plan.json
 
-          # 2. Executa a geração. Usamos '|| true' aqui porque o gerador experimental
-          # quase sempre gera avisos ou erros de conflito que não devem travar o pipeline
-          # de geração de rascunho.
-          terraform plan -generate-config-out=generated_resources.tf -out=import.tfplan -input=false || echo "⚠️ Warning: the generator hit HCL conflicts, continuing anyway to produce the draft."
+          # 2. Executa a geração. O gerador de configuração é experimental e a
+          # saída dele quase sempre tem conflito de HCL, então a falha aqui é
+          # esperada e tratada no passo 2b -- não é motivo para derrubar o
+          # pipeline. O log vai para arquivo porque 2b precisa lê-lo.
+          DRAFT_STATUS=0
+          terraform plan -generate-config-out=generated_resources.tf -out=import.tfplan -input=false > draft_plan.log 2>&1 || DRAFT_STATUS=$?
+          cat draft_plan.log
+
+          # 2b. O RASCUNHO SÓ SERVE SE O ARQUIVO DE PLANO FOR ESCRITO. Sem ele
+          # não há JSON, e o que chega ao front-end é o aviso do passo 3 -- que
+          # se lê como "não achei nada" e não como "isto falhou".
+          #
+          # O que trava o plano é o próprio gerador emitindo cada atributo
+          # opcional do schema no valor zero (`ipv6_cidr_block = ""`,
+          # `enable_lni_at_device_index = 0`), que os validadores do provider
+          # então recusam. Medido numa VPC de 12 recursos no provider 5.100.0:
+          # 10 erros e nenhum plano. `sanitize-generated-config.mjs` tira esses
+          # valores; cada rodada recebe os erros do plano anterior e a série
+          # para assim que não houver mais o que tirar.
+          if [ "$DRAFT_STATUS" -ne 0 ] && [ -f "generated_resources.tf" ]; then
+            SANITIZER="$ENGINE_PATH/scripts/sanitize-generated-config.mjs"
+            if [ ! -f "$SANITIZER" ] || ! command -v node > /dev/null 2>&1; then
+              echo -e "${YELLOW}⚠️ Warning: the draft has HCL errors and cannot be repaired here (node or the sanitizer is missing).${NC}"
+            else
+              echo -e "${color}🧹 ${label} Repairing the generated HCL...${NC}"
+              node "$SANITIZER" generated_resources.tf || true
+              for attempt in 1 2 3 4; do
+                # Sem `-generate-config-out` de propósito: ele recusa sobrescrever
+                # um arquivo que existe, e daqui em diante a configuração É o
+                # arquivo que acabou de ser saneado.
+                if terraform plan -out=import.tfplan -input=false > draft_plan.log 2>&1; then
+                  DRAFT_STATUS=0
+                  echo -e "${color}✅ Draft repaired on pass ${attempt}.${NC}"
+                  break
+                fi
+                node "$SANITIZER" generated_resources.tf draft_plan.log || break
+              done
+              if [ "$DRAFT_STATUS" -ne 0 ]; then
+                cat draft_plan.log
+                echo -e "${YELLOW}⚠️ Warning: the draft still has HCL errors after the repair passes.${NC}"
+              fi
+            fi
+          fi
+
+          # 2c. `user_data` chega ao rascunho como o SHA1 que o state guarda,
+          # nunca como o conteúdo -- e o provider relê esse hash COMO SE fosse o
+          # conteúdo, propondo trocar o user-data da instância pelo hash de
+          # outra coisa. Remover a linha não resolve, `user_data_base64` não
+          # resolve e `ignore_changes` não resolve; medido contra uma instância
+          # viva, o único rascunho que fecha em `0 to change` é o que carrega o
+          # script de verdade. Por isso ele é lido da conta e escrito aqui.
+          if [ "$DRAFT_STATUS" -eq 0 ] && [ -f "generated_resources.tf" ]; then
+            INLINER="$ENGINE_PATH/scripts/inline-user-data.mjs"
+            if [ -f "$INLINER" ] && command -v node > /dev/null 2>&1 && command -v aws > /dev/null 2>&1; then
+              cp generated_resources.tf generated_resources.tf.prev
+              if terraform show -json import.tfplan > draft_plan.json 2>/dev/null && node "$INLINER" generated_resources.tf draft_plan.json; then
+                if terraform plan -out=import.tfplan -input=false > draft_plan.log 2>&1; then
+                  echo -e "${color}📝 ${label} The user-data of the imported instances is in the draft, and gets committed with it.${NC}"
+                else
+                  # Sem plano não há JSON, e o rascunho anterior pelo menos tinha
+                  # um. A diferença de user_data volta, e é visível no plano.
+                  cat draft_plan.log
+                  echo -e "${YELLOW}⚠️ Warning: the draft stopped planning once the user-data was written in. Keeping the version without it.${NC}"
+                  mv generated_resources.tf.prev generated_resources.tf
+                  terraform plan -out=import.tfplan -input=false > draft_plan.log 2>&1 || true
+                fi
+              fi
+              rm -f generated_resources.tf.prev draft_plan.json
+            fi
+          fi
 
           # 3. Verifica se pelo menos o arquivo .tf foi gerado (mesmo com erros de validação)
           if [ -f "generated_resources.tf" ]; then

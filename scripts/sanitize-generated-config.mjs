@@ -155,6 +155,25 @@ function walk(decide) {
 }
 
 /**
+ * Removes what Terraform draws for a terminal, leaving the text.
+ *
+ * WITHOUT THIS, NOTHING BELOW MATCHES. Terraform colours a plan unless it is
+ * given `-no-color`, and a redirected log keeps the escapes -- one real run
+ * carried 541 of them. An `Error:` line arrives as
+ *
+ *   \x1b[31m│\x1b[0m \x1b[0m\x1b[1m\x1b[31mError: \x1b[0m...
+ *
+ * so any attempt to read it from the left stops inside `\x1b[31m`, on the `3`.
+ * The caller passes `-no-color` too; this is here because a log is a log and
+ * nobody notices when a parser quietly matches nothing.
+ *
+ * @param text raw log contents
+ */
+function stripDecoration(text) {
+	return text.replace(/\r\n/g, '\n').replace(/\x1B\[[0-9;?]*[A-Za-z]/g, '');
+}
+
+/**
  * Reads a plan log and returns, per resource address, the attributes its
  * diagnostics blame.
  *
@@ -169,8 +188,8 @@ function attributesBlamedBy(log) {
 	// redirected log, and splitting on a character that is not there put every
 	// attribute in the file onto whichever resource was blamed first.
 	const groups = [];
-	for (const line of log.replace(/\r\n/g, '\n').split('\n')) {
-		const clean = line.replace(/^[^A-Za-z0-9"]*/, '');
+	for (const line of stripDecoration(log).split('\n')) {
+		const clean = line.replace(/^[\s│╵╷|]*/, '');
 		if (/^(Error|Warning):/.test(clean)) groups.push([]);
 		if (groups.length === 0) continue;
 		groups[groups.length - 1].push(clean);

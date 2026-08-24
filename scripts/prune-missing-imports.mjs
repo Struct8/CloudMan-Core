@@ -35,14 +35,20 @@ if (!importsPath || !fs.existsSync(importsPath) || !logPath || !fs.existsSync(lo
 	process.exit(1);
 }
 
-const log = fs.readFileSync(logPath, 'utf-8').replace(/\r\n/g, '\n');
+// The colour codes go first, and they are not cosmetic here: Terraform colours
+// a plan unless told not to, a redirected log keeps every escape, and the
+// address this looks for sits right after one of them. One real run carried 541.
+const log = fs
+	.readFileSync(logPath, 'utf-8')
+	.replace(/\r\n/g, '\n')
+	.replace(/\x1B\[[0-9;?]*[A-Za-z]/g, '');
 
 // The diagnostic is wrapped at the terminal width and framed with box-drawing
-// characters that a redirected log does not carry, so the address is read off
-// the whole text rather than off any one line.
+// characters, so the address is read off the whole text rather than off any one
+// line.
 const flattened = log
 	.split('\n')
-	.map((line) => line.replace(/^[^A-Za-z0-9"]*/, ''))
+	.map((line) => line.replace(/^[\s│╵╷|]*/, ''))
 	.join(' ');
 
 const missing = new Set();

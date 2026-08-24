@@ -210,6 +210,15 @@ function attributesBlamedBy(log) {
 		const clean = line.replace(/^[\s│╵╷|]*/, '');
 		if (/^(Error|Warning):/.test(clean)) groups.push([]);
 		if (groups.length === 0) continue;
+		// `on main.tf line 14, in resource "google_storage_bucket_object"
+		// "conflito":` ends with the resource's own NAME in quotes and a colon --
+		// the same shape as a blamed attribute, so it was being read as one and
+		// dropped. A resource called `content` would have lost its `content`.
+		//
+		// The aws fixtures never showed this: their logical names carry hyphens,
+		// which the attribute pattern excludes. It took running the same parser
+		// against the google provider, whose names do not, to surface it.
+		if (/^on\s+\S+\s+line\s+\d+/.test(clean)) continue;
 		groups[groups.length - 1].push(clean);
 	}
 
@@ -223,10 +232,22 @@ function attributesBlamedBy(log) {
 		const attrs = new Set();
 
 		// `"availability_zone": conflicts with ...`, `"ipv6_netmask_length": all
-		// of ... must be specified`. The quoted one is the attribute that is
-		// present and should not be; the other side of a conflict arrives as its
-		// own diagnostic, so taking only the quoted one keeps this from dropping
-		// a pair on the strength of a single message.
+		// of ... must be specified`, `"source": only one of `content,source` can
+		// be specified`. All four constraint families of the SDK quote the
+		// offending attribute first -- the format strings are `%q: ...` in
+		// helper/schema, so this is not provider-specific phrasing.
+		//
+		// Only the quoted one, never the other side: each side arrives as its own
+		// diagnostic, so a pair is never dropped on one message.
+		//
+		// LIMIT, on `ExactlyOneOf`. Both sides do then get dropped, one per
+		// diagnostic, and exactly one of them was required. The next round says
+		// `one of ...` must be specified, nothing is left to drop, and the series
+		// ends without a draft -- visibly, in the log, which is the failure this
+		// is willing to have. It does not arise from a generated draft: config
+		// generation fills one side with the account's value and the other with
+		// the type's zero, and pass 1 removes the zero before this ever runs. A
+		// draft with both sides really filled has not been seen.
 		for (const m of body.matchAll(/"([a-z0-9_]+)"\s*:/g)) attrs.add(m[1]);
 
 		// `Error: enable_lni_at_device_index must not be zero, got 0` -- a

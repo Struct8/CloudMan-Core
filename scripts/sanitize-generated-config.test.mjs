@@ -257,6 +257,39 @@ const diagnostic = (summary, address, detail, { colour = false, box = true } = {
 	check('exits 1 when the named resource is not in the file', r2.code === 1, r2.out);
 }
 
+{
+	// THE LOCATION LINE LOOKS LIKE A BLAMED ATTRIBUTE. `on main.tf line 14, in
+	// resource "google_storage_bucket_object" "content":` ends with the
+	// resource's own name in quotes and a colon -- the exact shape this reads as
+	// "the provider blamed this attribute". A resource called `content` lost its
+	// `content`.
+	//
+	// It survived every aws case because those logical names carry hyphens,
+	// which the attribute pattern excludes. Running the same parser against the
+	// google provider, whose names do not, is what surfaced it -- so the case is
+	// written with google's wording, which is the SDK's `ExactlyOneOf`.
+	const config = `resource "google_storage_bucket_object" "content" {
+  bucket  = "b"
+  content = "oi"
+  source  = "/tmp/a"
+}
+`;
+	const log = [
+		'Error: Invalid combination of arguments',
+		'',
+		'  with google_storage_bucket_object.content,',
+		'  on main.tf line 14, in resource "google_storage_bucket_object" "content":',
+		'  14:   source  = "/tmp/a"',
+		'',
+		'"source": only one of `content,source` can be specified, but',
+		'`content,source` were specified.',
+		''
+	].join('\n');
+	const r = run(config, log);
+	check('drops what the provider blamed, across providers', !/source\s+=/.test(r.config), r.config);
+	check('and not the resource name that has an attribute shape', /content = "oi"/.test(r.config), r.config);
+}
+
 fs.rmSync(TMP, { recursive: true, force: true });
 console.log(failures === 0 ? '\n✅ ALL CASES PASSED' : `\n❌ ${failures} CASE(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

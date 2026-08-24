@@ -717,7 +717,15 @@ run_terraform_process() {
             else
               echo -e "${color}🧹 ${label} Repairing the generated HCL...${NC}"
               node "$SANITIZER" generated_resources.tf || true
-              for attempt in 1 2 3 4; do
+              # QUEM PARA A SÉRIE É O SANEADOR, não este número: ele sai com 1
+              # assim que não tem mais o que tirar, e o `|| break` abaixo é o
+              # fim de verdade. O teto existe só como rede contra um laço que
+              # não converge, e por isso é alto: cada passe custa um `terraform
+              # plan` contra a conta, mas parar cedo custa o rascunho inteiro.
+              # Quatro bastaram para uma VPC de 12 recursos com 6 tipos; uma
+              # conta com 50 tipos traz mais classes de erro, e o corte seria
+              # invisível -- o rascunho voltaria parcial sem dizer por quê.
+              for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
                 # Sem `-generate-config-out` de propósito: ele recusa sobrescrever
                 # um arquivo que existe, e daqui em diante a configuração É o
                 # arquivo que acabou de ser saneado.

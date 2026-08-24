@@ -213,9 +213,17 @@ function attributesBlamedBy(log) {
 		// a pair on the strength of a single message.
 		for (const m of body.matchAll(/"([a-z0-9_]+)"\s*:/g)) attrs.add(m[1]);
 
-		// `Error: enable_lni_at_device_index must not be zero, got 0`
+		// `Error: enable_lni_at_device_index must not be zero, got 0` -- a
+		// validator on the attribute, which the SDK reports without quoting it.
 		const zero = /^Error:\s*([a-z0-9_]+)\s+must not be zero/.exec(body);
 		if (zero) attrs.add(zero[1]);
+
+		// `expected private_dns_hostname_type_on_launch to be one of [...]`, and
+		// the rest of the `validation.*` family, which name the attribute bare.
+		// The generator emits the zero value of an enum as often as of anything
+		// else, and an enum has no valid zero.
+		const validated = /\bexpected\s+([a-z0-9_]+)\s+to be\b/.exec(body);
+		if (validated) attrs.add(validated[1]);
 
 		// Last resort: the source line Terraform echoes under the diagnostic.
 		// Precise when present, and absent on the first run, where the file did

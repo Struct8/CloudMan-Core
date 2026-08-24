@@ -153,7 +153,13 @@ const igwFilter = vpcIds.length
 	: [];
 for (const igw of aws('ec2', 'describe-internet-gateways', igwFilter)?.InternetGateways ?? []) {
 	push(`arn:aws:ec2:${region}:${igw.OwnerId}:internet-gateway/${igw.InternetGatewayId}`, {
-		tags: tagsOf(igw.Tags)
+		tags: tagsOf(igw.Tags),
+		// The VPC it is attached to, which for this type lives in `Attachments`
+		// rather than in a `VpcId` field of its own. Without it Struct8 cannot tell
+		// that a gateway belongs to a VPC it is discarding -- and the default VPC's
+		// gateway came through beside the one a person created, with nothing to say
+		// which was which.
+		vpcId: (igw.Attachments ?? []).find((a) => a.VpcId)?.VpcId ?? null
 	});
 }
 

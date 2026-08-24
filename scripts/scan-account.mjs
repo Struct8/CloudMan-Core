@@ -182,7 +182,14 @@ for (const nat of aws('ec2', 'describe-nat-gateways', natFilter)?.NatGateways ??
 for (const table of aws('ec2', 'describe-route-tables', vpcFilter)?.RouteTables ?? []) {
 	push(`arn:aws:ec2:${region}:${table.OwnerId}:route-table/${table.RouteTableId}`, {
 		tags: tagsOf(table.Tags),
-		vpcId: table.VpcId
+		vpcId: table.VpcId,
+		// The main route table, which AWS creates with the VPC. There is no
+		// `IsDefault` on this type -- the only sign is that one of its
+		// associations is the main one. Without this it arrives untagged and
+		// unmarked, and gets adopted as if a person had made it. Seen on a real
+		// account: `rtb-0ab086790b184a34b`, named after its own id because there
+		// was no tag to name it from.
+		isDefault: (table.Associations ?? []).some((a) => a.Main === true)
 	});
 	for (const association of table.Associations ?? []) {
 		// The main association belongs to the VPC, not to a subnet, and Terraform
@@ -204,6 +211,13 @@ for (const acl of aws('ec2', 'describe-network-acls', vpcFilter)?.NetworkAcls ??
 		isDefault: acl.IsDefault === true,
 		vpcId: acl.VpcId
 	});
+	// The default ACL is dropped by Struct8 as something AWS created, so its
+	// rules have nothing to attach to. Not expanding them here is cheaper than
+	// sending them to be discarded, and Struct8 discards them anyway -- both
+	// sides check, because either one alone leaves the rules adoptable if the
+	// other changes.
+	if (acl.IsDefault === true) continue;
+
 	for (const entry of acl.Entries ?? []) {
 		// 32767 is the catch-all rule AWS puts in every ACL. It is not importable
 		// and Terraform does not manage it.

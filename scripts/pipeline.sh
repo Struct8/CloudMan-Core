@@ -948,6 +948,27 @@ debug_auth_status "BACKEND PROFILE CRIADO"
 # DEPENDÊNCIAS EXTERNAS
 # ---------------------------------------------------------
 EXTERNAL_REPOS=$(jq -c '.external_repositories // []' "$MANIFEST_PATH")
+
+# QUAL VERSAO DO CODIGO ESTE RUN CLONOU
+#
+# Uma linha por fonte: `provedor:dono/repo<TAB>identificador`. Vai para ARQUIVO e
+# nao para variavel porque o laco abaixo roda depois de um cano (`| while`), e
+# tudo que um subshell atribui morre com ele -- foi assim que a primeira versao
+# do relatorio de progresso perdeu o token, calada.
+#
+# Quem le e `notify_progress`, que manda o conteudo no primeiro relatorio. E daqui
+# que sai a promocao de versao: o canvas guarda estes valores no estagio, e o
+# estagio seguinte recebe os mesmos em vez de buscar o topo do branch de novo.
+SOURCES_FILE="${RUNNER_TEMP:-/tmp}/cloudman_sources.tsv"
+rm -f "$SOURCES_FILE"
+
+# Fontes em que a versao pedida NAO ficou na arvore. Tambem em arquivo, e pelo
+# mesmo motivo: `exit` dentro do laco mataria so o subshell, e o pipeline seguiria
+# rodando terraform contra a arvore errada -- calado, que e exatamente o que este
+# mecanismo existe para impedir. Conferido depois do laco, no shell de verdade.
+PIN_FAILED_FILE="${RUNNER_TEMP:-/tmp}/cloudman_pin_failed.txt"
+rm -f "$PIN_FAILED_FILE"
+
 if [ "$EXTERNAL_REPOS" != "[]" ] && [ "$EXTERNAL_REPOS" != "null" ]; then
     echo "📦 Resolving external dependencies..."
     echo "$EXTERNAL_REPOS" | jq -c '.[]' | while read -r repo; do
@@ -956,6 +977,10 @@ if [ "$EXTERNAL_REPOS" != "[]" ] && [ "$EXTERNAL_REPOS" != "null" ]; then
         BRANCH=$(echo "$repo" | jq -r '.branch')
         TARGET_DIR=$(echo "$repo" | jq -r '.target_dir')
         FOLDERS=$(echo "$repo" | jq -r '.folders | join(" ")')
+        # Versao fixada pelo canvas. Vazio = clona o topo do branch, que e o
+        # comportamento de sempre e o que o primeiro estagio da cadeia faz.
+        COMMIT=$(echo "$repo" | jq -r '.commit // empty')
+        PROVIDER=$(echo "$repo" | jq -r '.provider // "github"')
         FULL_TARGET_DIR="./$TARGET_DIR"
         REPO_URL="https://x-access-token:${GH_CLONE_TOKEN}@github.com/${ORG}/${REPO_NAME}.git"
 
@@ -965,13 +990,48 @@ if [ "$EXTERNAL_REPOS" != "[]" ] && [ "$EXTERNAL_REPOS" != "null" ]; then
             cd "$FULL_TARGET_DIR"
             git sparse-checkout init --cone
             git sparse-checkout set $FOLDERS
-            git checkout "$BRANCH"
+            if [ -n "$COMMIT" ]; then
+                # O clone raso trouxe so o topo do branch, e o commit fixado pode
+                # ser mais antigo. Buscar pelo identificador resolve isso sem
+                # baixar a historia inteira -- o GitHub serve commit avulso.
+                echo "📌 Pinned to $COMMIT"
+                git fetch --depth 1 --filter=blob:none origin "$COMMIT"
+                git checkout --detach "$COMMIT"
+            else
+                git checkout "$BRANCH"
+            fi
             cd - > /dev/null
         else
             echo "🔄 Updating folders in $REPO_NAME..."
-            (cd "$FULL_TARGET_DIR" && git sparse-checkout set $FOLDERS && git pull origin "$BRANCH")
+            if [ -n "$COMMIT" ]; then
+                echo "📌 Pinned to $COMMIT"
+                (cd "$FULL_TARGET_DIR"                     && git sparse-checkout set $FOLDERS                     && git fetch --depth 1 --filter=blob:none origin "$COMMIT"                     && git checkout --detach "$COMMIT")
+            else
+                (cd "$FULL_TARGET_DIR" && git sparse-checkout set $FOLDERS && git pull origin "$BRANCH")
+            fi
+        fi
+
+        # O que de fato ficou na arvore de trabalho, e nao o que foi pedido.
+        # Vale para os dois caminhos: com versao fixada isto confirma que ela
+        # chegou; sem, e a foto que o proximo estagio vai receber.
+        RESOLVED=$(cd "$FULL_TARGET_DIR" && git rev-parse HEAD 2>/dev/null) || RESOLVED=""
+        if [ -n "$RESOLVED" ]; then
+            printf '%s\t%s\n' "${PROVIDER}:${ORG}/${REPO_NAME}" "$RESOLVED" >> "$SOURCES_FILE"
+        fi
+
+        # Pediu uma versao e ficou outra: o clone caiu no topo do branch, e o
+        # estagio aplicaria codigo que nao e o aprovado. Registrado para o corte
+        # logo depois do laco.
+        if [ -n "$COMMIT" ] && [ "$RESOLVED" != "$COMMIT" ]; then
+            printf '%s: pediu %s, ficou %s\n'                 "${ORG}/${REPO_NAME}" "$COMMIT" "${RESOLVED:-nada}" >> "$PIN_FAILED_FILE"
         fi
     done
+fi
+
+if [ -s "$PIN_FAILED_FILE" ]; then
+    echo "::error::A versao fixada nao pode ser posicionada. Nada foi aplicado."
+    cat "$PIN_FAILED_FILE"
+    exit 1
 fi
 
 # ---------------------------------------------------------
@@ -1010,6 +1070,7 @@ report_state_progress() {
 
     local state_path="$1" status="$2" index="$3" total="$4"
     local token="" corpo=""
+    local sources_json="" body_with_sources="" code=""
 
     # Token OIDC deste run, com audiencia PROPRIA do relatorio de andamento --
     # diferente da `https://struct8.com/gitops` que o GateKeeper valida. Separar as
@@ -1031,6 +1092,16 @@ report_state_progress() {
         return 0
     fi
 
+    # The code version this run cloned, carried by the first report that gets
+    # through. The clone loop wrote one line per source, as
+    # `provider:owner/repo<TAB>identifier`; this folds them into the single
+    # object the Worker reads.
+    if [ -s "${SOURCES_FILE:-}" ]; then
+        sources_json=$(jq -Rn \
+            '[inputs | split("\t") | select(length == 2) | {(.[0]): .[1]}] | add' \
+            < "$SOURCES_FILE" 2>/dev/null) || sources_json=""
+    fi
+
     # Corpo enxuto de proposito: repositorio, sha e link do run saem do token, do
     # lado do Worker. Mandar de novo aqui nao adiantaria nada -- ele ignora o que
     # vier no corpo para esses tres.
@@ -1046,12 +1117,34 @@ report_state_progress() {
             total:  $total
         }' 2>/dev/null) || return 0
 
-    curl -sS -m 5 -o /dev/null \
+    # Folded into the body already built, rather than built again with the field
+    # added: two places building the same object drift apart over time. A failure
+    # here keeps the original body, so progress is still reported.
+    if [ -n "$sources_json" ] && [ "$sources_json" != "null" ]; then
+        body_with_sources=$(printf '%s' "$corpo" \
+            | jq -c --argjson sources "$sources_json" '. + { sources: $sources }' \
+            2>/dev/null) || body_with_sources=""
+        if [ -n "$body_with_sources" ]; then
+            corpo="$body_with_sources"
+        fi
+    fi
+
+    # The status code is read so the run can tell whether the version arrived.
+    # Progress itself stays best-effort: a failure here never brings the pipeline
+    # down.
+    code=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' \
         -X POST \
         -H "Authorization: Bearer ${token}" \
         -H 'Content-Type: application/json' \
         -d "$corpo" \
-        "$PROGRESS_URL" 2>/dev/null || true
+        "$PROGRESS_URL" 2>/dev/null) || code=""
+
+    # Dropped only after the Worker accepted it, so a report that never arrived
+    # is sent again on the next state. Without this the next stage has no version
+    # to promote.
+    if [ -n "$sources_json" ] && [ "$code" = "200" ]; then
+        rm -f "$SOURCES_FILE"
+    fi
 
     return 0
 }

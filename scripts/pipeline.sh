@@ -949,23 +949,25 @@ debug_auth_status "BACKEND PROFILE CRIADO"
 # ---------------------------------------------------------
 EXTERNAL_REPOS=$(jq -c '.external_repositories // []' "$MANIFEST_PATH")
 
-# QUAL VERSAO DO CODIGO ESTE RUN CLONOU
+# WHICH CODE VERSION THIS RUN CLONED
 #
-# Uma linha por fonte: `provedor:dono/repo<TAB>identificador`. Vai para ARQUIVO e
-# nao para variavel porque o laco abaixo roda depois de um cano (`| while`), e
-# tudo que um subshell atribui morre com ele -- foi assim que a primeira versao
-# do relatorio de progresso perdeu o token, calada.
+# One line per source: `provider:owner/repo<TAB>identifier`. Written to a FILE
+# and not to a variable because the loop below runs behind a pipe (`| while`),
+# and anything a subshell assigns dies with it -- that is how the first version
+# of the progress report lost its token, silently.
 #
-# Quem le e `notify_progress`, que manda o conteudo no primeiro relatorio. E daqui
-# que sai a promocao de versao: o canvas guarda estes valores no estagio, e o
-# estagio seguinte recebe os mesmos em vez de buscar o topo do branch de novo.
+# `report_state_progress` reads it and sends the contents in the first report.
+# This is where version promotion starts: the canvas stores these values on the
+# stage, and the next stage receives the same ones instead of looking up the tip
+# of the branch again.
 SOURCES_FILE="${RUNNER_TEMP:-/tmp}/cloudman_sources.tsv"
 rm -f "$SOURCES_FILE"
 
-# Fontes em que a versao pedida NAO ficou na arvore. Tambem em arquivo, e pelo
-# mesmo motivo: `exit` dentro do laco mataria so o subshell, e o pipeline seguiria
-# rodando terraform contra a arvore errada -- calado, que e exatamente o que este
-# mecanismo existe para impedir. Conferido depois do laco, no shell de verdade.
+# Sources whose requested version did NOT end up in the tree. Also a file, for
+# the same reason: `exit` inside the loop would kill only the subshell, and the
+# pipeline would carry on running terraform against the wrong tree -- silently,
+# which is exactly what this exists to prevent. Checked after the loop, in the
+# real shell.
 PIN_FAILED_FILE="${RUNNER_TEMP:-/tmp}/cloudman_pin_failed.txt"
 rm -f "$PIN_FAILED_FILE"
 
@@ -977,8 +979,9 @@ if [ "$EXTERNAL_REPOS" != "[]" ] && [ "$EXTERNAL_REPOS" != "null" ]; then
         BRANCH=$(echo "$repo" | jq -r '.branch')
         TARGET_DIR=$(echo "$repo" | jq -r '.target_dir')
         FOLDERS=$(echo "$repo" | jq -r '.folders | join(" ")')
-        # Versao fixada pelo canvas. Vazio = clona o topo do branch, que e o
-        # comportamento de sempre e o que o primeiro estagio da cadeia faz.
+        # Version pinned by the canvas. Empty = clone the tip of the branch,
+        # which is the long-standing behaviour and what the first stage in the
+        # chain does.
         COMMIT=$(echo "$repo" | jq -r '.commit // empty')
         PROVIDER=$(echo "$repo" | jq -r '.provider // "github"')
         FULL_TARGET_DIR="./$TARGET_DIR"
@@ -991,9 +994,10 @@ if [ "$EXTERNAL_REPOS" != "[]" ] && [ "$EXTERNAL_REPOS" != "null" ]; then
             git sparse-checkout init --cone
             git sparse-checkout set $FOLDERS
             if [ -n "$COMMIT" ]; then
-                # O clone raso trouxe so o topo do branch, e o commit fixado pode
-                # ser mais antigo. Buscar pelo identificador resolve isso sem
-                # baixar a historia inteira -- o GitHub serve commit avulso.
+                # The shallow clone brought only the tip of the branch, and the
+                # pinned commit can be older. Fetching it by identifier solves
+                # that without downloading the whole history -- GitHub serves a
+                # single commit.
                 echo "📌 Pinned to $COMMIT"
                 git fetch --depth 1 --filter=blob:none origin "$COMMIT"
                 git checkout --detach "$COMMIT"
@@ -1005,32 +1009,38 @@ if [ "$EXTERNAL_REPOS" != "[]" ] && [ "$EXTERNAL_REPOS" != "null" ]; then
             echo "🔄 Updating folders in $REPO_NAME..."
             if [ -n "$COMMIT" ]; then
                 echo "📌 Pinned to $COMMIT"
-                (cd "$FULL_TARGET_DIR"                     && git sparse-checkout set $FOLDERS                     && git fetch --depth 1 --filter=blob:none origin "$COMMIT"                     && git checkout --detach "$COMMIT")
+                (cd "$FULL_TARGET_DIR" \
+                    && git sparse-checkout set $FOLDERS \
+                    && git fetch --depth 1 --filter=blob:none origin "$COMMIT" \
+                    && git checkout --detach "$COMMIT")
             else
                 (cd "$FULL_TARGET_DIR" && git sparse-checkout set $FOLDERS && git pull origin "$BRANCH")
             fi
         fi
 
-        # O que de fato ficou na arvore de trabalho, e nao o que foi pedido.
-        # Vale para os dois caminhos: com versao fixada isto confirma que ela
-        # chegou; sem, e a foto que o proximo estagio vai receber.
+        # What actually ended up in the working tree, not what was asked for.
+        # True for both paths: with a pinned version this confirms it arrived;
+        # without one, this is the snapshot the next stage will receive.
         RESOLVED=$(cd "$FULL_TARGET_DIR" && git rev-parse HEAD 2>/dev/null) || RESOLVED=""
         if [ -n "$RESOLVED" ]; then
             printf '%s\t%s\n' "${PROVIDER}:${ORG}/${REPO_NAME}" "$RESOLVED" >> "$SOURCES_FILE"
         fi
 
-        # Pediu uma versao e ficou outra: o clone caiu no topo do branch, e o
-        # estagio aplicaria codigo que nao e o aprovado. Registrado para o corte
-        # logo depois do laco.
+        # Asked for one version and got another: the clone fell back to the tip
+        # of the branch, and the stage would apply code that was never approved.
+        # Recorded for the check right after the loop.
         if [ -n "$COMMIT" ] && [ "$RESOLVED" != "$COMMIT" ]; then
-            printf '%s: pediu %s, ficou %s\n'                 "${ORG}/${REPO_NAME}" "$COMMIT" "${RESOLVED:-nada}" >> "$PIN_FAILED_FILE"
+            printf '%s: requested %s, got %s\n' \
+                "${ORG}/${REPO_NAME}" "$COMMIT" "${RESOLVED:-none}" \
+                >> "$PIN_FAILED_FILE"
         fi
     done
 fi
 
 if [ -s "$PIN_FAILED_FILE" ]; then
-    echo "::error::A versao fixada nao pode ser posicionada. Nada foi aplicado."
+    echo "::error::The pinned version could not be checked out. Nothing was applied."
     cat "$PIN_FAILED_FILE"
+    echo "Check that the commit still exists in that repository."
     exit 1
 fi
 

@@ -97,9 +97,20 @@ const tagsOf = (list) =>
 //
 // One call for the whole region, across every service. It is an INDEX, not the
 // services themselves -- it keeps entries for resources that were destroyed, so
-// a name that was created and deleted repeatedly accumulates dead ARNs. The read
-// pass is what settles it: an id that no longer resolves fails its import block
-// and is reported, which is the only test that separates the live one.
+// a name that was created and deleted repeatedly accumulates dead ARNs.
+//
+// SEPARATING THE DEAD ONES IS NOT THIS SCRIPT'S JOB, and the attempt to make it
+// one is worth recording. This file briefly asked EC2 which instances were in an
+// importable state and dropped the rest. It worked, and it was the wrong place:
+// a week later the same thing happened to a SUBNET, and the fix would have been
+// a second hand-written check, then a third. What answers this question for 135
+// of the 254 AWS types -- and is maintained because another screen depends on it
+// -- is the AgentV2 status read. Struct8 now runs it over this inventory before
+// showing the selection list; see `scanLiveness.ts` in the frontend.
+//
+// So what this script writes is deliberately generous: everything the region
+// index reports, dead entries included. Erring wide costs a click; erring narrow
+// hides a resource that exists, and nobody can see what was never offered.
 {
 	const extra = ['--resources-per-page', '100'];
 	for (const filter of tagFilters) {
@@ -120,56 +131,6 @@ const tagsOf = (list) =>
 		}
 		token = page.PaginationToken || null;
 	} while (token);
-}
-
-// ------------------------------- layer 1a bis: instances that no longer exist
-//
-// A terminated instance keeps its tags, and the tagging index keeps answering
-// for it -- for about an hour after it dies. The comment above says the read
-// pass settles this: an id that no longer resolves fails its import block and
-// is reported.
-//
-// THAT IS NOT ENOUGH, and the reason is a rule on the other side. Struct8 stops
-// the import when fewer resources come back than were selected, because a
-// diagram holding part of a network looks no different from one holding all of
-// it. So dead instances in the index do not arrive as warnings next to a
-// working import -- they STOP it. Measured on 2026-08-24 in mx-central-1: two
-// live instances, four dead ones, "the reading returned 12 of the 16 resources
-// selected", and no diagram. Clicking Read again selected the same four.
-//
-// `terminated` and `shutting-down` are the two states with nothing to import.
-// A `stopped` instance is an ordinary instance that happens to be off, and
-// imports like any other -- asking for the live states by name, rather than
-// excluding the dead ones, would have dropped it.
-//
-// A failure here keeps every instance instead of dropping every instance. This
-// scan is allowed to offer too much; it is not allowed to hide what exists.
-{
-	const hasInstances = items.some((i) => /:instance\/i-/.test(i.arn));
-	if (hasInstances) {
-		const live = aws('ec2', 'describe-instances', [
-			'--filters',
-			'Name=instance-state-name,Values=pending,running,stopping,stopped'
-		]);
-		if (live) {
-			const alive = new Set(
-				(live.Reservations ?? []).flatMap((r) => (r.Instances ?? []).map((i) => i.InstanceId))
-			);
-			const dead = [];
-			for (let i = items.length - 1; i >= 0; i--) {
-				const id = items[i].arn.match(/:instance\/(i-[0-9a-f]+)/)?.[1];
-				if (id && !alive.has(id)) dead.push(...items.splice(i, 1));
-			}
-			if (dead.length) {
-				// Named, not just counted: a scan that silently returns less than the
-				// account holds is the failure this whole script exists to avoid.
-				console.error(
-					`scan-account: ${dead.length} instance(s) gone, left out: ` +
-						dead.map((d) => d.tags?.Name ?? d.arn.split('/').pop()).join(', ')
-				);
-			}
-		}
-	}
 }
 
 // ------------------------------------- layer 1b: the network family, by vpc-id

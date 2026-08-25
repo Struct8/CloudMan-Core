@@ -129,11 +129,6 @@ const ANSWERS = {
 			]
 		}
 	],
-	// Only the live one comes back: the scan asks for the importable states by
-	// name, so a terminated instance is simply absent from the answer.
-	'ec2 describe-instances': [
-		{ Reservations: [{ Instances: [{ InstanceId: 'i-0aaaaaaaaaaaaaaaa' }] }] }
-	],
 	// The one the credentials cannot read.
 	'ec2 describe-security-groups': 'THROWS',
 	'sts get-caller-identity': [{ Account: A }]
@@ -192,17 +187,23 @@ try {
 	);
 	check('a bucket with no tags still came', arns.includes('arn:aws:s3:::s3-loki-billing-pay'));
 
-	// The rule that stops the import is on the other side: Struct8 refuses a read
-	// that returns fewer resources than were selected. So an instance offered here
-	// and unimportable there does not degrade the result -- it blocks it.
+	// BOTH COME, and that is the contract. This file briefly dropped the dead one
+	// itself, by asking EC2 which instances were in an importable state. It worked
+	// for instances and only for instances -- the next dead thing to stop an
+	// import was a subnet. What answers this for 135 of the 254 AWS types is the
+	// AgentV2 status read, and Struct8 now runs it over this inventory before
+	// showing the selection list (`scanLiveness.ts`, in the frontend).
+	//
+	// So the assertion here is deliberately the wide one: this script reports what
+	// the region index says, and someone else decides what is still alive.
 	check(
 		'the live instance came',
 		arns.includes(`arn:aws:ec2:${R}:${A}:instance/i-0aaaaaaaaaaaaaaaa`),
 		JSON.stringify(arns)
 	);
 	check(
-		'the terminated one was left out, even sharing a Name tag with the live one',
-		!arns.includes(`arn:aws:ec2:${R}:${A}:instance/i-0dddddddddddddddd`),
+		'and so does the terminated one -- telling them apart is not this script\'s job',
+		arns.includes(`arn:aws:ec2:${R}:${A}:instance/i-0dddddddddddddddd`),
 		JSON.stringify(arns)
 	);
 

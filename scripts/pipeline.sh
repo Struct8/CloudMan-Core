@@ -308,6 +308,29 @@ run_terraform_process() {
         # ---------------------------------------------------------
         echo -e "${color}▶️ ${label} Initializing backend (state)...${NC}"
 
+        # O ARQUIVO QUE UMA FUNCAO IMPORTADA APONTA.
+        #
+        # `aws_lambda_function` exige em configuracao um de `filename`,
+        # `image_uri` ou `s3_bucket`, e uma funcao importada nao responde por
+        # nenhum: a AWS devolve uma URL assinada para baixar o pacote atual,
+        # nunca de onde ele veio. O diagrama entao declara um arquivo
+        # provisorio e ignora ele e o hash que sai dele -- o codigo continua
+        # sendo o que ja esta rodando, e o Terraform cuida so das
+        # configuracoes da funcao.
+        #
+        # O provider abre esse arquivo para calcular o hash, mesmo com
+        # `ignore_changes`. Ele nao vai para o repositorio de proposito: e um
+        # ZIP vazio de 22 bytes, sem conteudo nenhum, e commita-lo seria
+        # guardar um artefato que ninguem le. Escrito aqui, uma vez por
+        # execucao, so quando a configuracao o menciona.
+        if grep -rqs "imported_lambda_placeholder.zip" --include="*.tf" . 2>/dev/null; then
+            if [ ! -f "imported_lambda_placeholder.zip" ]; then
+                printf 'PK\005\006\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000' \
+                    > imported_lambda_placeholder.zip
+                echo -e "${color}   wrote the placeholder archive an imported function points at${NC}"
+            fi
+        fi
+
         # Limpa ambiente para garantir que o Init use apenas o profile
         unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_REGION
 

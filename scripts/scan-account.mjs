@@ -370,6 +370,18 @@ if (tagFilters.length) {
  */
 let detailUnread = null;
 
+/**
+ * How many unread candidates are named one by one.
+ *
+ * A COUNT WITH NO NAMES CANNOT BE CHECKED. `no longer there: 1` came back
+ * identical from two scans half an hour apart, which is not what a resource
+ * disappearing mid-scan looks like -- something answers LIST and then refuses to
+ * be read, every time, and there was no way to find out what. The names are
+ * capped because an account with a permissions problem can produce hundreds of
+ * these, and this file is read by a browser.
+ */
+const UNREAD_NAMED = 20;
+
 /** Why a read failed, in the words of whoever has to act on it. */
 const reasonFor = (message) => {
 	if (isThrottle(message)) return 'rate limited';
@@ -381,6 +393,7 @@ const reasonFor = (message) => {
 if (cfnDetailTypes.length) {
 	const wanted = new Set(cfnDetailTypes);
 	const unreadBy = new Map();
+	const unreadWho = [];
 	const candidates = items.filter((i) => i.cfnType && wanted.has(i.cfnType));
 
 	/** Every ARN a candidate's own configuration names, and who named it. */
@@ -415,7 +428,11 @@ if (cfnDetailTypes.length) {
 				// A resource that cannot be read individually costs its references and
 				// nothing else -- the row itself already came from the listing and stays.
 				unread++;
-				unreadBy.set(reasonFor(message), (unreadBy.get(reasonFor(message)) ?? 0) + 1);
+				const reason = reasonFor(message);
+				unreadBy.set(reason, (unreadBy.get(reason) ?? 0) + 1);
+				if (unreadWho.length < UNREAD_NAMED) {
+					unreadWho.push({ cfnType: row.cfnType, importId: String(row.importId), reason });
+				}
 				return true;
 			}
 		);
@@ -463,7 +480,13 @@ if (cfnDetailTypes.length) {
 	}
 
 	detailUnread = unread
-		? { count: unread, of: candidates.length, by: Object.fromEntries(unreadBy) }
+		? {
+				count: unread,
+				of: candidates.length,
+				by: Object.fromEntries(unreadBy),
+				who: unreadWho,
+				named: Math.min(unread, UNREAD_NAMED)
+			}
 		: null;
 
 	// Cloud Control identifies a role by its NAME and a distribution by its id,

@@ -404,6 +404,28 @@ try {
 		out.detailUnread?.by?.['not allowed'] === 1,
 		JSON.stringify(out.detailUnread)
 	);
+	// A COUNT WITH NO NAMES CANNOT BE CHECKED. `no longer there: 1` came back
+	// identical from two scans half an hour apart -- which is not a resource
+	// disappearing mid-scan, but something that answers LIST and refuses to be
+	// read, every time. There was no way to find out what.
+	check(
+		'and it names the candidate, so someone can go look',
+		out.detailUnread?.who?.[0]?.importId === 'import-lab-items',
+		JSON.stringify(out.detailUnread?.who)
+	);
+	check(
+		'with its type and the same reason the tally counted',
+		out.detailUnread?.who?.[0]?.cfnType === 'AWS::DynamoDB::Table' &&
+			out.detailUnread?.who?.[0]?.reason === 'not allowed',
+		JSON.stringify(out.detailUnread?.who)
+	);
+	// THE CONTROL: only the unread one is named. Listing every candidate would
+	// satisfy the two checks above just as well.
+	check(
+		'and nothing that WAS read is named',
+		out.detailUnread?.who?.length === 1,
+		JSON.stringify(out.detailUnread?.who)
+	);
 	// THE CONTROL: a retry that never fired would leave the throttled read here too.
 	check(
 		'and the read that was merely rate limited is NOT among them',

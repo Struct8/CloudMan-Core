@@ -126,6 +126,15 @@ function aws(service, operation, extra = [], expected = null) {
  * Only the type sweep uses it. Everything else here is a handful of calls where
  * the synchronous version reads better and costs nothing.
  */
+/**
+ * Rate limiting, from the message the CLI printed.
+ *
+ * Module scope because BOTH wide passes need it: the type sweep and the detail
+ * read. It lived inside the sweep until 2026-08-26, which is part of why the
+ * detail read had no retry -- the ladder was not reachable from there.
+ */
+const isThrottle = (message) => /Throttl|Rate exceeded|TooManyRequests/i.test(message);
+
 function awsAsync(service, operation, extra = [], expected = null) {
 	return new Promise((resolve) => {
 		execFile(
@@ -234,7 +243,6 @@ const tagsOf = (list) =>
 	// silently returning fewer resources than the account holds is the one outcome
 	// worth failing over, because half a diagram looks exactly like a whole one.
 	const throttled = [];
-	const isThrottle = (message) => /Throttl|Rate exceeded|TooManyRequests/i.test(message);
 
 	async function sweep(type, onThrottle) {
 		let token = null;
@@ -276,108 +284,6 @@ const tagsOf = (list) =>
 	if (skipped) {
 		console.error(`scan-account: ${skipped} type(s) have no usable LIST -- expected, not an error.`);
 	}
-}
-
-// ------------------------------ layer 1a-ter: which global resources belong here
-//
-// IAM, CloudFront and Route 53 have no region. A sweep of one region answers for
-// the WHOLE ACCOUNT on those, and on a real account that is nearly the entire
-// answer: measured in mx-central-1 on 2026-08-26, of 409 rows that could become
-// nodes, 391 were global and 18 were actually in the region. The 18 included
-// everything the person was looking for, and they were unfindable in the list.
-//
-// DROPPING THE GLOBALS IS WRONG. The role a function runs as has no region, and
-// importing the function without it leaves the role unmanaged. So instead of
-// guessing, each candidate is asked WHAT IT USES, and the globals it names are
-// marked. A function answers `Role`; that role answers `Policies` and
-// `ManagedPolicyArns`. The chain is the account's own answer, not a match on
-// names -- which would be the same mistake the type mapping already refused.
-//
-// ONLY THE TYPES STRUCT8 ASKS FOR. One call per swept row would be thousands.
-// `cfnDetailTypes` is the subset that can become a node at all, and only the
-// catalog knows which those are, so it travels with the request like the sweep
-// list does.
-if (cfnDetailTypes.length) {
-	const wanted = new Set(cfnDetailTypes);
-	const candidates = items.filter((i) => i.cfnType && wanted.has(i.cfnType));
-
-	/** Every ARN a candidate's own configuration names, and who named it. */
-	const namedBy = new Map();
-	let unread = 0;
-
-	await inParallel(candidates, 8, async (row) => {
-		const answer = await awsAsync(
-			'cloudcontrol',
-			'get-resource',
-			['--type-name', row.cfnType, '--identifier', String(row.importId)],
-			() => {
-				// A resource that cannot be read individually costs its references and
-				// nothing else -- the row itself already came from the listing and stays.
-				unread++;
-				return true;
-			}
-		);
-		// Properties arrive as a JSON STRING inside the answer, not as an object.
-		const properties = answer?.ResourceDescription?.Properties;
-		if (typeof properties !== 'string') return;
-		const names = new Set(properties.match(/arn:aws[a-z-]*:[^"\\\s,\]]+/g) ?? []);
-
-		// Not every reference is an ARN. A KMS alias names its key by a bare id
-		// (`TargetKeyId`), and the same holds wherever AWS uses a plain identifier.
-		// So every string VALUE in the answer is offered too, matched whole against
-		// what the sweep found -- values, not a search through the text, because a
-		// substring hit would tie together resources that merely share a prefix.
-		try {
-			const walk = (value) => {
-				if (typeof value === "string") {
-					if (value.length >= 8) names.add(value);
-				} else if (Array.isArray(value)) {
-					value.forEach(walk);
-				} else if (value && typeof value === "object") {
-					Object.values(value).forEach(walk);
-				}
-			};
-			walk(JSON.parse(properties));
-		} catch {
-			// Properties that will not parse still gave up their ARNs above.
-		}
-
-		for (const name of names) {
-			if (!namedBy.has(name)) namedBy.set(name, new Set());
-			namedBy.get(name).add(String(row.importId));
-		}
-	});
-
-	// Cloud Control identifies a role by its NAME and a distribution by its id,
-	// while the reference that points at them is a full ARN. So a row is matched
-	// on its identifier, on that identifier being the ARN's tail, or on the two
-	// being equal outright -- whichever the type happens to use.
-	const tail = (value) => String(value).split(/[/:]/).pop();
-	const byIdentifier = new Map();
-	for (const row of items) {
-		if (!row.importId) continue;
-		const id = String(row.importId);
-		if (!byIdentifier.has(id)) byIdentifier.set(id, []);
-		byIdentifier.get(id).push(row);
-	}
-
-	let marked = 0;
-	for (const [arn, users] of namedBy) {
-		const hits = byIdentifier.get(arn) ?? byIdentifier.get(tail(arn)) ?? [];
-		for (const row of hits) {
-			// Itself does not count: a resource whose own ARN appears in its own
-			// configuration would otherwise look like something else needs it.
-			const others = [...users].filter((u) => u !== String(row.importId));
-			if (!others.length) continue;
-			row.referencedBy = [...new Set([...(row.referencedBy ?? []), ...others])].sort();
-			marked++;
-		}
-	}
-
-	console.error(
-		`scan-account: read ${candidates.length - unread} of ${candidates.length} candidate(s) in detail; ` +
-			`${marked} resource(s) are used by one of them.`
-	);
 }
 
 // --------------------------------------- layer 1a-bis: the tagging API, on ask
@@ -434,6 +340,162 @@ if (tagFilters.length) {
 	for (let i = items.length - 1; i >= 0; i--) {
 		if (items[i].dropForRegion) items.splice(i, 1);
 	}
+}
+
+// ------------------------- layer 1a-quater: which global resources belong here
+//
+// IAM, CloudFront and Route 53 have no region. A sweep of one region answers for
+// the WHOLE ACCOUNT on those, and on a real account that is nearly the entire
+// answer: measured in mx-central-1 on 2026-08-26, of 409 rows that could become
+// nodes, 391 were global and 18 were actually in the region. The 18 included
+// everything the person was looking for, and they were unfindable in the list.
+//
+// DROPPING THE GLOBALS IS WRONG. The role a function runs as has no region, and
+// importing the function without it leaves the role unmanaged. So instead of
+// guessing, each candidate is asked WHAT IT USES, and the globals it names are
+// marked. A function answers `Role`; that role answers `Policies` and
+// `ManagedPolicyArns`. The chain is the account's own answer, not a match on
+// names -- which would be the same mistake the type mapping already refused.
+//
+// ONLY THE TYPES STRUCT8 ASKS FOR. One call per swept row would be thousands.
+// `cfnDetailTypes` is the subset that can become a node at all, and only the
+// catalog knows which those are, so it travels with the request like the sweep
+// list does.
+/**
+ * How many candidates could not be read in detail, and why.
+ *
+ * Travels to the panel because the person choosing resources is the one who pays
+ * for it: an unread candidate is a resource whose references were never followed,
+ * so whatever it uses is offered as an anonymous row among hundreds.
+ */
+let detailUnread = null;
+
+/** Why a read failed, in the words of whoever has to act on it. */
+const reasonFor = (message) => {
+	if (isThrottle(message)) return 'rate limited';
+	if (/AccessDenied|not authorized|UnauthorizedOperation/i.test(message)) return 'not allowed';
+	if (/NotFound|does not exist/i.test(message)) return 'no longer there';
+	return 'refused';
+};
+
+if (cfnDetailTypes.length) {
+	const wanted = new Set(cfnDetailTypes);
+	const unreadBy = new Map();
+	const candidates = items.filter((i) => i.cfnType && wanted.has(i.cfnType));
+
+	/** Every ARN a candidate's own configuration names, and who named it. */
+	const namedBy = new Map();
+	let unread = 0;
+
+	/**
+	 * Reads one candidate and records what its configuration names.
+	 *
+	 * RATE LIMITING IS THE COMMON FAILURE HERE, not a resource that cannot be read.
+	 * Measured on 2026-08-26: 55 of 78 reads came back empty on a real account, and
+	 * because every failure counted as expected, the run reported one error and
+	 * looked healthy. What was lost was this pass's whole purpose -- the function in
+	 * the test account never named its role, so the role stayed indistinguishable
+	 * from the account's other 248 and nobody selected it.
+	 *
+	 * So a throttled read comes back for a narrower pass, the same ladder the sweep
+	 * uses, and whatever is still unread afterwards is counted BY REASON and
+	 * reported. Silence was the actual defect; a number nobody can see is the same
+	 * defect with extra steps.
+	 */
+	const readOne = async (row, onThrottle) => {
+		const answer = await awsAsync(
+			'cloudcontrol',
+			'get-resource',
+			['--type-name', row.cfnType, '--identifier', String(row.importId)],
+			(message) => {
+				if (onThrottle && isThrottle(message)) {
+					onThrottle(row);
+					return true;
+				}
+				// A resource that cannot be read individually costs its references and
+				// nothing else -- the row itself already came from the listing and stays.
+				unread++;
+				unreadBy.set(reasonFor(message), (unreadBy.get(reasonFor(message)) ?? 0) + 1);
+				return true;
+			}
+		);
+		// Properties arrive as a JSON STRING inside the answer, not as an object.
+		const properties = answer?.ResourceDescription?.Properties;
+		if (typeof properties !== 'string') return;
+		const names = new Set(properties.match(/arn:aws[a-z-]*:[^"\\\s,\]]+/g) ?? []);
+
+		// Not every reference is an ARN. A KMS alias names its key by a bare id
+		// (`TargetKeyId`), and the same holds wherever AWS uses a plain identifier.
+		// So every string VALUE in the answer is offered too, matched whole against
+		// what the sweep found -- values, not a search through the text, because a
+		// substring hit would tie together resources that merely share a prefix.
+		try {
+			const walk = (value) => {
+				if (typeof value === "string") {
+					if (value.length >= 8) names.add(value);
+				} else if (Array.isArray(value)) {
+					value.forEach(walk);
+				} else if (value && typeof value === "object") {
+					Object.values(value).forEach(walk);
+				}
+			};
+			walk(JSON.parse(properties));
+		} catch {
+			// Properties that will not parse still gave up their ARNs above.
+		}
+
+		for (const name of names) {
+			if (!namedBy.has(name)) namedBy.set(name, new Set());
+			namedBy.get(name).add(String(row.importId));
+		}
+	};
+
+	const throttledRows = [];
+	await inParallel(candidates, 8, (row) => readOne(row, (r) => throttledRows.push(r)));
+	for (let width = 4; width >= 1 && throttledRows.length; width = Math.floor(width / 2)) {
+		const again = throttledRows.splice(0, throttledRows.length);
+		console.error(
+			`scan-account: ${again.length} read(s) rate limited -- asking again, ${width} at a time.`
+		);
+		await inParallel(again, width, (r) =>
+			readOne(r, width > 1 ? (x) => throttledRows.push(x) : null)
+		);
+	}
+
+	detailUnread = unread
+		? { count: unread, of: candidates.length, by: Object.fromEntries(unreadBy) }
+		: null;
+
+	// Cloud Control identifies a role by its NAME and a distribution by its id,
+	// while the reference that points at them is a full ARN. So a row is matched
+	// on its identifier, on that identifier being the ARN's tail, or on the two
+	// being equal outright -- whichever the type happens to use.
+	const tail = (value) => String(value).split(/[/:]/).pop();
+	const byIdentifier = new Map();
+	for (const row of items) {
+		if (!row.importId) continue;
+		const id = String(row.importId);
+		if (!byIdentifier.has(id)) byIdentifier.set(id, []);
+		byIdentifier.get(id).push(row);
+	}
+
+	let marked = 0;
+	for (const [arn, users] of namedBy) {
+		const hits = byIdentifier.get(arn) ?? byIdentifier.get(tail(arn)) ?? [];
+		for (const row of hits) {
+			// Itself does not count: a resource whose own ARN appears in its own
+			// configuration would otherwise look like something else needs it.
+			const others = [...users].filter((u) => u !== String(row.importId));
+			if (!others.length) continue;
+			row.referencedBy = [...new Set([...(row.referencedBy ?? []), ...others])].sort();
+			marked++;
+		}
+	}
+
+	console.error(
+		`scan-account: read ${candidates.length - unread} of ${candidates.length} candidate(s) in detail; ` +
+			`${marked} resource(s) are used by one of them.`
+	);
 }
 
 // ------------------------------------- layer 1b: the network family, by vpc-id
@@ -580,6 +642,7 @@ fs.writeFileSync(
 			// reading this file whether the sweep was as wide as they meant.
 			scope: { vpcIds, tagFilters, cfnTypeCount: cfnTypes.length, cfnDetailTypeCount: cfnDetailTypes.length },
 			items,
+			detailUnread,
 			errors
 		},
 		null,

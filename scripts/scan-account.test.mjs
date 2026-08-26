@@ -74,7 +74,13 @@ const ANSWERS = {
 		}
 	],
 	// One candidate read in detail: this is where the function names the role it uses.
+	//
+	// RATE LIMITED THE FIRST TIME, on purpose. This read is the one that carries the
+	// reference, so without a retry the role below goes unmarked -- which is exactly
+	// what happened on a real account on 2026-08-26. The assertion that the role is
+	// marked is therefore also the assertion that the retry happened.
 	'cloudcontrol get-resource AWS::Lambda::Function cost-report': [
+		{ THROWS: 'ThrottlingException: Rate exceeded' },
 		{
 			ResourceDescription: {
 				Identifier: 'cost-report',
@@ -90,9 +96,10 @@ const ANSWERS = {
 			}
 		}
 	],
-	'cloudcontrol get-resource AWS::DynamoDB::Table import-lab-items': [
-		{ ResourceDescription: { Identifier: 'import-lab-items', Properties: '{"TableName":"import-lab-items"}' } }
-	],
+	// Refused outright, every time: what the count has to report. The row itself
+	// still came from the listing and stays -- an unread candidate costs its
+	// references, not its own existence.
+	'cloudcontrol get-resource AWS::DynamoDB::Table import-lab-items': 'THROWS',
 	'cloudcontrol list-resources AWS::DynamoDB::Table': [
 		{ ResourceDescriptions: [{ Identifier: 'import-lab-items', Properties: '{}' }] }
 	],
@@ -109,6 +116,14 @@ const ANSWERS = {
 	],
 	// null LocationConstraint means us-east-1. Reading it as "no region" is what
 	// would silently drop every bucket in the busiest region AWS has.
+	'cloudcontrol get-resource AWS::S3::Bucket bucket-aqui': [
+		{ ResourceDescription: { Identifier: 'bucket-aqui', Properties: '{"BucketName":"bucket-aqui"}' } }
+	],
+	// Answered so a regression does not crash the stub -- the assertion is that this
+	// is never asked for, not that asking it fails.
+	'cloudcontrol get-resource AWS::S3::Bucket bucket-noutra-regiao': [
+		{ ResourceDescription: { Identifier: 'bucket-noutra-regiao', Properties: '{}' } }
+	],
 	's3api get-bucket-location bucket-aqui': [{ LocationConstraint: null }],
 	's3api get-bucket-location bucket-noutra-regiao': [{ LocationConstraint: 'sa-east-1' }],
 	// A type with no LIST handler at all. Normal across a sweep this wide, and a
@@ -226,7 +241,11 @@ function execFileSync(_bin, argv) {
 	if (answer && answer.THROWS) { const e = new Error(answer.THROWS); e.stderr = answer.THROWS; throw e; }
 	const i = __PAGE[key] ?? 0;
 	__PAGE[key] = i + 1;
-	return JSON.stringify(answer[Math.min(i, answer.length - 1)]);
+	const page = answer[Math.min(i, answer.length - 1)];
+	// Per-page, so an answer can refuse the first time and work the second -- which
+	// is the only way to tell a retry that happened from one that did not.
+	if (page && page.THROWS) { const e = new Error(page.THROWS); e.stderr = page.THROWS; throw e; }
+	return JSON.stringify(page);
 }
 // The sweep runs many calls at once and so takes the callback form. Same table,
 // same keys -- only the shape of the answer differs, which keeps the concurrent
@@ -261,7 +280,7 @@ try {
 			],
 			// IAM is deliberately NOT here: it is the global type whose members we want
 			// to discover BY REFERENCE, not a candidate to ask what it uses.
-			cfnDetailTypes: ['AWS::Lambda::Function', 'AWS::DynamoDB::Table'],
+			cfnDetailTypes: ['AWS::Lambda::Function', 'AWS::DynamoDB::Table', 'AWS::S3::Bucket'],
 			requestId: 'pedido-42'
 		})
 	);
@@ -368,6 +387,30 @@ try {
 		!roleIdle?.referencedBy,
 		JSON.stringify(roleIdle)
 	);
+	// ------------------------------------------- what could NOT be read, and why
+	//
+	// This used to be invisible. On a real account 55 of 78 reads came back empty and
+	// the run reported one error, because every failure counted as expected. The
+	// person choosing resources pays for that: an unread candidate is one whose
+	// references were never followed, so whatever it uses is offered as an anonymous
+	// row among hundreds.
+	check(
+		'the candidate that could not be read is counted',
+		out.detailUnread?.count === 1,
+		JSON.stringify(out.detailUnread)
+	);
+	check(
+		'and the count says why, in a word someone can act on',
+		out.detailUnread?.by?.['not allowed'] === 1,
+		JSON.stringify(out.detailUnread)
+	);
+	// THE CONTROL: a retry that never fired would leave the throttled read here too.
+	check(
+		'and the read that was merely rate limited is NOT among them',
+		!out.detailUnread?.by?.['rate limited'],
+		JSON.stringify(out.detailUnread)
+	);
+
 	check(
 		'a candidate that names nothing marks nothing',
 		!out.items.find((i) => i.importId === 'import-lab-processor')?.referencedBy,
@@ -432,6 +475,30 @@ try {
 
 	// ------------------------------------------------- the flags actually sent
 	const calls = JSON.parse(fs.readFileSync(path.join(dir, 'calls.json'), 'utf-8'));
+
+	// ------------------------------------------------ detail runs AFTER the region
+	//
+	// S3 lists the whole account whatever region is asked, so every bucket is a
+	// candidate until its location says otherwise. Reading them first spends one
+	// Cloud Control call per foreign bucket -- and Cloud Control is the same quota
+	// the reads that matter are queueing for.
+	const detalhe = calls.filter((c) => c.startsWith('cloudcontrol get-resource'));
+	check(
+		'a bucket in another region is never read in detail',
+		!detalhe.some((c) => c.includes('bucket-noutra-regiao')),
+		JSON.stringify(detalhe)
+	);
+	// THE CONTROL: skipping the detail pass entirely would satisfy that too.
+	check(
+		'and the bucket that IS in the region still is',
+		detalhe.some((c) => c.includes('bucket-aqui')),
+		JSON.stringify(detalhe)
+	);
+	check(
+		'the rate limited read was asked a second time',
+		detalhe.filter((c) => c.includes('AWS::Lambda::Function cost-report') || (c.includes('AWS::Lambda::Function') && c.includes('cost-report'))).length === 2,
+		JSON.stringify(detalhe)
+	);
 	// Only the types Struct8 named are read one by one. Reading every swept row
 	// would be one call per resource in the account -- thousands.
 	check(

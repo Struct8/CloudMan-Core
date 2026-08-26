@@ -41,7 +41,7 @@
 //                         [--vpc vpc-0703...] [--tag Project=k8hub]
 //                         [--type AWS::Lambda::Function ...]
 
-import { execFileSync } from 'node:child_process';
+import { execFileSync, execFile } from 'node:child_process';
 import fs from 'node:fs';
 
 const args = process.argv.slice(2);
@@ -105,6 +105,51 @@ function aws(service, operation, extra = [], expected = null) {
 	}
 }
 
+/**
+ * The same call, off the main thread, so many can be in flight at once.
+ *
+ * Only the type sweep uses it. Everything else here is a handful of calls where
+ * the synchronous version reads better and costs nothing.
+ */
+function awsAsync(service, operation, extra = [], expected = null) {
+	return new Promise((resolve) => {
+		execFile(
+			'aws',
+			[service, operation, '--region', region, '--output', 'json', ...extra],
+			{ encoding: 'utf-8', maxBuffer: 64 * 1024 * 1024 },
+			(error, stdout, stderr) => {
+				if (error) {
+					const message = String(stderr || error?.message || error).slice(0, 400);
+					if (expected && expected(message)) return resolve(null);
+					errors.push({ source: `${service} ${operation}`, message });
+					return resolve(null);
+				}
+				try {
+					resolve(JSON.parse(stdout));
+				} catch {
+					errors.push({ source: `${service} ${operation}`, message: 'answer was not JSON' });
+					resolve(null);
+				}
+			}
+		);
+	});
+}
+
+/**
+ * Runs `worker` over `list`, `width` at a time.
+ *
+ * A fixed pool rather than `Promise.all` over everything: 478 AWS CLI processes
+ * at once is 478 processes, and the rate limiter would refuse most of them
+ * anyway.
+ */
+async function inParallel(list, width, worker) {
+	const queue = [...list];
+	const runners = Array.from({ length: Math.min(width, queue.length) }, async () => {
+		while (queue.length) await worker(queue.shift());
+	});
+	await Promise.all(runners);
+}
+
 const items = [];
 const push = (arn, extra = {}) => items.push({ arn, ...extra });
 const tagsOf = (list) =>
@@ -162,14 +207,34 @@ const tagsOf = (list) =>
 		return false;
 	};
 
-	for (const type of cfnTypes) {
+	// CONCURRENT, and it is not an optimisation. Measured on 2026-08-25: 478 types
+	// asked one after another did not finish inside ten minutes, and the panel
+	// waiting on this run gives up at twenty. Each call is almost entirely time
+	// spent waiting on AWS, so width costs nothing locally and is the difference
+	// between a scan someone waits through and one they abandon.
+	//
+	// Rate limiting is the expected cost of that width, not a failure, and it is
+	// why throttled types come back for a second, narrower pass rather than being
+	// reported as missing. A type that is still throttled after that IS reported --
+	// silently returning fewer resources than the account holds is the one outcome
+	// worth failing over, because half a diagram looks exactly like a whole one.
+	const throttled = [];
+	const isThrottle = (message) => /Throttl|Rate exceeded|TooManyRequests/i.test(message);
+
+	async function sweep(type, onThrottle) {
 		let token = null;
 		do {
-			const page = aws(
+			const page = await awsAsync(
 				'cloudcontrol',
 				'list-resources',
 				token ? ['--type-name', type, '--next-token', token] : ['--type-name', type],
-				notNews
+				(message) => {
+					if (onThrottle && isThrottle(message)) {
+						onThrottle(type);
+						return true;
+					}
+					return notNews(message);
+				}
 			);
 			if (!page) break;
 			for (const row of page.ResourceDescriptions ?? []) {
@@ -179,6 +244,18 @@ const tagsOf = (list) =>
 			}
 			token = page.NextToken || null;
 		} while (token);
+	}
+
+	await inParallel(cfnTypes, 10, (type) => sweep(type, (t) => throttled.push(t)));
+
+	// NARROWING, not one retry. A single second pass still left nine types unread
+	// on a real sweep, and each unread type is a set of resources the person is
+	// never offered -- which looks exactly like an account that does not have them.
+	// Each round halves the width, so the last one is nearly serial.
+	for (let width = 4; width >= 1 && throttled.length; width = Math.floor(width / 2)) {
+		const again = throttled.splice(0, throttled.length);
+		console.error(`scan-account: ${again.length} type(s) rate limited -- asking again, ${width} at a time.`);
+		await inParallel(again, width, (type) => sweep(type, width > 1 ? (t) => throttled.push(t) : null));
 	}
 
 	if (skipped) {

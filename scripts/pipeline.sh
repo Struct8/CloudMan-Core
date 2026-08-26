@@ -322,9 +322,17 @@ run_terraform_process() {
         # credencial ou backend chegava ao diagrama como plano velho, igual a
         # todas as outras falhas.
         INIT_STATUS=0
-        _stream_cmd terraform init -reconfigure -input=false \
-            -backend-config="profile=backend" \
-            -backend-config="region=$BACKEND_REGION" || INIT_STATUS=$?
+        if [ "$action" == "scan" ]; then
+            # A scan is not Terraform. Its folder holds the manifest and the
+            # scope and no `.tf` at all, so there is no configuration for init
+            # to initialise. It also neither reads nor writes state, which is
+            # what makes it the one action here that does not need the backend.
+            echo -e "${color}⏭️  ${label} Scan: no Terraform in this folder, skipping init.${NC}"
+        else
+            _stream_cmd terraform init -reconfigure -input=false \
+                -backend-config="profile=backend" \
+                -backend-config="region=$BACKEND_REGION" || INIT_STATUS=$?
+        fi
 
         if [ $INIT_STATUS -ne 0 ]; then
             # Só plan e drift: é o arquivo que ESSAS duas ações publicam e que o
@@ -648,16 +656,131 @@ run_terraform_process() {
           APPLY_STATUS=$?
 
         # INÍCIO DA NOVA LÓGICA DE IMPORT (GERAÇÃO PARA REVISÃO)
-        elif [ "$action" == "import" ]; then
+        # TWO NAMES, ONE PASS. `import` is the original name and the old Import
+        # tab still sends it. `read` is what the account-scan journey sends, and
+        # it is the accurate one: this branch WRITES NO STATE -- it reads the
+        # resources named in the import blocks and produces a draft. The step
+        # that writes is `apply`, over those same blocks.
+        elif [ "$action" == "import" ] || [ "$action" == "read" ]; then
           echo -e "${color}📥 ${label} Generating import draft...${NC}"
 
           # 1. Limpeza preventiva absoluta
-          rm -f generated_resources.tf import.tfplan generated_resources.json
+          rm -f generated_resources.tf generated_resources.tf.prev import.tfplan generated_resources.json draft_plan.log draft_plan.json
 
-          # 2. Executa a geração. Usamos '|| true' aqui porque o gerador experimental
-          # quase sempre gera avisos ou erros de conflito que não devem travar o pipeline
-          # de geração de rascunho.
-          terraform plan -generate-config-out=generated_resources.tf -out=import.tfplan -input=false || echo "⚠️ Warning: the generator hit HCL conflicts, continuing anyway to produce the draft."
+          # 2. Executa a geração. O gerador de configuração é experimental e a
+          # saída dele quase sempre tem conflito de HCL, então a falha aqui é
+          # esperada e tratada no passo 2b -- não é motivo para derrubar o
+          # pipeline. O log vai para arquivo porque 2b precisa lê-lo.
+          DRAFT_STATUS=0
+          terraform plan -generate-config-out=generated_resources.tf -out=import.tfplan -input=false > draft_plan.log 2>&1 || DRAFT_STATUS=$?
+          cat draft_plan.log
+
+          # 2a. OS BLOCOS DE IMPORT VÊM DE UMA VARREDURA, E UMA VARREDURA É UMA
+          # FOTO. Entre a pessoa escolher os recursos e a importação rodar, algo
+          # pode ter sido apagado -- e o Terraform então para. Não aquele
+          # recurso: a rodada inteira. Uma instância que sumiu derruba o
+          # rascunho das outras onze.
+          #
+          # Tirar o bloco não esconde a diferença: sobram menos recursos do que
+          # os pedidos, e o canvas compara os dois números e para nisso. A
+          # configuração é regerada do zero porque ela foi escrita com o recurso
+          # que não existe mais.
+          PRUNER="$ENGINE_PATH/scripts/prune-missing-imports.mjs"
+          if [ "$DRAFT_STATUS" -ne 0 ] && [ -f "$PRUNER" ] && [ -f imports.tf ] && command -v node > /dev/null 2>&1; then
+            for round in 1 2; do
+              grep -q 'Cannot import non-existent remote object' draft_plan.log || break
+              node "$PRUNER" imports.tf draft_plan.log || break
+              echo -e "${YELLOW}⚠️ Some of the resources picked no longer exist in the account, and were left out of the draft.${NC}"
+              rm -f generated_resources.tf
+              DRAFT_STATUS=0
+              terraform plan -generate-config-out=generated_resources.tf -out=import.tfplan -input=false > draft_plan.log 2>&1 || DRAFT_STATUS=$?
+              cat draft_plan.log
+              if [ "$DRAFT_STATUS" -eq 0 ]; then break; fi
+            done
+          fi
+
+          # 2b. O RASCUNHO SÓ SERVE SE O ARQUIVO DE PLANO FOR ESCRITO. Sem ele
+          # não há JSON, e o que chega ao front-end é o aviso do passo 3 -- que
+          # se lê como "não achei nada" e não como "isto falhou".
+          #
+          # O que trava o plano é o próprio gerador emitindo cada atributo
+          # opcional do schema no valor zero (`ipv6_cidr_block = ""`,
+          # `enable_lni_at_device_index = 0`), que os validadores do provider
+          # então recusam. Medido numa VPC de 12 recursos no provider 5.100.0:
+          # 10 erros e nenhum plano. `sanitize-generated-config.mjs` tira esses
+          # valores; cada rodada recebe os erros do plano anterior e a série
+          # para assim que não houver mais o que tirar.
+          if [ "$DRAFT_STATUS" -ne 0 ] && [ -f "generated_resources.tf" ]; then
+            SANITIZER="$ENGINE_PATH/scripts/sanitize-generated-config.mjs"
+            if [ ! -f "$SANITIZER" ] || ! command -v node > /dev/null 2>&1; then
+              echo -e "${YELLOW}⚠️ Warning: the draft has HCL errors and cannot be repaired here (node or the sanitizer is missing).${NC}"
+            else
+              echo -e "${color}🧹 ${label} Repairing the generated HCL...${NC}"
+              node "$SANITIZER" generated_resources.tf || true
+
+              # O LAÇO RODA EM `terraform validate`, NÃO EM `plan`.
+              #
+              # É a mesma autoridade: `ConflictsWith`, `RequiredWith` e os
+              # validadores de valor são checados na validação de schema do SDK,
+              # que acontece ANTES de qualquer chamada de API. Medido contra os
+              # seis erros desta conta, o `validate` pega todos os seis, com o
+              # texto idêntico ao do plan -- e roda sem credencial nenhuma.
+              #
+              # A diferença é o preço de um passe. Cada `plan` relia a conta
+              # inteira, o que fazia o teto de passes virar risco de verdade:
+              # cortar cedo devolvia um rascunho parcial, e cortar tarde custava
+              # minutos por rodada. Um `validate` não fala com a AWS, então o
+              # teto pode ser alto sem custar nada.
+              #
+              # Quem termina a série continua sendo o saneador, que sai com 1
+              # assim que não tem mais o que tirar.
+              REPAIR_PASSES=0
+              for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+                if terraform validate > draft_plan.log 2>&1; then break; fi
+                REPAIR_PASSES=$attempt
+                node "$SANITIZER" generated_resources.tf draft_plan.log || break
+              done
+
+              # O plano volta a ser tirado UMA vez, agora que a configuração
+              # passa na validação. Sem `-generate-config-out` de propósito: ele
+              # recusa sobrescrever um arquivo que existe, e daqui em diante a
+              # configuração É o arquivo que acabou de ser saneado.
+              if terraform plan -out=import.tfplan -input=false > draft_plan.log 2>&1; then
+                DRAFT_STATUS=0
+                echo -e "${color}✅ Draft repaired in ${REPAIR_PASSES} local pass(es).${NC}"
+              else
+                cat draft_plan.log
+                echo -e "${YELLOW}⚠️ Warning: the draft still has HCL errors after the repair passes.${NC}"
+              fi
+            fi
+          fi
+
+          # 2c. `user_data` chega ao rascunho como o SHA1 que o state guarda,
+          # nunca como o conteúdo -- e o provider relê esse hash COMO SE fosse o
+          # conteúdo, propondo trocar o user-data da instância pelo hash de
+          # outra coisa. Remover a linha não resolve, `user_data_base64` não
+          # resolve e `ignore_changes` não resolve; medido contra uma instância
+          # viva, o único rascunho que fecha em `0 to change` é o que carrega o
+          # script de verdade. Por isso ele é lido da conta e escrito aqui.
+          if [ "$DRAFT_STATUS" -eq 0 ] && [ -f "generated_resources.tf" ]; then
+            INLINER="$ENGINE_PATH/scripts/inline-user-data.mjs"
+            if [ -f "$INLINER" ] && command -v node > /dev/null 2>&1 && command -v aws > /dev/null 2>&1; then
+              cp generated_resources.tf generated_resources.tf.prev
+              if terraform show -json import.tfplan > draft_plan.json 2>/dev/null && node "$INLINER" generated_resources.tf draft_plan.json; then
+                if terraform plan -out=import.tfplan -input=false > draft_plan.log 2>&1; then
+                  echo -e "${color}📝 ${label} The user-data of the imported instances is in the draft, and gets committed with it.${NC}"
+                else
+                  # Sem plano não há JSON, e o rascunho anterior pelo menos tinha
+                  # um. A diferença de user_data volta, e é visível no plano.
+                  cat draft_plan.log
+                  echo -e "${YELLOW}⚠️ Warning: the draft stopped planning once the user-data was written in. Keeping the version without it.${NC}"
+                  mv generated_resources.tf.prev generated_resources.tf
+                  terraform plan -out=import.tfplan -input=false > draft_plan.log 2>&1 || true
+                fi
+              fi
+              rm -f generated_resources.tf.prev draft_plan.json
+            fi
+          fi
 
           # 3. Verifica se pelo menos o arquivo .tf foi gerado (mesmo com erros de validação)
           if [ -f "generated_resources.tf" ]; then
@@ -677,6 +800,39 @@ run_terraform_process() {
               echo -e "${RED}❌ Critical error: terraform could not even produce the draft .tf file.${NC}"
               exit 1
           fi
+
+        elif [ "$action" == "scan" ]; then
+          echo -e "${color}🔎 ${label} Listing the account...${NC}"
+
+          # In Node rather than bash with jq, because what comes out is a JSON
+          # with two layers and what consumes it is TypeScript: keeping the shape
+          # in one language is what stops the two ends from drifting apart.
+          # `node` ships with the GitHub runner, but the check stays -- without
+          # it the failure would surface as "the scan produced no inventory",
+          # which points at the wrong thing.
+          if ! command -v node > /dev/null 2>&1; then
+            echo -e "${RED}❌ Critical error: node is not on this runner, and the scan needs it.${NC}"
+            exit 1
+          fi
+
+          rm -f scan_inventory.json
+
+          # No `|| true`: the script already records, inside the inventory, every
+          # service the credentials could not read, and carries on. So a non-zero
+          # exit means it did not reach the end -- and a partial inventory passing
+          # for a complete one is the worst outcome this action has.
+          node "$ENGINE_PATH/scripts/scan-account.mjs" --out scan_inventory.json
+
+          if [ ! -f scan_inventory.json ]; then
+            echo -e "${RED}❌ Critical error: the scan produced no inventory file.${NC}"
+            exit 1
+          fi
+
+          SCAN_COUNT=$(jq '.items | length' scan_inventory.json 2>/dev/null || echo "?")
+          SCAN_ERRORS=$(jq '.errors | length' scan_inventory.json 2>/dev/null || echo "?")
+          echo -e "${color}📄 ${label} ${SCAN_COUNT} resource(s) listed, ${SCAN_ERRORS} service(s) unreadable.${NC}"
+
+          touch "$GITHUB_WORKSPACE/.needs_scan_commit"
 
         elif [ "$action" == "destroy" ]; then
 
@@ -732,6 +888,16 @@ run_terraform_process() {
               echo -e "${color}❌ ${label} Terraform destroy failed. Remote cleanup was NOT performed.${NC}"
               return $DESTROY_STATUS
           fi
+
+        else
+          # NO SILENT FALL-THROUGH. Until this branch existed, an action the
+          # engine does not know -- a typo, or a name the app began sending
+          # before the engine learned it -- ran init and target auth, matched
+          # nothing in this chain, and the run finished GREEN having done
+          # nothing at all. The app was then left waiting for a file that was
+          # never going to arrive, with no failure anywhere to point at.
+          echo -e "${RED}❌ Unknown action '$action'. This engine serves: plan, drift, apply, destroy, import, read, scan.${NC}"
+          exit 1
         fi
     )
 
@@ -782,6 +948,29 @@ debug_auth_status "BACKEND PROFILE CRIADO"
 # DEPENDÊNCIAS EXTERNAS
 # ---------------------------------------------------------
 EXTERNAL_REPOS=$(jq -c '.external_repositories // []' "$MANIFEST_PATH")
+
+# WHICH CODE VERSION THIS RUN CLONED
+#
+# One line per source: `provider:owner/repo<TAB>identifier`. Written to a FILE
+# and not to a variable because the loop below runs behind a pipe (`| while`),
+# and anything a subshell assigns dies with it -- that is how the first version
+# of the progress report lost its token, silently.
+#
+# `report_state_progress` reads it and sends the contents in the first report.
+# This is where version promotion starts: the canvas stores these values on the
+# stage, and the next stage receives the same ones instead of looking up the tip
+# of the branch again.
+SOURCES_FILE="${RUNNER_TEMP:-/tmp}/cloudman_sources.tsv"
+rm -f "$SOURCES_FILE"
+
+# Sources whose requested version did NOT end up in the tree. Also a file, for
+# the same reason: `exit` inside the loop would kill only the subshell, and the
+# pipeline would carry on running terraform against the wrong tree -- silently,
+# which is exactly what this exists to prevent. Checked after the loop, in the
+# real shell.
+PIN_FAILED_FILE="${RUNNER_TEMP:-/tmp}/cloudman_pin_failed.txt"
+rm -f "$PIN_FAILED_FILE"
+
 if [ "$EXTERNAL_REPOS" != "[]" ] && [ "$EXTERNAL_REPOS" != "null" ]; then
     echo "📦 Resolving external dependencies..."
     echo "$EXTERNAL_REPOS" | jq -c '.[]' | while read -r repo; do
@@ -790,6 +979,11 @@ if [ "$EXTERNAL_REPOS" != "[]" ] && [ "$EXTERNAL_REPOS" != "null" ]; then
         BRANCH=$(echo "$repo" | jq -r '.branch')
         TARGET_DIR=$(echo "$repo" | jq -r '.target_dir')
         FOLDERS=$(echo "$repo" | jq -r '.folders | join(" ")')
+        # Version pinned by the canvas. Empty = clone the tip of the branch,
+        # which is the long-standing behaviour and what the first stage in the
+        # chain does.
+        COMMIT=$(echo "$repo" | jq -r '.commit // empty')
+        PROVIDER=$(echo "$repo" | jq -r '.provider // "github"')
         FULL_TARGET_DIR="./$TARGET_DIR"
         REPO_URL="https://x-access-token:${GH_CLONE_TOKEN}@github.com/${ORG}/${REPO_NAME}.git"
 
@@ -799,24 +993,447 @@ if [ "$EXTERNAL_REPOS" != "[]" ] && [ "$EXTERNAL_REPOS" != "null" ]; then
             cd "$FULL_TARGET_DIR"
             git sparse-checkout init --cone
             git sparse-checkout set $FOLDERS
-            git checkout "$BRANCH"
+            if [ -n "$COMMIT" ]; then
+                # The shallow clone brought only the tip of the branch, and the
+                # pinned commit can be older. Fetching it by identifier solves
+                # that without downloading the whole history -- GitHub serves a
+                # single commit.
+                echo "📌 Pinned to $COMMIT"
+                git fetch --depth 1 --filter=blob:none origin "$COMMIT"
+                git checkout --detach "$COMMIT"
+            else
+                git checkout "$BRANCH"
+            fi
             cd - > /dev/null
         else
             echo "🔄 Updating folders in $REPO_NAME..."
-            (cd "$FULL_TARGET_DIR" && git sparse-checkout set $FOLDERS && git pull origin "$BRANCH")
+            if [ -n "$COMMIT" ]; then
+                echo "📌 Pinned to $COMMIT"
+                (cd "$FULL_TARGET_DIR" \
+                    && git sparse-checkout set $FOLDERS \
+                    && git fetch --depth 1 --filter=blob:none origin "$COMMIT" \
+                    && git checkout --detach "$COMMIT")
+            else
+                (cd "$FULL_TARGET_DIR" && git sparse-checkout set $FOLDERS && git pull origin "$BRANCH")
+            fi
+        fi
+
+        # What actually ended up in the working tree, not what was asked for.
+        # True for both paths: with a pinned version this confirms it arrived;
+        # without one, this is the snapshot the next stage will receive.
+        RESOLVED=$(cd "$FULL_TARGET_DIR" && git rev-parse HEAD 2>/dev/null) || RESOLVED=""
+        if [ -n "$RESOLVED" ]; then
+            printf '%s\t%s\n' "${PROVIDER}:${ORG}/${REPO_NAME}" "$RESOLVED" >> "$SOURCES_FILE"
+        fi
+
+        # Asked for one version and got another: the clone fell back to the tip
+        # of the branch, and the stage would apply code that was never approved.
+        # Recorded for the check right after the loop.
+        if [ -n "$COMMIT" ] && [ "$RESOLVED" != "$COMMIT" ]; then
+            printf '%s: requested %s, got %s\n' \
+                "${ORG}/${REPO_NAME}" "$COMMIT" "${RESOLVED:-none}" \
+                >> "$PIN_FAILED_FILE"
         fi
     done
 fi
 
+if [ -s "$PIN_FAILED_FILE" ]; then
+    echo "::error::The pinned version could not be checked out. Nothing was applied."
+    cat "$PIN_FAILED_FILE"
+    echo "Check that the commit still exists in that repository."
+    exit 1
+fi
+
+# ---------------------------------------------------------
+# ANDAMENTO POR STATE
+# ---------------------------------------------------------
+# Para onde contar em que state o pipeline esta, enquanto ele corre. Vem do
+# manifesto, e nao de uma configuracao aqui: quem monta o manifesto ja sabe com
+# qual Worker aquele canvas fala, entao dev, test e producao acertam o proprio
+# sem nada para manter sincronizado.
+#
+# Vazio -- manifesto antigo, ou frontend sem Worker configurado -- e o
+# comportamento de sempre: nao reporta nada.
+PROGRESS_URL=$(jq -r '.progress_url // empty' "$MANIFEST_PATH")
+
+# Conta ao Struct8 que um state comecou ou terminou.
+#
+# Ate aqui o canvas do cliente sabia duas coisas: que empurrou, e que terminou.
+# O meio -- que passa de vinte minutos num apply de EKS -- nao tinha como ser
+# contado, entao os recursos do estagio inteiro ficavam com a mesma marca de "em
+# execucao" do primeiro ao ultimo segundo. Cada chamada daqui apaga a marca de um
+# recurso na tela, ou pinta de vermelho o que quebrou.
+#
+# O Worker resolve sozinho de qual canvas e de qual no e este run, cruzando
+# repositorio e sha com o registro que o navegador gravou no momento do push. Por
+# isso nao vai identidade nenhuma daqui -- e nem poderia: o par (repositorio, sha)
+# ele tira do TOKEN, nunca do corpo, e e isso que impede um repositorio qualquer
+# de escrever progresso no canvas de outra pessoa.
+#
+# NUNCA derruba o deploy. Sem `progress_url` nao faz nada; sem token tambem nao;
+# e a chamada tem timeout curto com o erro engolido. Este script roda sob `set -e`,
+# e um relatorio perdido custa uma animacao, nao uma execucao.
+report_state_progress() {
+    if [ -z "$PROGRESS_URL" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+        return 0
+    fi
+
+    local state_path="$1" status="$2" index="$3" total="$4"
+    local token="" corpo=""
+    local sources_json="" body_with_sources="" code=""
+
+    # Token OIDC deste run, com audiencia PROPRIA do relatorio de andamento --
+    # diferente da `https://struct8.com/gitops` que o GateKeeper valida. Separar as
+    # duas e o que impede um token pedido para contar progresso de ser
+    # reapresentado ao GateKeeper para cunhar um token de repositorio.
+    #
+    # `audience`, e nao `aud`: o GitHub ignora parametro desconhecido em silencio e
+    # emite a audiencia PADRAO -- ver o caso registrado no engine.yml.
+    #
+    # Pedido a cada relatorio, e nao uma vez no inicio: o token do Actions vale
+    # minutos e um apply de EKS passa de vinte. Quem responde e o servico local do
+    # runner, entao a chamada e barata perto de qualquer terraform.
+    token=$(curl -sS -m 5 \
+        -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+        "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://struct8.com/run-progress" \
+        2>/dev/null | jq -r '.value // empty' 2>/dev/null) || return 0
+
+    if [ -z "$token" ]; then
+        return 0
+    fi
+
+    # The code version this run cloned, carried by the first report that gets
+    # through. The clone loop wrote one line per source, as
+    # `provider:owner/repo<TAB>identifier`; this folds them into the single
+    # object the Worker reads.
+    if [ -s "${SOURCES_FILE:-}" ]; then
+        sources_json=$(jq -Rn \
+            '[inputs | split("\t") | select(length == 2) | {(.[0]): .[1]}] | add' \
+            < "$SOURCES_FILE" 2>/dev/null) || sources_json=""
+    fi
+
+    # Corpo enxuto de proposito: repositorio, sha e link do run saem do token, do
+    # lado do Worker. Mandar de novo aqui nao adiantaria nada -- ele ignora o que
+    # vier no corpo para esses tres.
+    corpo=$(jq -n \
+        --arg state "$state_path" \
+        --arg status "$status" \
+        --argjson index "$index" \
+        --argjson total "$total" \
+        '{
+            state:  $state,
+            status: $status,
+            index:  $index,
+            total:  $total
+        }' 2>/dev/null) || return 0
+
+    # Folded into the body already built, rather than built again with the field
+    # added: two places building the same object drift apart over time. A failure
+    # here keeps the original body, so progress is still reported.
+    if [ -n "$sources_json" ] && [ "$sources_json" != "null" ]; then
+        body_with_sources=$(printf '%s' "$corpo" \
+            | jq -c --argjson sources "$sources_json" '. + { sources: $sources }' \
+            2>/dev/null) || body_with_sources=""
+        if [ -n "$body_with_sources" ]; then
+            corpo="$body_with_sources"
+        fi
+    fi
+
+    # The status code is read so the run can tell whether the version arrived.
+    # Progress itself stays best-effort: a failure here never brings the pipeline
+    # down.
+    code=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' \
+        -X POST \
+        -H "Authorization: Bearer ${token}" \
+        -H 'Content-Type: application/json' \
+        -d "$corpo" \
+        "$PROGRESS_URL" 2>/dev/null) || code=""
+
+    # Dropped only after the Worker accepted it, so a report that never arrived
+    # is sent again on the next state. Without this the next stage has no version
+    # to promote.
+    if [ -n "$sources_json" ] && [ "$code" = "200" ]; then
+        rm -f "$SOURCES_FILE"
+    fi
+
+    return 0
+}
+
+if [ -n "$PROGRESS_URL" ]; then
+    echo "📡 Reporting per-state progress to the canvas."
+fi
+
+# Which state each background job belongs to.
+#
+# `wait` gives back an exit code and nothing else -- it does not say which
+# directory the job was working in. These three lists are what turns that exit
+# code back into a state, and they are the reason the parallel branch can report
+# progress at all. Index k of the three describes one job.
+PAR_PIDS=()
+PAR_PATHS=()
+PAR_IDX=()
+
+# Waits for every job launched so far and reports each one by name.
+#
+# Called twice: when the batch fills up to `max_parallel`, and once more after
+# the loop for whatever is left. A batch waits for its slowest member, which is
+# the price of not depending on `wait -n -p` -- that flag would give a sliding
+# window, and it only exists in bash 5.1+.
+#
+# Sets `failed` (a global of the stage loop) instead of returning it: the caller
+# already reads that variable to decide whether the stage as a whole is over.
+_drain_parallel_batch() {
+    local k
+    for k in "${!PAR_PIDS[@]}"; do
+        # Condition context on purpose: with `set -e` a bare `wait` on a job that
+        # exited non-zero would end the script here, and the state that failed
+        # would never be reported -- the node would keep a running badge on a run
+        # that is already over.
+        if wait "${PAR_PIDS[$k]}"; then
+            report_state_progress "${PAR_PATHS[$k]}" "ok" "${PAR_IDX[$k]}" "$STATE_TOTAL"
+        else
+            report_state_progress "${PAR_PATHS[$k]}" "failed" "${PAR_IDX[$k]}" "$STATE_TOTAL"
+            failed=1
+        fi
+    done
+    PAR_PIDS=()
+    PAR_PATHS=()
+    PAR_IDX=()
+}
+
+# ==============================================================================
+# ESCALONAMENTO POR DEPENDENCIA
+# ==============================================================================
+# O laco de estagios abaixo e uma sequencia de barreiras: uma entrada de
+# `pipeline_stages` so comeca quando a anterior terminou INTEIRA. Com as entradas
+# saindo uma por onda topologica, isso faz um state esperar por gente da rodada
+# anterior com quem ele nao tem relacao nenhuma -- dois ramos independentes
+# andam no passo do mais lento dos dois.
+#
+# Aqui os states das entradas viram um conjunto so, e cada um parte assim que os
+# do `depends_on` DELE terminaram. Mesmas ligacoes, mesma ordem respeitada,
+# menos espera.
+#
+# Vale quando o manifesto pede (`pipeline_schedule.mode == "dependency"`). Sem o
+# campo, nada muda: o manifesto continua trazendo as ondas e o laco de sempre as
+# executa. E o que mantem um engine antigo correto diante de um manifesto novo.
+#
+# POR QUE O CODIGO DE SAIDA VEM DE ARQUIVO, E NAO DE `wait`
+#
+# `wait` sem -n bloqueia ate UM pid especifico terminar, que e justamente o que
+# nao se pode fazer aqui: o proximo a liberar vaga e desconhecido. `wait -n -p`
+# resolveria, mas so existe no bash 5.1+, e este script nao escolhe o runner.
+# Cada job gravando o proprio codigo de saida num arquivo funciona em qualquer
+# bash, e nao depende de quando o shell recolhe o filho.
+SCH_PATH=()
+SCH_PROVIDER=()
+SCH_TARGET_AUTH=()
+SCH_ADD_AUTH=()
+SCH_DEPS=()
+SCH_STATUS=()
+SCH_PID=()
+SCH_DONE_DIR=""
+SCH_RODANDO=0
+
+# 0 quando todo o `depends_on` do state $1 ja terminou com sucesso.
+#
+# Dependencia que nao esta no conjunto e ignorada: o state nao foi enviado neste
+# push, nunca vai reportar, e esperar por ele penduraria o run ate o timeout do
+# Actions. Quem monta o manifesto ja descarta essas, e isto e a segunda linha.
+_deps_satisfeitas() {
+    local idx="$1" dep k achado
+    while IFS= read -r dep; do
+        [ -z "$dep" ] && continue
+        achado=""
+        for k in "${!SCH_PATH[@]}"; do
+            if [ "${SCH_PATH[$k]}" == "$dep" ]; then
+                achado="$k"
+                break
+            fi
+        done
+        [ -z "$achado" ] && continue
+        [ "${SCH_STATUS[$achado]}" == "ok" ] || return 1
+    done <<< "${SCH_DEPS[$idx]}"
+    return 0
+}
+
+# Recolhe quem terminou desde a ultima passada e reporta cada um pelo nome.
+# Devolve 0 se recolheu alguem -- e o sinal de que vale tentar lancar mais sem
+# dormir de novo.
+_recolher_terminados() {
+    local k arquivo codigo recolheu=1
+    for k in "${!SCH_STATUS[@]}"; do
+        [ "${SCH_STATUS[$k]}" == "running" ] || continue
+        arquivo="$SCH_DONE_DIR/$k"
+        [ -f "$arquivo" ] || continue
+
+        codigo=$(cat "$arquivo" 2>/dev/null || echo 1)
+        case "$codigo" in ''|*[!0-9]*) codigo=1 ;; esac
+        wait "${SCH_PID[$k]}" 2>/dev/null || true
+        SCH_RODANDO=$((SCH_RODANDO - 1))
+
+        if [ "$codigo" -eq 0 ]; then
+            SCH_STATUS[$k]="ok"
+            report_state_progress "${SCH_PATH[$k]}" "ok" "$((k + 1))" "${#SCH_PATH[@]}"
+            echo "✅ State finished: ${SCH_PATH[$k]}"
+        else
+            SCH_STATUS[$k]="failed"
+            report_state_progress "${SCH_PATH[$k]}" "failed" "$((k + 1))" "${#SCH_PATH[@]}"
+            echo "::error::State ${SCH_PATH[$k]} failed"
+            failed=1
+        fi
+        recolheu=0
+    done
+    return $recolheu
+}
+
+run_dependency_schedule() {
+    local state path k lancados pendentes max_parallel
+
+    max_parallel=$(jq -r '.pipeline_schedule.max_parallel // empty' "$MANIFEST_PATH")
+    case "$max_parallel" in ''|*[!0-9]*) max_parallel=0 ;; esac
+
+    # Todos os states de todas as entradas, na ordem em que aparecem. As entradas
+    # continuam sendo as ondas; aqui a divisao delas nao interessa -- quem ordena
+    # e o `depends_on`.
+    #
+    # Tudo o que o lancamento precisa sai do JSON AQUI, uma vez por state. Deixar
+    # para extrair na hora de lancar poria tres `jq` dentro do laco de decisao,
+    # que roda a cada volta e para cada candidato.
+    while read -r state; do
+        [ -z "$state" ] && continue
+        SCH_PATH+=("$(echo "$state" | jq -r '.path')")
+        SCH_PROVIDER+=("$(echo "$state" | jq -r '.provider')")
+        SCH_TARGET_AUTH+=("$(echo "$state" | jq -c '.target_auth')")
+        SCH_ADD_AUTH+=("$(echo "$state" | jq -c '.additional_auth // []')")
+        SCH_DEPS+=("$(echo "$state" | jq -r '(.depends_on // [])[]')")
+        SCH_STATUS+=("pending")
+        SCH_PID+=("")
+    done <<< "$(jq -c '.pipeline_stages[].states[]' "$MANIFEST_PATH")"
+
+    if [ "${#SCH_PATH[@]}" -eq 0 ]; then
+        echo "⚠️  Nenhum state no manifesto. Nada a fazer."
+        return 0
+    fi
+
+    SCH_DONE_DIR=$(mktemp -d)
+    failed=0
+
+    echo ""
+    echo "=========================================================="
+    echo "🚀 ${#SCH_PATH[@]} states, escalonados por dependência (até $max_parallel por vez)"
+    echo "=========================================================="
+
+    while true; do
+        lancados=0
+
+        # Nada novo comeca depois de uma falha. O que ja esta rodando termina --
+        # `terraform apply` nao e interrompivel com seguranca -- e o run acaba.
+        if [ $failed -eq 0 ]; then
+            for k in "${!SCH_STATUS[@]}"; do
+                [ "${SCH_STATUS[$k]}" == "pending" ] || continue
+                if [ "$max_parallel" -gt 0 ] && [ "$SCH_RODANDO" -ge "$max_parallel" ]; then
+                    break
+                fi
+                _deps_satisfeitas "$k" || continue
+
+                path="${SCH_PATH[$k]}"
+
+                if [ ! -d "$path" ]; then
+                    echo "⚠️  Directory $path does not exist. Skipping."
+                    # Conta como concluido, e nao como pendente: quem depende dele
+                    # nunca sairia do lugar, e o run morreria no guarda de ciclo
+                    # apontando um ciclo que nao existe.
+                    SCH_STATUS[$k]="ok"
+                    continue
+                fi
+                if [ -d ".external_modules" ]; then
+                    ln -sfn "$(readlink -f .external_modules)" "$path/.external_modules"
+                fi
+
+                report_state_progress "$path" "running" "$((k + 1))" "${#SCH_PATH[@]}"
+                echo "▶️  State starting: $path"
+                (
+                    # `set +e` aqui dentro: com o `set -e` da linha 27 o subshell
+                    # morreria no terraform que falhou, sem gravar o arquivo, e o
+                    # laco ficaria esperando um state que ja acabou.
+                    set +e
+                    run_terraform_process "$path" "$ACTION" \
+                        "${SCH_TARGET_AUTH[$k]}" "${SCH_PROVIDER[$k]}" "${SCH_ADD_AUTH[$k]}"
+                    echo "$?" > "$SCH_DONE_DIR/$k"
+                ) &
+                SCH_PID[$k]=$!
+                SCH_STATUS[$k]="running"
+                SCH_RODANDO=$((SCH_RODANDO + 1))
+                lancados=$((lancados + 1))
+            done
+        fi
+
+        if [ "$SCH_RODANDO" -eq 0 ] && [ "$lancados" -eq 0 ]; then
+            break
+        fi
+
+        # Uma passada de recolhimento libera vaga sem dormir. Sem ninguem para
+        # recolher, um segundo de espera nao pesa perto de um terraform.
+        if ! _recolher_terminados; then
+            sleep 1
+        fi
+    done
+
+    rm -rf "$SCH_DONE_DIR"
+
+    pendentes=0
+    for k in "${!SCH_STATUS[@]}"; do
+        [ "${SCH_STATUS[$k]}" == "pending" ] && pendentes=$((pendentes + 1))
+    done
+
+    if [ $failed -ne 0 ]; then
+        echo "::error::Pipeline failed"
+        exit 1
+    fi
+
+    if [ "$pendentes" -gt 0 ]; then
+        # Sem falha, sem ninguem rodando, e ainda sobrou gente esperando: o
+        # `depends_on` tem um ciclo. O canvas recusa ciclo antes de gerar o
+        # manifesto, entao chegar aqui e manifesto vindo de outra origem -- e o
+        # unico jeito honesto de terminar e recusando.
+        echo "::error::$pendentes state(s) never became runnable -- depends_on has a cycle"
+        exit 1
+    fi
+
+    echo "✅ Pipeline finished: ${#SCH_PATH[@]} states"
+}
+
 # ---------------------------------------------------------
 # EXECUÇÃO DOS ESTÁGIOS
 # ---------------------------------------------------------
+# Qual dos dois percursos. Ausente = por rodada, que e o que o manifesto de
+# qualquer versao anterior pede, e o que este script sempre fez.
+SCHEDULE_MODE=$(jq -r '.pipeline_schedule.mode // "stages"' "$MANIFEST_PATH")
+
+if [ "$SCHEDULE_MODE" == "dependency" ]; then
+    run_dependency_schedule
+    exit 0
+fi
+
 TOTAL_STAGES=$(jq '.pipeline_stages | length' "$MANIFEST_PATH")
 
 for (( i=0; i<$TOTAL_STAGES; i++ )); do
     STAGE_NAME=$(jq -r ".pipeline_stages[$i].stage_name" "$MANIFEST_PATH")
     IS_PARALLEL=$(jq -r ".pipeline_stages[$i].parallel_execution" "$MANIFEST_PATH")
     STATES_JSON=$(jq -c ".pipeline_stages[$i].states[]" "$MANIFEST_PATH")
+    # Posicao do state dentro do estagio, para o canvas poder dizer "3 de 7".
+    # O laco abaixo usa here-string (`<<<`), e nao pipe: ele roda neste mesmo
+    # shell, entao o contador sobrevive a cada volta.
+    STATE_TOTAL=$(jq ".pipeline_stages[$i].states | length" "$MANIFEST_PATH")
+    STATE_INDEX=0
+    # How many states of this entry may run at once. Absent or junk means no
+    # ceiling, which is what an older manifest asks for: run the whole entry.
+    MAX_PARALLEL=$(jq -r ".pipeline_stages[$i].max_parallel // empty" "$MANIFEST_PATH")
+    case "$MAX_PARALLEL" in ''|*[!0-9]*) MAX_PARALLEL=0 ;; esac
+    PAR_PIDS=()
+    PAR_PATHS=()
+    PAR_IDX=()
 
     # >>> NÃO usar "::group::" aqui. O `::group::` renderiza a seção RECOLHIDA
     # por padrão no painel do Actions — como todo o terraform (init/plan/apply/
@@ -830,11 +1447,11 @@ for (( i=0; i<$TOTAL_STAGES; i++ )); do
     echo "🚀 Stage: $STAGE_NAME"
     echo "=========================================================="
 
-    pids=""
     failed=0
 
     while read -r state; do
         path=$(echo "$state" | jq -r '.path')
+        STATE_INDEX=$((STATE_INDEX + 1))
         provider=$(echo "$state" | jq -r '.provider')
         target_auth=$(echo "$state" | jq -c '.target_auth')
         # `// []` cobre o manifesto antigo, que não traz o campo.
@@ -849,19 +1466,38 @@ for (( i=0; i<$TOTAL_STAGES; i++ )); do
         fi
 
         if [ "$IS_PARALLEL" == "true" ]; then
+            # Reported before launching, and the launch is recorded so the exit
+            # code can be traced back to this directory. Without that pairing the
+            # canvas had to go dark for the whole parallel run: attributing an
+            # outcome to the wrong state would clear the badge of a resource that
+            # is still being created.
+            report_state_progress "$path" "running" "$STATE_INDEX" "$STATE_TOTAL"
             run_terraform_process "$path" "$ACTION" "$target_auth" "$provider" "$additional_auth" &
-            pids="$pids $!"
+            PAR_PIDS+=("$!")
+            PAR_PATHS+=("$path")
+            PAR_IDX+=("$STATE_INDEX")
+
+            if [ "$MAX_PARALLEL" -gt 0 ] && [ "${#PAR_PIDS[@]}" -ge "$MAX_PARALLEL" ]; then
+                _drain_parallel_batch
+                # Nothing new is started once something has failed. What is
+                # already running finishes -- `terraform apply` cannot be
+                # interrupted safely -- and the stage ends right after.
+                if [ $failed -ne 0 ]; then break; fi
+            fi
         else
+            report_state_progress "$path" "running" "$STATE_INDEX" "$STATE_TOTAL"
             run_terraform_process "$path" "$ACTION" "$target_auth" "$provider" "$additional_auth"
-            if [ $? -ne 0 ]; then failed=1; break; fi
+            if [ $? -ne 0 ]; then
+                report_state_progress "$path" "failed" "$STATE_INDEX" "$STATE_TOTAL"
+                failed=1
+                break
+            fi
+            report_state_progress "$path" "ok" "$STATE_INDEX" "$STATE_TOTAL"
         fi
     done <<< "$STATES_JSON"
 
     if [ "$IS_PARALLEL" == "true" ]; then
-        for pid in $pids; do
-            wait $pid
-            if [ $? -ne 0 ]; then failed=1; fi
-        done
+        _drain_parallel_batch
     fi
 
     if [ $failed -ne 0 ]; then

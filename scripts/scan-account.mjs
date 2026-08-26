@@ -13,15 +13,20 @@
 //
 // TWO LAYERS, and the second is why this is not just one API call:
 //
-//   1. Resources with a listing API. The tagging API answers every taggable
-//      resource in the region in one paginated call, across services. The
-//      network family is asked separately, by `vpc-id`, because a subnet that
-//      nobody tagged still has to come.
+//   1. Resources with a listing API. Cloud Control is asked once per resource
+//      type, from the list Struct8 sends -- one uniform call, no per-resource
+//      code. The network family is asked separately, by `vpc-id`, because it
+//      needs an anchor Cloud Control has no way to express.
 //
 //   2. Children that live INSIDE a parent's answer. An ACL entry has no listing
 //      API and no ARN -- it is a row in `describe-network-acls`. Those cost no
 //      extra call: they are expanded out of the parent's response, and each
 //      carries the composite id Terraform imports it by.
+//
+// WHAT THIS SCRIPT DOES NOT KNOW: any CloudMan type name. It answers in AWS's own
+// vocabulary -- `AWS::Lambda::Function` and an identifier -- and Struct8 decides
+// what that maps to, because Struct8 is what holds the catalog. Adding a resource
+// to the catalog changes nothing in this file.
 //
 // CREDENTIALS. Whatever the caller already set up. `pipeline.sh` runs this after
 // PASSO 2, with `AWS_PROFILE=target` exported, so the AWS CLI reaches the
@@ -34,6 +39,7 @@
 // Usage:
 //   node scan-account.mjs [--region us-east-1] [--out scan_inventory.json]
 //                         [--vpc vpc-0703...] [--tag Project=k8hub]
+//                         [--type AWS::Lambda::Function ...]
 
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -59,6 +65,10 @@ const region = argOf('region') || scope.region || process.env.AWS_REGION || null
 const outPath = argOf('out', 'scan_inventory.json');
 const vpcIds = allOf('vpc').length ? allOf('vpc') : (scope.vpcIds ?? []);
 const tagFilters = allOf('tag').length ? allOf('tag') : (scope.tagFilters ?? []);
+// The types to sweep. Struct8 sends them because Struct8 is what owns the
+// catalog -- this script deliberately knows no CloudMan type names, so that a
+// resource added to the catalog costs nothing here.
+const cfnTypes = allOf('type').length ? allOf('type') : (scope.cfnTypes ?? []);
 
 if (!region) {
 	console.error('scan-account: no region -- not in scan_scope.json, --region or AWS_REGION.');
@@ -67,8 +77,16 @@ if (!region) {
 
 const errors = [];
 
-/** One AWS CLI call. A failure is recorded and the scan continues. */
-function aws(service, operation, extra = []) {
+/**
+ * One AWS CLI call. A failure is recorded and the scan continues.
+ *
+ * `expected` marks failures that are not news, and the type sweep below cannot
+ * work without it: of the ~770 AWS resource types, a couple hundred have no LIST
+ * handler at all. Recording one error each would bury the handful a person can
+ * actually act on under three hundred that mean "this type never lists, for
+ * anyone" -- and would make a complete scan read as a broken one.
+ */
+function aws(service, operation, extra = [], expected = null) {
 	try {
 		const out = execFileSync(
 			'aws',
@@ -80,10 +98,9 @@ function aws(service, operation, extra = []) {
 		// Recorded, never fatal: one service the credentials cannot read must not
 		// cost the other forty. Struct8 shows this list next to what was found, so
 		// a partial scan is never mistaken for a complete one.
-		errors.push({
-			source: `${service} ${operation}`,
-			message: String(error?.stderr ?? error?.message ?? error).slice(0, 400)
-		});
+		const message = String(error?.stderr ?? error?.message ?? error).slice(0, 400);
+		if (expected && expected(message)) return null;
+		errors.push({ source: `${service} ${operation}`, message });
 		return null;
 	}
 }
@@ -93,25 +110,89 @@ const push = (arn, extra = {}) => items.push({ arn, ...extra });
 const tagsOf = (list) =>
 	Object.fromEntries((list ?? []).map((t) => [t.Key ?? t.key, t.Value ?? t.value]));
 
-// --------------------------------------------- layer 1a: everything taggable
+// -------------------------------------------- layer 1a: every type, by its LIST
 //
-// One call for the whole region, across every service. It is an INDEX, not the
-// services themselves -- it keeps entries for resources that were destroyed, so
-// a name that was created and deleted repeatedly accumulates dead ARNs.
+// The Cloud Control API answers one question for any resource type: what exists.
+// `--type-name` is the only thing that differs between one type and the next, so
+// sweeping four hundred types is the same code as sweeping four. There is no
+// per-resource handler anywhere in this path, which is the whole point: a type
+// new to AWS costs a line in a list, not code here.
 //
-// SEPARATING THE DEAD ONES IS NOT THIS SCRIPT'S JOB, and the attempt to make it
-// one is worth recording. This file briefly asked EC2 which instances were in an
-// importable state and dropped the rest. It worked, and it was the wrong place:
-// a week later the same thing happened to a SUBNET, and the fix would have been
-// a second hand-written check, then a third. What answers this question for 135
-// of the 254 AWS types -- and is maintained because another screen depends on it
-// -- is the AgentV2 status read. Struct8 now runs it over this inventory before
-// showing the selection list; see `scanLiveness.ts` in the frontend.
+// WHY IT REPLACED THE TAGGING API. That index only answers for resources that
+// carry a tag, and an account built by hand in the console carries none. Measured
+// in mx-central-1 on 2026-08-25, against a bucket, a table, a function, a role and
+// a log group created without tags: the tagging index answered with two EC2
+// instances DESTROYED hours earlier, and none of the five that existed. One
+// source, two failures -- blind to the living, still reporting the dead.
 //
-// So what this script writes is deliberately generous: everything the region
-// index reports, dead entries included. Erring wide costs a click; erring narrow
-// hides a resource that exists, and nobody can see what was never offered.
+// The `Identifier` this returns IS the Terraform import id, in the shape
+// `terraform import` expects. Nothing downstream has to rebuild it from an ARN.
+//
+// STILL DELIBERATELY GENEROUS about what is alive. This script reports what the
+// account answers; deciding what is still usable belongs to the AgentV2 status
+// read, which Struct8 runs over this inventory before showing the selection list
+// (`scanLiveness.ts`, in the frontend). This file briefly did that itself, by
+// asking EC2 which instances were in an importable state. It worked for instances
+// and only for instances -- the next dead thing to stop an import was a subnet,
+// and the fix would have been a second hand-written check, then a third.
 {
+	if (!cfnTypes.length) {
+		errors.push({
+			source: 'cloudcontrol list-resources',
+			message:
+				'No type list to sweep: `cfnTypes` was absent from scan_scope.json and no --type was passed. ' +
+				'Only the network layer was read.'
+		});
+	}
+
+	// A type with no LIST handler, and one that refuses without a parent id, are
+	// both normal across a sweep this wide -- they are properties of the type, not
+	// of this account. Counted, not recorded one by one; see `aws()` above.
+	let skipped = 0;
+	const notNews = (message) => {
+		if (
+			/does not support LIST|UnsupportedActionException|TypeNotFoundException/i.test(message) ||
+			/required key \[|Missing Or Invalid ResourceModel|Missing or invalid ResourceModel/i.test(
+				message
+			)
+		) {
+			skipped++;
+			return true;
+		}
+		return false;
+	};
+
+	for (const type of cfnTypes) {
+		let token = null;
+		do {
+			const page = aws(
+				'cloudcontrol',
+				'list-resources',
+				token ? ['--type-name', type, '--next-token', token] : ['--type-name', type],
+				notNews
+			);
+			if (!page) break;
+			for (const row of page.ResourceDescriptions ?? []) {
+				// No ARN: Cloud Control does not answer one. The type and the import id
+				// are what the frontend needs, and they are both here.
+				if (row.Identifier) push(null, { cfnType: type, importId: row.Identifier });
+			}
+			token = page.NextToken || null;
+		} while (token);
+	}
+
+	if (skipped) {
+		console.error(`scan-account: ${skipped} type(s) have no usable LIST -- expected, not an error.`);
+	}
+}
+
+// --------------------------------------- layer 1a-bis: the tagging API, on ask
+//
+// It survives for one reason: it is the only call that can answer "which
+// resources carry this tag", and `tagFilters` is a scope input. It is no longer
+// the default path, so its two defects -- silent about the untagged, still
+// answering for the destroyed -- only reach someone who asked for a tag filter.
+if (tagFilters.length) {
 	const extra = ['--resources-per-page', '100'];
 	for (const filter of tagFilters) {
 		const [key, value] = String(filter).split('=');
@@ -131,6 +212,34 @@ const tagsOf = (list) =>
 		}
 		token = page.PaginationToken || null;
 	} while (token);
+}
+
+// ------------------------------------------- layer 1a-ter: S3 answers globally
+//
+// `--region` filters every regional type on its own -- measured: the lab function
+// in mx-central-1 does not appear when listing us-east-1 or sa-east-1. S3 is the
+// exception that matters: its LIST returns every bucket in the account whatever
+// region is asked, and the answer carries only the name. So the region has to be
+// asked per bucket, and buckets elsewhere dropped -- otherwise scanning one
+// region drags in the whole account's storage.
+//
+// THE QUIRK THAT WOULD EAT THEM SILENTLY: a bucket in us-east-1 answers a null
+// LocationConstraint, not the region name. Reading null as "no region" loses every
+// us-east-1 bucket without a word.
+//
+// IAM is global too and is deliberately NOT filtered: a role has no region at all,
+// and dropping it would break the very function being imported alongside it.
+{
+	const buckets = items.filter((i) => i.cfnType === 'AWS::S3::Bucket');
+	for (const bucket of buckets) {
+		const answer = aws('s3api', 'get-bucket-location', ['--bucket', String(bucket.importId)]);
+		if (!answer) continue;
+		const home = answer.LocationConstraint || 'us-east-1';
+		if (home !== region) bucket.dropForRegion = home;
+	}
+	for (let i = items.length - 1; i >= 0; i--) {
+		if (items[i].dropForRegion) items.splice(i, 1);
+	}
 }
 
 // ------------------------------------- layer 1b: the network family, by vpc-id
@@ -271,7 +380,10 @@ fs.writeFileSync(
 			accountId: caller?.Account ?? null,
 			// No timestamp from this side on purpose: the commit already carries one,
 			// and a second clock is a second thing that can disagree.
-			scope: { vpcIds, tagFilters },
+			// The type list is echoed as a count, not in full: it is hundreds of
+			// entries, Struct8 already has it, and the number is what tells someone
+			// reading this file whether the sweep was as wide as they meant.
+			scope: { vpcIds, tagFilters, cfnTypeCount: cfnTypes.length },
 			items,
 			errors
 		},

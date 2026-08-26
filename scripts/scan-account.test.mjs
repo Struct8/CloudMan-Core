@@ -167,7 +167,7 @@ const ANSWERS = {
 // over the whole file: if it ever changes, this fails loudly instead of
 // silently testing nothing.
 const original = fs.readFileSync(SOURCE, 'utf-8');
-const IMPORT_LINE = "import { execFileSync } from 'node:child_process';";
+const IMPORT_LINE = "import { execFileSync, execFile } from 'node:child_process';";
 if (!original.includes(IMPORT_LINE)) {
 	console.log(`FAIL - scan-account.mjs no longer imports execFileSync the way this test stubs it`);
 	process.exit(1);
@@ -196,6 +196,13 @@ function execFileSync(_bin, argv) {
 	const i = __PAGE[key] ?? 0;
 	__PAGE[key] = i + 1;
 	return JSON.stringify(answer[Math.min(i, answer.length - 1)]);
+}
+// The sweep runs many calls at once and so takes the callback form. Same table,
+// same keys -- only the shape of the answer differs, which keeps the concurrent
+// path and the sequential one honest about testing the same thing.
+function execFile(bin, argv, _opts, cb) {
+	try { cb(null, execFileSync(bin, argv), ''); }
+	catch (e) { cb(e, '', e.stderr ?? e.message); }
 }
 process.on('exit', () => { try { fs.writeFileSync('calls.json', JSON.stringify(__CALLS, null, 1)); } catch {} });
 `;

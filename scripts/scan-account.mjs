@@ -39,7 +39,7 @@
 // Usage:
 //   node scan-account.mjs [--region us-east-1] [--out scan_inventory.json]
 //                         [--vpc vpc-0703...] [--tag Project=k8hub]
-//                         [--type AWS::Lambda::Function ...]
+//                         [--type AWS::Lambda::Function ...] [--request-id abc]
 
 import { execFileSync, execFile } from 'node:child_process';
 import fs from 'node:fs';
@@ -73,6 +73,17 @@ const cfnTypes = allOf('type').length ? allOf('type') : (scope.cfnTypes ?? []);
 // sends it because only the catalog knows which types can become a node -- asking
 // every swept row would be one call per resource in the account.
 const cfnDetailTypes = allOf('detail').length ? allOf('detail') : (scope.cfnDetailTypes ?? []);
+// Echoed into the answer, and that is its whole job.
+//
+// `scan_inventory.json` sits at a fixed path, so the file the PREVIOUS scan wrote
+// is still there while this one runs -- complete, valid, and indistinguishable
+// from the one being waited for. Struct8 polls that path, and on 2026-08-26 it
+// picked up the old file and moved on to the selection screen while the sweep was
+// still going, offering resources from a scan the person had already replaced.
+//
+// So the answer carries the id of the request that asked for it, and Struct8
+// ignores an answer that is not the one it asked for.
+const requestId = argOf('request-id') || scope.requestId || null;
 
 if (!region) {
 	console.error('scan-account: no region -- not in scan_scope.json, --region or AWS_REGION.');
@@ -537,6 +548,7 @@ fs.writeFileSync(
 	JSON.stringify(
 		{
 			version: 1,
+			requestId,
 			region,
 			accountId: caller?.Account ?? null,
 			// No timestamp from this side on purpose: the commit already carries one,

@@ -261,7 +261,8 @@ try {
 			],
 			// IAM is deliberately NOT here: it is the global type whose members we want
 			// to discover BY REFERENCE, not a candidate to ask what it uses.
-			cfnDetailTypes: ['AWS::Lambda::Function', 'AWS::DynamoDB::Table']
+			cfnDetailTypes: ['AWS::Lambda::Function', 'AWS::DynamoDB::Table'],
+			requestId: 'pedido-42'
 		})
 	);
 
@@ -273,6 +274,12 @@ try {
 
 	check('the account id came from the caller identity', out.accountId === A, out.accountId);
 	check('the scope was read from scan_scope.json', out.scope.vpcIds[0] === 'vpc-0703');
+	// The answer says which request it answers. Without it, the file the PREVIOUS
+	// scan left at this same path is complete, valid, and indistinguishable from
+	// the one being waited for -- which is how a scan still running came to show a
+	// finished list on 2026-08-26.
+	check('the answer carries the id of the request that asked for it',
+		out.requestId === 'pedido-42', String(out.requestId));
 
 	// -------------------------------------------------------------- layer 1a
 	const swept = out.items.filter((i) => i.cfnType);

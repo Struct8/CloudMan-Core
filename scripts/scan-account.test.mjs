@@ -63,6 +63,36 @@ const ANSWERS = {
 			NextToken: ''
 		}
 	],
+	// Two roles. IAM has no region, so both come back from a sweep of ANY region --
+	// and only one of them has anything to do with what is being imported.
+	'cloudcontrol list-resources AWS::IAM::Role': [
+		{
+			ResourceDescriptions: [
+				{ Identifier: 'cost-report-role', Properties: '{}' },
+				{ Identifier: 'nada-a-ver-role', Properties: '{}' }
+			]
+		}
+	],
+	// One candidate read in detail: this is where the function names the role it uses.
+	'cloudcontrol get-resource AWS::Lambda::Function cost-report': [
+		{
+			ResourceDescription: {
+				Identifier: 'cost-report',
+				Properties: '{"FunctionName":"cost-report","Role":"arn:aws:iam::262578989263:role/cost-report-role"}'
+			}
+		}
+	],
+	'cloudcontrol get-resource AWS::Lambda::Function import-lab-processor': [
+		{
+			ResourceDescription: {
+				Identifier: 'import-lab-processor',
+				Properties: '{"FunctionName":"import-lab-processor"}'
+			}
+		}
+	],
+	'cloudcontrol get-resource AWS::DynamoDB::Table import-lab-items': [
+		{ ResourceDescription: { Identifier: 'import-lab-items', Properties: '{"TableName":"import-lab-items"}' } }
+	],
 	'cloudcontrol list-resources AWS::DynamoDB::Table': [
 		{ ResourceDescriptions: [{ Identifier: 'import-lab-items', Properties: '{}' }] }
 	],
@@ -183,8 +213,9 @@ const __PAGE = {};
 function __keyOf(argv) {
 	const base = argv[0] + ' ' + argv[1];
 	const at = (flag) => { const i = argv.indexOf(flag); return i === -1 ? null : argv[i + 1]; };
-	const arg = at('--type-name') ?? at('--bucket');
-	return arg ? base + ' ' + arg : base;
+	const type = at('--type-name');
+	const ident = at('--identifier') ?? at('--bucket');
+	return base + (type ? ' ' + type : '') + (ident ? ' ' + ident : '');
 }
 function execFileSync(_bin, argv) {
 	const key = __keyOf(argv);
@@ -223,10 +254,14 @@ try {
 				'AWS::Lambda::Function',
 				'AWS::DynamoDB::Table',
 				'AWS::S3::Bucket',
+				'AWS::IAM::Role',
 				'AWS::IAM::Policy',
 				'AWS::ApiGateway::Resource',
 				'AWS::Batch::JobQueue'
-			]
+			],
+			// IAM is deliberately NOT here: it is the global type whose members we want
+			// to discover BY REFERENCE, not a candidate to ask what it uses.
+			cfnDetailTypes: ['AWS::Lambda::Function', 'AWS::DynamoDB::Table']
 		})
 	);
 
@@ -302,6 +337,36 @@ try {
 		!!byId('bucket-aqui')
 	);
 
+	// -------------------------------------- layer 1a: which globals belong here
+	//
+	// IAM has no region, so a sweep of one region answers for the whole account.
+	// On a real account that is most of the answer, and it buries the handful the
+	// person is looking for -- measured in mx-central-1 on 2026-08-26: 391 global
+	// rows against 18 that were actually in the region.
+	//
+	// Dropping them is wrong, because the role a function runs as is one of them.
+	// So each candidate is asked what it USES, and what it names gets marked.
+	const roleUsed = out.items.find((i) => i.importId === 'cost-report-role');
+	const roleIdle = out.items.find((i) => i.importId === 'nada-a-ver-role');
+
+	check(
+		'the role the function names is marked as used by it',
+		roleUsed?.referencedBy?.includes('cost-report'),
+		JSON.stringify(roleUsed)
+	);
+	// THE CONTROL, and the whole point: a role nobody named stays unmarked. Marking
+	// everything would satisfy the assertion above just as well.
+	check(
+		'and a role nobody names is left unmarked',
+		!roleIdle?.referencedBy,
+		JSON.stringify(roleIdle)
+	);
+	check(
+		'a candidate that names nothing marks nothing',
+		!out.items.find((i) => i.importId === 'import-lab-processor')?.referencedBy,
+		JSON.stringify(out.items.find((i) => i.importId === 'import-lab-processor'))
+	);
+
 	// -------------------------------------------------------------- layer 1b
 	check('the VPC came, named by its tag', out.items.some((i) => i.tags?.Name === 'EKS-k8hub'));
 	// `i.arn?.` and not `i.arn.`: the swept rows above have no ARN at all, so an
@@ -360,6 +425,14 @@ try {
 
 	// ------------------------------------------------- the flags actually sent
 	const calls = JSON.parse(fs.readFileSync(path.join(dir, 'calls.json'), 'utf-8'));
+	// Only the types Struct8 named are read one by one. Reading every swept row
+	// would be one call per resource in the account -- thousands.
+	check(
+		'only the types asked for were read in detail',
+		calls.some((c) => c.startsWith('cloudcontrol get-resource') && c.includes('AWS::Lambda::Function')) &&
+			!calls.some((c) => c.startsWith('cloudcontrol get-resource') && c.includes('AWS::IAM::Role')),
+		JSON.stringify(calls.filter((c) => c.startsWith('cloudcontrol get-resource')))
+	);
 	// Kept for the second run below, which asserts something about THIS one: the
 	// directory is gone by then.
 	callsFromMainRun = calls;

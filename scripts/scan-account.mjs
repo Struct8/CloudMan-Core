@@ -69,6 +69,10 @@ const tagFilters = allOf('tag').length ? allOf('tag') : (scope.tagFilters ?? [])
 // catalog -- this script deliberately knows no CloudMan type names, so that a
 // resource added to the catalog costs nothing here.
 const cfnTypes = allOf('type').length ? allOf('type') : (scope.cfnTypes ?? []);
+// The subset of those worth reading one by one, to learn what each USES. Struct8
+// sends it because only the catalog knows which types can become a node -- asking
+// every swept row would be one call per resource in the account.
+const cfnDetailTypes = allOf('detail').length ? allOf('detail') : (scope.cfnDetailTypes ?? []);
 
 if (!region) {
 	console.error('scan-account: no region -- not in scan_scope.json, --region or AWS_REGION.');
@@ -261,6 +265,86 @@ const tagsOf = (list) =>
 	if (skipped) {
 		console.error(`scan-account: ${skipped} type(s) have no usable LIST -- expected, not an error.`);
 	}
+}
+
+// ------------------------------ layer 1a-ter: which global resources belong here
+//
+// IAM, CloudFront and Route 53 have no region. A sweep of one region answers for
+// the WHOLE ACCOUNT on those, and on a real account that is nearly the entire
+// answer: measured in mx-central-1 on 2026-08-26, of 409 rows that could become
+// nodes, 391 were global and 18 were actually in the region. The 18 included
+// everything the person was looking for, and they were unfindable in the list.
+//
+// DROPPING THE GLOBALS IS WRONG. The role a function runs as has no region, and
+// importing the function without it leaves the role unmanaged. So instead of
+// guessing, each candidate is asked WHAT IT USES, and the globals it names are
+// marked. A function answers `Role`; that role answers `Policies` and
+// `ManagedPolicyArns`. The chain is the account's own answer, not a match on
+// names -- which would be the same mistake the type mapping already refused.
+//
+// ONLY THE TYPES STRUCT8 ASKS FOR. One call per swept row would be thousands.
+// `cfnDetailTypes` is the subset that can become a node at all, and only the
+// catalog knows which those are, so it travels with the request like the sweep
+// list does.
+if (cfnDetailTypes.length) {
+	const wanted = new Set(cfnDetailTypes);
+	const candidates = items.filter((i) => i.cfnType && wanted.has(i.cfnType));
+
+	/** Every ARN a candidate's own configuration names, and who named it. */
+	const namedBy = new Map();
+	let unread = 0;
+
+	await inParallel(candidates, 8, async (row) => {
+		const answer = await awsAsync(
+			'cloudcontrol',
+			'get-resource',
+			['--type-name', row.cfnType, '--identifier', String(row.importId)],
+			() => {
+				// A resource that cannot be read individually costs its references and
+				// nothing else -- the row itself already came from the listing and stays.
+				unread++;
+				return true;
+			}
+		);
+		// Properties arrive as a JSON STRING inside the answer, not as an object.
+		const properties = answer?.ResourceDescription?.Properties;
+		if (typeof properties !== 'string') return;
+		for (const arn of properties.match(/arn:aws[a-z-]*:[^"\\\s,\]]+/g) ?? []) {
+			if (!namedBy.has(arn)) namedBy.set(arn, new Set());
+			namedBy.get(arn).add(String(row.importId));
+		}
+	});
+
+	// Cloud Control identifies a role by its NAME and a distribution by its id,
+	// while the reference that points at them is a full ARN. So a row is matched
+	// on its identifier, on that identifier being the ARN's tail, or on the two
+	// being equal outright -- whichever the type happens to use.
+	const tail = (value) => String(value).split(/[/:]/).pop();
+	const byIdentifier = new Map();
+	for (const row of items) {
+		if (!row.importId) continue;
+		const id = String(row.importId);
+		if (!byIdentifier.has(id)) byIdentifier.set(id, []);
+		byIdentifier.get(id).push(row);
+	}
+
+	let marked = 0;
+	for (const [arn, users] of namedBy) {
+		const hits = byIdentifier.get(arn) ?? byIdentifier.get(tail(arn)) ?? [];
+		for (const row of hits) {
+			// Itself does not count: a resource whose own ARN appears in its own
+			// configuration would otherwise look like something else needs it.
+			const others = [...users].filter((u) => u !== String(row.importId));
+			if (!others.length) continue;
+			row.referencedBy = [...new Set([...(row.referencedBy ?? []), ...others])].sort();
+			marked++;
+		}
+	}
+
+	console.error(
+		`scan-account: read ${candidates.length - unread} of ${candidates.length} candidate(s) in detail; ` +
+			`${marked} resource(s) are used by one of them.`
+	);
 }
 
 // --------------------------------------- layer 1a-bis: the tagging API, on ask
@@ -460,7 +544,7 @@ fs.writeFileSync(
 			// The type list is echoed as a count, not in full: it is hundreds of
 			// entries, Struct8 already has it, and the number is what tells someone
 			// reading this file whether the sweep was as wide as they meant.
-			scope: { vpcIds, tagFilters, cfnTypeCount: cfnTypes.length },
+			scope: { vpcIds, tagFilters, cfnTypeCount: cfnTypes.length, cfnDetailTypeCount: cfnDetailTypes.length },
 			items,
 			errors
 		},

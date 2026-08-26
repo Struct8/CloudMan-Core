@@ -320,9 +320,31 @@ if (cfnDetailTypes.length) {
 		// Properties arrive as a JSON STRING inside the answer, not as an object.
 		const properties = answer?.ResourceDescription?.Properties;
 		if (typeof properties !== 'string') return;
-		for (const arn of properties.match(/arn:aws[a-z-]*:[^"\\\s,\]]+/g) ?? []) {
-			if (!namedBy.has(arn)) namedBy.set(arn, new Set());
-			namedBy.get(arn).add(String(row.importId));
+		const names = new Set(properties.match(/arn:aws[a-z-]*:[^"\\\s,\]]+/g) ?? []);
+
+		// Not every reference is an ARN. A KMS alias names its key by a bare id
+		// (`TargetKeyId`), and the same holds wherever AWS uses a plain identifier.
+		// So every string VALUE in the answer is offered too, matched whole against
+		// what the sweep found -- values, not a search through the text, because a
+		// substring hit would tie together resources that merely share a prefix.
+		try {
+			const walk = (value) => {
+				if (typeof value === "string") {
+					if (value.length >= 8) names.add(value);
+				} else if (Array.isArray(value)) {
+					value.forEach(walk);
+				} else if (value && typeof value === "object") {
+					Object.values(value).forEach(walk);
+				}
+			};
+			walk(JSON.parse(properties));
+		} catch {
+			// Properties that will not parse still gave up their ARNs above.
+		}
+
+		for (const name of names) {
+			if (!namedBy.has(name)) namedBy.set(name, new Set());
+			namedBy.get(name).add(String(row.importId));
 		}
 	});
 

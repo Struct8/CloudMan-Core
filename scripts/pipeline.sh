@@ -716,6 +716,24 @@ run_terraform_process() {
               echo -e "${YELLOW}⚠️ Warning: the draft has HCL errors and cannot be repaired here (node or the sanitizer is missing).${NC}"
             else
               echo -e "${color}🧹 ${label} Repairing the generated HCL...${NC}"
+
+              # ANTES DA PASSAGEM 1, e a ordem e o ponto todo.
+              #
+              # `aws_lambda_function` exige em configuracao um de `filename`,
+              # `image_uri` ou `s3_bucket`, e a AWS nao responde por nenhum
+              # deles: ela devolve uma URL assinada para baixar o pacote atual,
+              # nunca de onde ele foi enviado. O gerador escreve os tres na
+              # string vazia, a passagem 1 limpa os tres por estarem vazios, e
+              # dai em diante nao ha mais o que completar -- so o provider
+              # dizendo que falta um, sobre uma funcao que esta rodando.
+              #
+              # Medido em 2026-08-26 numa conta de cinco recursos: o plano
+              # fechou em `3 to import` e a funcao foi uma das duas de fora.
+              COMPLETER="$ENGINE_PATH/scripts/complete-lambda-source.mjs"
+              if [ -f "$COMPLETER" ]; then
+                node "$COMPLETER" generated_resources.tf || true
+              fi
+
               node "$SANITIZER" generated_resources.tf || true
 
               # O LAÇO RODA EM `terraform validate`, NÃO EM `plan`.

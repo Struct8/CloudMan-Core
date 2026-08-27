@@ -124,6 +124,8 @@ jobs:
           if [ -z "$MANIFEST_PATH" ]; then
             echo "⚠️ No manifest found. Assuming the default flow (false)."
             echo "needs_private_access=false" >> $GITHUB_OUTPUT
+            # Sem manifesto nao ha o que pular: 'apply' mantem TODOS os passos.
+            echo "action=apply" >> $GITHUB_OUTPUT
             echo "engine_ref=$ENGINE_REF_DEFAULT" >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -131,6 +133,7 @@ jobs:
           if [ ! -s "$MANIFEST_PATH" ]; then
              echo "⚠️ manifest.json exists but is empty."
              echo "needs_private_access=false" >> $GITHUB_OUTPUT
+             echo "action=apply" >> $GITHUB_OUTPUT
              echo "engine_ref=$ENGINE_REF_DEFAULT" >> $GITHUB_OUTPUT
              exit 0
           fi
@@ -201,6 +204,16 @@ jobs:
           # SALVANDO NA MEMÓRIA PARA O RESTO DO PIPELINE
           echo "needs_private_access=$NEEDS_ACCESS" >> $GITHUB_OUTPUT
           echo "manifest_path=$MANIFEST_PATH" >> $GITHUB_OUTPUT
+
+          # QUAL OPERACAO ESTE RUN E.
+          #
+          # So 'traffic' muda alguma coisa: ele move o percentual blue/green por
+          # uma chamada de API e nao encosta em Terraform -- nem init, nem state,
+          # nem plano. Os passos abaixo que existem so para o Terraform sao
+          # pulados por ela. Qualquer outro valor mantem o run inteiro.
+          MANIFEST_ACTION=$(jq -r '.action // "apply"' "$MANIFEST_PATH")
+          echo "⚡ Manifest action: $MANIFEST_ACTION"
+          echo "action=$MANIFEST_ACTION" >> $GITHUB_OUTPUT
           echo "engine_ref=$ENGINE_REF" >> $GITHUB_OUTPUT
 
       # THE ONE STEP THAT CANNOT BECOME A SCRIPT
@@ -356,6 +369,8 @@ jobs:
           token: ${{ steps.gatekeeper.outputs.token || secrets.GITHUB_TOKEN }}
 
       - name: 🛠️ Setup Terraform
+        # Um run de traffic nao chama terraform nenhuma vez.
+        if: steps.manifest_check.outputs.action != 'traffic'
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.5.7"  # Adicione esta linha
@@ -398,7 +413,9 @@ jobs:
       # compression-level: 0 because the scripts already compress what they
       # stage; deflating it again would spend CPU to shrink nothing.
       - name: 📤 Publish Engine Output
-        if: always()
+        # Nao ha plano nem resultado de apply para publicar: o que este run
+        # produz e uma escrita na nuvem, e ela ja aparece no log.
+        if: always() && steps.manifest_check.outputs.action != 'traffic'
         uses: actions/upload-artifact@v4
         with:
           name: engine-output
@@ -432,7 +449,9 @@ jobs:
 
           MANIFEST_PATH="${{ steps.manifest_check.outputs.manifest_path }}" bash .struct8-engine/scripts/release-locks.sh
       - name: 💾 Push / Cleanup GitOps State
-        if: success()
+        # Traffic nao gera state, nao toma lock e nao escreve arquivo nenhum no
+        # repositorio -- nao ha o que devolver.
+        if: success() && steps.manifest_check.outputs.action != 'traffic'
         shell: bash
         run: |
           bash .struct8-engine/scripts/publish-gitops.sh

@@ -1140,6 +1140,13 @@ if [ -z "$MANIFEST_PATH" ] || [ ! -f "$MANIFEST_PATH" ]; then
   exit 1
 fi
 
+# QUANTO CADA TRECHO LEVOU, em segundos desde o inicio do script.
+#
+# Existe porque a conta do tempo de um run so podia ser feita por deducao: dois
+# `echo` adjacentes apareciam no log com 6 segundos entre eles, e nada dizia o
+# que havia no meio. Uma linha por marco resolve, e custa nada.
+_mark() { echo "⏱️  +${SECONDS}s  $1"; }
+
 ACTION=$(jq -r '.action // "apply"' "$MANIFEST_PATH")
 
 # Exporta para ser visível dentro do subshell do terraform init
@@ -1156,11 +1163,26 @@ export CLOUDMAN_TRIGGERED_BY=$(jq -r '.triggered_by // empty' "$MANIFEST_PATH")
 
 echo "⚡ Global action: $ACTION"
 echo "👤 Triggered by: ${CLOUDMAN_TRIGGERED_BY:-(no field in the manifest -- falling back to $GITHUB_ACTOR)}"
-echo "🔑 Setting up the backend profile..."
+# O PERFIL DO BACKEND SO SERVE AO TERRAFORM.
+#
+# Ele existe para o `terraform init -backend-config="profile=backend"` alcancar o
+# bucket de state. Um run de `traffic` nao roda init, nao le nem grava state:
+# assumir o papel por OIDC + STS custa segundos de relogio e da acesso a conta do
+# state numa operacao que nao precisa dela.
+#
+# Vale so para o manifesto INTEIRO de traffic. Um selo viajando dentro de um
+# destroy cai no `else`, porque os states daquele manifesto vao inicializar.
+if [ "$ACTION" == "traffic" ]; then
+    echo "⏭️  Backend profile skipped: traffic does not touch Terraform state."
+else
+    echo "🔑 Setting up the backend profile..."
+    _mark "antes do auth do backend"
 
-# Cria o profile [backend] em ~/.aws/credentials
-auth_aws "{\"role_arn\": \"$BACKEND_ROLE\", \"region\": \"$BACKEND_REGION\"}" "backend"
-debug_auth_status "BACKEND PROFILE CRIADO"
+    # Cria o profile [backend] em ~/.aws/credentials
+    auth_aws "{\"role_arn\": \"$BACKEND_ROLE\", \"region\": \"$BACKEND_REGION\"}" "backend"
+    debug_auth_status "BACKEND PROFILE CRIADO"
+    _mark "depois do auth do backend"
+fi
 
 # ---------------------------------------------------------
 # DEPENDÊNCIAS EXTERNAS
@@ -1644,6 +1666,8 @@ if [ "$SCHEDULE_MODE" == "dependency" ]; then
 fi
 
 TOTAL_STAGES=$(jq '.pipeline_stages | length' "$MANIFEST_PATH")
+
+_mark "comecando as etapas"
 
 for (( i=0; i<$TOTAL_STAGES; i++ )); do
     STAGE_NAME=$(jq -r ".pipeline_stages[$i].stage_name" "$MANIFEST_PATH")

@@ -262,6 +262,151 @@ publish_plan_failure() {
 }
 
 # ==============================================================================
+# DIVISÃO BLUE/GREEN
+#
+# O canvas move o percentual entre as duas versões, e quem guarda esse número é
+# um recurso da conta do CLIENTE: um parâmetro na AWS, um par chave/valor na
+# Cloudflare. A escrita acontece AQUI, e não numa chamada direta do navegador,
+# por uma razão só: as credenciais do cliente já estão neste runner, resolvidas
+# para esta conta. Qualquer outro caminho precisaria de um segredo novo, por
+# provedor, guardado e rotacionado em algum lugar.
+#
+# NÃO É TERRAFORM, de propósito. O recurso é criado pelo apply, com `value` em
+# `ignore_changes`; o que passa por aqui é só o movimento do valor. Um apply por
+# clique de percentual levaria minutos e gravaria cada ajuste no repositório.
+#
+# A FUSÃO ACONTECE AQUI E EM MAIS LUGAR NENHUM
+#
+# O documento guarda TODOS os estágios (`{"alpha": {...}, "beta": {...}}`), e
+# gravar só o que mudou apagaria os outros -- um ajuste no alpha levaria junto a
+# divisão do beta, calado, porque o documento resultante continua válido. Fundir
+# exige o valor de HOJE, que só este runner lê: outro operador pode ter mexido
+# desde que a aba do canvas abriu. Por isso o canvas manda só a parte dele.
+# ==============================================================================
+
+# Documento atual do estágio, já com a parte nova no lugar.
+# Documento ausente, vazio ou ilegível vira documento novo: é a primeira escrita
+# depois do apply que criou a chave, e recusar aqui travaria o primeiro canary de
+# todo cliente.
+_traffic_merge() {
+    local current=$1 stage=$2 split=$3
+
+    if [ -z "$current" ] || ! echo "$current" | jq empty >/dev/null 2>&1; then
+        current="{}"
+    fi
+
+    echo "$current" | jq -c --arg stage "$stage" --argjson split "$split" '.[$stage] = $split'
+}
+
+_traffic_write_aws() {
+    local document=$1 stage=$2 split=$3 address=$4 label=$5
+
+    local region
+    region=$(echo "$address" | jq -r '.region // empty')
+    [ -z "$region" ] && region="${AWS_REGION:-us-east-1}"
+
+    local current existed=1
+    current=$(aws ssm get-parameter --name "$document" --with-decryption --region "$region" \
+                  --query 'Parameter.Value' --output text 2>/dev/null) || existed=0
+
+    local merged
+    merged=$(_traffic_merge "$current" "$stage" "$split") || return 1
+
+    # `--type` só na criação. Num parâmetro que já existe, declarar o tipo
+    # converteria um SecureString em String sem ninguém pedir -- e quem decide
+    # isso é o cliente no diagrama, não este script.
+    if [ "$existed" -eq 1 ]; then
+        aws ssm put-parameter --name "$document" --overwrite \
+            --value "$merged" --region "$region" >/dev/null || return 1
+    else
+        echo "ℹ️  ${label} traffic: parameter '$document' not found, creating it."
+        aws ssm put-parameter --name "$document" --type String \
+            --value "$merged" --region "$region" >/dev/null || return 1
+    fi
+}
+
+_traffic_write_cloudflare() {
+    local document=$1 stage=$2 split=$3 address=$4 label=$5
+
+    local account_id namespace_id
+    account_id=$(echo "$address" | jq -r '.account_id // empty')
+    namespace_id=$(echo "$address" | jq -r '.namespace_id // empty')
+
+    if [ -z "$account_id" ] || [ -z "$namespace_id" ]; then
+        echo "❌ ${label} traffic: the manifest carries no account_id/namespace_id for the KV pair."
+        return 1
+    fi
+    if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+        echo "❌ ${label} traffic: CLOUDFLARE_API_TOKEN is not set for this state."
+        return 1
+    fi
+
+    local api="https://api.cloudflare.com/client/v4/accounts/${account_id}/storage/kv/namespaces/${namespace_id}/values/${document}"
+
+    # 404 na chave é o caso normal da primeira escrita, e o corpo devolvido não é
+    # o valor -- `_traffic_merge` trata isso como documento novo.
+    local current
+    current=$(curl -sS -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" "$api" 2>/dev/null) || current=""
+
+    local merged
+    merged=$(_traffic_merge "$current" "$stage" "$split") || return 1
+
+    # Por arquivo, e não `-F "value=$merged"`: o valor é JSON e leva chaves,
+    # aspas e vírgulas que o parser de formulário do curl interpreta.
+    local body_file
+    body_file=$(mktemp)
+    printf '%s' "$merged" > "$body_file"
+
+    local response rc=0
+    response=$(curl -sS -X PUT -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+                    -F "value=<${body_file}" -F 'metadata={}' "$api" 2>&1) || rc=$?
+    rm -f "$body_file"
+
+    if [ $rc -ne 0 ]; then
+        echo "❌ ${label} traffic: the call to the Cloudflare API failed."
+        echo "$response"
+        return 1
+    fi
+
+    # A API responde 200 com `"success": false` no corpo -- conferir só o código
+    # de saída do curl deixaria passar token sem permissão e namespace errado.
+    if [ "$(echo "$response" | jq -r '.success // false' 2>/dev/null)" != "true" ]; then
+        echo "❌ ${label} traffic: Cloudflare refused the write."
+        echo "$response"
+        return 1
+    fi
+}
+
+# Roteia por provedor. Provedor sem escrita nomeada FALHA ALTO: seguir calado
+# devolveria sucesso para uma mudança de tráfego que não aconteceu, e o canvas
+# passaria a mostrar um percentual que a nuvem não tem.
+apply_traffic_split() {
+    local traffic_json=$1 provider=$2 label=$3
+
+    local document stage split address
+    document=$(echo "$traffic_json" | jq -r '.document // empty')
+    stage=$(echo "$traffic_json" | jq -r '.stage // empty')
+    split=$(echo "$traffic_json" | jq -c '.split // empty')
+    address=$(echo "$traffic_json" | jq -c '.address // {}')
+
+    if [ -z "$document" ] || [ -z "$stage" ] || [ -z "$split" ]; then
+        echo "❌ ${label} traffic: the manifest entry has no document, stage or split."
+        return 1
+    fi
+
+    echo "🎛️  ${label} traffic: stage '${stage}' -> ${split}"
+
+    case "$provider" in
+        aws)        _traffic_write_aws "$document" "$stage" "$split" "$address" "$label" ;;
+        cloudflare) _traffic_write_cloudflare "$document" "$stage" "$split" "$address" "$label" ;;
+        *)
+            echo "❌ ${label} traffic: provider '$provider' has no traffic store writer in this engine."
+            return 1
+            ;;
+    esac
+}
+
+# ==============================================================================
 # FUNÇÃO PRINCIPAL: Execução do Terraform
 # ==============================================================================
 run_terraform_process() {
@@ -278,6 +423,9 @@ run_terraform_process() {
     # Default "[]" mantém compatível com manifesto antigo, que não traz
     # o campo -- o laço abaixo simplesmente não itera.
     local additional_auth=${5:-[]}
+    # A divisão blue/green a gravar, quando `action` é `traffic`. Vazio nas
+    # outras ações, que nem chegam a olhar.
+    local traffic_json=${6:-}
     local label="[$path]"
 
     local color=$BLUE
@@ -351,6 +499,15 @@ run_terraform_process() {
             # to initialise. It also neither reads nor writes state, which is
             # what makes it the one action here that does not need the backend.
             echo -e "${color}⏭️  ${label} Scan: no Terraform in this folder, skipping init.${NC}"
+        elif [ "$action" == "traffic" ]; then
+            # Same reason as scan, from the other side: the folder DOES hold
+            # Terraform, but moving the traffic split does not go through it.
+            # The resource was created by an earlier apply with `value` in
+            # `ignore_changes`, and what runs here is a single API call. An init
+            # would download providers and take the state lock for nothing --
+            # and taking the lock would make a percentage tweak collide with a
+            # deploy running next door.
+            echo -e "${color}⏭️  ${label} Traffic: not a Terraform operation, skipping init.${NC}"
         else
             _stream_cmd terraform init -reconfigure -input=false \
                 -backend-config="profile=backend" \
@@ -504,6 +661,22 @@ run_terraform_process() {
             if [ "$provider" != "cloudflare" ]; then
                  echo "⚠️  Warning: no authentication script found for '$provider'."
             fi
+        fi
+
+        # ---------------------------------------------------------
+        # DIVISÃO BLUE/GREEN: sai antes do Terraform
+        # ---------------------------------------------------------
+        # Aqui em cima porque tudo abaixo é Terraform, e isto não é. As
+        # credenciais do cliente já estão no ambiente -- é esse o único motivo
+        # de a escrita acontecer no runner e não no navegador.
+        if [ "$action" == "traffic" ]; then
+            if [ -z "$traffic_json" ]; then
+                echo "❌ ${label} traffic: the state carries no traffic block in the manifest."
+                exit 1
+            fi
+            apply_traffic_split "$traffic_json" "$provider" "$label" || exit 1
+            echo -e "${GREEN}✅ ${label} Traffic split written.${NC}"
+            exit 0
         fi
 
         # ---------------------------------------------------------
@@ -937,7 +1110,11 @@ run_terraform_process() {
           # nothing in this chain, and the run finished GREEN having done
           # nothing at all. The app was then left waiting for a file that was
           # never going to arrive, with no failure anywhere to point at.
-          echo -e "${RED}❌ Unknown action '$action'. This engine serves: plan, drift, apply, destroy, import, read, scan.${NC}"
+          # `traffic` is in the list even though it never reaches here: it exits
+          # further up, before Terraform. The list says what this engine serves,
+          # and leaving it out would tell a client running an older engine that
+          # the name is wrong, when what is wrong is the engine version.
+          echo -e "${RED}❌ Unknown action '$action'. This engine serves: plan, drift, apply, destroy, import, read, scan, traffic.${NC}"
           exit 1
         fi
     )
@@ -1270,6 +1447,8 @@ SCH_PATH=()
 SCH_PROVIDER=()
 SCH_TARGET_AUTH=()
 SCH_ADD_AUTH=()
+SCH_ACTION=()
+SCH_TRAFFIC=()
 SCH_DEPS=()
 SCH_STATUS=()
 SCH_PID=()
@@ -1347,6 +1526,12 @@ run_dependency_schedule() {
         SCH_PROVIDER+=("$(echo "$state" | jq -r '.provider')")
         SCH_TARGET_AUTH+=("$(echo "$state" | jq -c '.target_auth')")
         SCH_ADD_AUTH+=("$(echo "$state" | jq -c '.additional_auth // []')")
+        # A ação do state e o que ela precisa. Sem estas duas colunas um state
+        # de tráfego seria lançado com a ação GLOBAL -- e num manifesto de
+        # destroy isso é `terraform destroy` na pasta da loja de configuração,
+        # em vez de uma escrita nela.
+        SCH_ACTION+=("$(echo "$state" | jq -r '.action // empty')")
+        SCH_TRAFFIC+=("$(echo "$state" | jq -c '.traffic // empty')")
         SCH_DEPS+=("$(echo "$state" | jq -r '(.depends_on // [])[]')")
         SCH_STATUS+=("pending")
         SCH_PID+=("")
@@ -1399,8 +1584,9 @@ run_dependency_schedule() {
                     # morreria no terraform que falhou, sem gravar o arquivo, e o
                     # laco ficaria esperando um state que ja acabou.
                     set +e
-                    run_terraform_process "$path" "$ACTION" \
-                        "${SCH_TARGET_AUTH[$k]}" "${SCH_PROVIDER[$k]}" "${SCH_ADD_AUTH[$k]}"
+                    run_terraform_process "$path" "${SCH_ACTION[$k]:-$ACTION}" \
+                        "${SCH_TARGET_AUTH[$k]}" "${SCH_PROVIDER[$k]}" "${SCH_ADD_AUTH[$k]}" \
+                        "${SCH_TRAFFIC[$k]}"
                     echo "$?" > "$SCH_DONE_DIR/$k"
                 ) &
                 SCH_PID[$k]=$!
@@ -1498,6 +1684,24 @@ for (( i=0; i<$TOTAL_STAGES; i++ )); do
         # `// []` cobre o manifesto antigo, que não traz o campo.
         additional_auth=$(echo "$state" | jq -c '.additional_auth // []')
 
+        # AÇÃO DESTE STATE, quando ela difere da global.
+        #
+        # Existe para o selo de tráfego poder viajar no MESMO manifesto do
+        # destroy que ele protege. Selar é fixar o tráfego na versão que fica,
+        # antes de destruir a outra; em dois manifestos separados o canvas teria
+        # de esperar o primeiro run terminar para disparar o segundo, e uma aba
+        # fechada no meio deixaria o tráfego selado e o destroy nunca pedido.
+        #
+        # Aqui a ordem sai de graça: o engine já percorre `pipeline_stages` em
+        # ordem, então o selo é a primeira entrada e o destroy vem depois. E a
+        # falha cai do lado seguro -- selo que não grava aborta o run antes de
+        # qualquer destroy.
+        #
+        # Ausente = a ação global, que é o manifesto de sempre.
+        state_action=$(echo "$state" | jq -r '.action // empty')
+        [ -z "$state_action" ] && state_action="$ACTION"
+        traffic=$(echo "$state" | jq -c '.traffic // empty')
+
         if [ ! -d "$path" ]; then
              echo "⚠️  Directory $path does not exist. Skipping."
              continue
@@ -1513,7 +1717,7 @@ for (( i=0; i<$TOTAL_STAGES; i++ )); do
             # outcome to the wrong state would clear the badge of a resource that
             # is still being created.
             report_state_progress "$path" "running" "$STATE_INDEX" "$STATE_TOTAL"
-            run_terraform_process "$path" "$ACTION" "$target_auth" "$provider" "$additional_auth" &
+            run_terraform_process "$path" "$state_action" "$target_auth" "$provider" "$additional_auth" "$traffic" &
             PAR_PIDS+=("$!")
             PAR_PATHS+=("$path")
             PAR_IDX+=("$STATE_INDEX")
@@ -1527,7 +1731,7 @@ for (( i=0; i<$TOTAL_STAGES; i++ )); do
             fi
         else
             report_state_progress "$path" "running" "$STATE_INDEX" "$STATE_TOTAL"
-            run_terraform_process "$path" "$ACTION" "$target_auth" "$provider" "$additional_auth"
+            run_terraform_process "$path" "$state_action" "$target_auth" "$provider" "$additional_auth" "$traffic"
             if [ $? -ne 0 ]; then
                 report_state_progress "$path" "failed" "$STATE_INDEX" "$STATE_TOTAL"
                 failed=1

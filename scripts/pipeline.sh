@@ -744,25 +744,39 @@ run_terraform_process() {
               #    -- seria republicar o estado completo, que é justamente o que
               #    esta defesa corta. O que caberia é projetar dali só esses
               #    recursos de regra.
-              # 2. Toda folha marcada como sensível vira "__REDACTED__", em
-              #    before e after, incluindo dentro de bloco aninhado e lista.
+              # 2. Toda folha marcada como sensível é trocada por um marcador,
+              #    em before e after, incluindo dentro de bloco aninhado e lista.
+              #    QUAL marcador sai depende de comparar os dois lados, e é o que
+              #    preserva o sinal de mudança sem revelar valor nenhum:
               #
-              # LIMITE 1 (alcance): isto cobre o que o PROVIDER marcou como
+              #      __REDACTED_SAME__      os dois lados eram iguais
+              #      __REDACTED_BEFORE__ /  divergem, e cada lado leva o seu, para
+              #      __REDACTED_AFTER__     que a diferença apareça como diferença
+              #
+              # LIMITE (alcance): isto cobre o que o PROVIDER marcou como
               # sensível. Segredo guardado num campo comum (ex.: senha colada num
               # user_data) não é sinalizado por ninguém e passa. Nenhuma redação
               # genérica resolve isso -- quem escreve segredo em campo comum
               # precisa de sensitive/Secrets Manager.
               #
-              # LIMITE 2 (fidelidade): os dois lados recebem o MESMO marcador,
-              # então uma mudança que acontece só dentro de campo sensível fica
-              # indistinguível de "não mudou" para quem lê o arquivo depois --
-              # uma troca de senha não aparece como alteração. Preservar esse
-              # sinal exigiria percorrer before/after em paralelo e marcar os
-              # lados de forma diferente quando divergem. Fica em aberto de
-              # propósito: hoje o diagrama só desenha o badge por recurso e não
-              # renderiza diferença campo-a-campo, então nada é perdido na tela.
-              # Quem for exibir campo-a-campo precisa resolver isto ANTES, senão
-              # a tela afirma "sem alteração" sobre algo que não sabe.
+              # POR QUE TRÊS MARCADORES E NÃO UM. Até 2026-08-28 os dois lados
+              # recebiam o MESMO "__REDACTED__", e uma troca de senha ficava
+              # indistinguível de "não mudou" para quem lesse o arquivo depois.
+              # Isso passava enquanto o diagrama só desenhava o selo por recurso.
+              # Quando a recusa de adoção passou a listar campo a campo, virou uma
+              # linha afirmando "(sem valor) → (sem valor)" sobre um parâmetro SSM
+              # que tinha valor -- e, pior, toda adoção com recurso de campo
+              # sensível era recusada, porque o leitor não tinha como distinguir
+              # "não mudou" de "não dá para saber".
+              #
+              # O ARQUIVO ANTIGO CONTINUA LEGÍVEL, e é por isso que o caso "iguais"
+              # ganhou nome novo em vez de manter o "__REDACTED__" de antes: o
+              # leitor casa por PREFIXO (`/^__REDACTED/` em planExplainer.ts), e o
+              # marcador antigo dos dois lados continua significando "este arquivo
+              # não responde se mudou" -- leitura conservadora, e a certa para um
+              # plano gravado antes desta mudança. Um leitor ANTIGO diante de um
+              # arquivo novo também erra para o lado seguro: vê dois marcadores
+              # iguais e diz que não sabe.
               # ---------------------------------------------------------------
               #
               # WHY IT IS PUBLISHED COMPRESSED
@@ -782,20 +796,33 @@ run_terraform_process() {
               # which exists to never publish unredacted values -- would never
               # fire. Keeping them as separate commands keeps jq's status.
               if jq -e '
-                def redact($val; $sens):
-                  if $sens == true then "__REDACTED__"
+                def redact($val; $twin; $sens; $side):
+                  if $sens == true then
+                    (if $val == $twin then "__REDACTED_SAME__"
+                     elif $side == "before" then "__REDACTED_BEFORE__"
+                     else "__REDACTED_AFTER__"
+                     end)
                   elif ($sens | type) == "object" and ($val | type) == "object" then
                     reduce ($val | keys_unsorted[]) as $k
-                      ({}; .[$k] = redact($val[$k]; ($sens[$k] // false)))
+                      ({}; .[$k] = redact(
+                             $val[$k];
+                             (if ($twin | type) == "object" then $twin[$k] else null end);
+                             ($sens[$k] // false);
+                             $side))
                   elif ($sens | type) == "array" and ($val | type) == "array" then
                     [ range(0; $val | length) as $i
-                      | redact($val[$i]; (($sens[$i]) // false)) ]
+                      | redact(
+                          $val[$i];
+                          (if ($twin | type) == "array" then $twin[$i] else null end);
+                          (($sens[$i]) // false);
+                          $side) ]
                   else $val
                   end;
 
                 def redact_change:
-                  .before = redact(.before; (.before_sensitive // false))
-                  | .after = redact(.after; (.after_sensitive // false));
+                  . as $c
+                  | .before = redact($c.before; $c.after;  ($c.before_sensitive // false); "before")
+                  | .after  = redact($c.after;  $c.before; ($c.after_sensitive  // false); "after");
 
                 {
                   format_version:    .format_version,

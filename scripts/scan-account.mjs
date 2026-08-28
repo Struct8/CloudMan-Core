@@ -648,6 +648,57 @@ for (const group of aws('ec2', 'describe-security-groups', vpcFilter)?.SecurityG
 	});
 }
 
+// ------------------------------- layer 2, off the VPC: the targets of a rule
+//
+// An EventBridge target is what connects a rule to the Lambda, queue or topic it
+// invokes, and AWS publishes no object for it: it is a row inside the rule,
+// reachable only through `list-targets-by-rule`. The sweep cannot find it --
+// there is no ARN to list -- so without this block the rule arrives on the
+// diagram with nothing attached to it, which is how it looked after the scan of
+// mx-central-1 on 2026-08-28: correct in the account, alone on the canvas.
+//
+// THE ID CARRIES THE BUS EXACTLY WHEN THE ARN DOES. A rule's own ARN is
+// `rule/<name>` on the default bus and `rule/<bus>/<name>` on any other, and the
+// provider splits a target's id the same way -- two segments mean the default
+// bus, three name one. Composing it by the same rule keeps this answer identical
+// to the one Struct8 composes from the configuration when it adopts (see
+// `COMPOSERS` in core/configImports.ts), so the two paths never disagree about
+// the same target.
+//
+// ASKED ONLY WHEN THE RULE ITSELF WAS ASKED FOR. The target follows its parent's
+// scope: with `AWS::Events::Rule` absent from the sweep no rule reaches the
+// diagram, so a target would name a rule that is not there -- and the calls
+// below would be spent to produce it.
+if (cfnTypes.includes('AWS::Events::Rule')) {
+	for (const bus of aws('events', 'list-event-buses')?.EventBuses ?? []) {
+		if (!bus.Name) continue;
+		const rules = aws('events', 'list-rules', ['--event-bus-name', bus.Name])?.Rules ?? [];
+		for (const rule of rules) {
+			if (!rule.Name) continue;
+			const scopedRule = bus.Name === 'default' ? rule.Name : `${bus.Name}/${rule.Name}`;
+			const targets =
+				aws('events', 'list-targets-by-rule', [
+					'--rule',
+					rule.Name,
+					'--event-bus-name',
+					bus.Name
+				])?.Targets ?? [];
+			for (const target of targets) {
+				// The id is what Terraform imports by, and AWS composes one when the
+				// caller does not supply it. A target without one cannot be named, so
+				// it is left out rather than given an id that points at nothing.
+				if (!target.Id) continue;
+				items.push({
+					arn: '',
+					terraformTypeHint: 'aws_cloudwatch_event_target',
+					importId: `${scopedRule}/${target.Id}`,
+					nameHint: `${rule.Name}_${target.Id}`
+				});
+			}
+		}
+	}
+}
+
 const caller = aws('sts', 'get-caller-identity');
 
 fs.writeFileSync(

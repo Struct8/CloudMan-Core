@@ -204,6 +204,34 @@ const ANSWERS = {
 	],
 	// The one the credentials cannot read.
 	'ec2 describe-security-groups': 'THROWS',
+
+	// ------------------------------ layer 2, off the VPC: EventBridge targets
+	//
+	// Two buses, because the id carries the bus only when the bus is not the
+	// default one and one bus alone cannot show that. The rules themselves come
+	// from the sweep above; what is expanded here is only what lives inside them.
+	'cloudcontrol list-resources AWS::Events::Rule': [
+		{ ResourceDescriptions: [{ Identifier: 'import-lab3-daily', Properties: '{}' }] }
+	],
+	'events list-event-buses': [
+		{ EventBuses: [{ Name: 'default' }, { Name: 'barramento-de-pedidos' }] }
+	],
+	'events list-rules default': [{ Rules: [{ Name: 'import-lab3-daily' }] }],
+	'events list-rules barramento-de-pedidos': [{ Rules: [{ Name: 'pedido-criado' }] }],
+	'events list-targets-by-rule default import-lab3-daily': [
+		{
+			Targets: [
+				{ Id: 'ingest-lambda', Arn: `arn:aws:lambda:${R}:${A}:function:import-lab3-ingest` },
+				// No `Id`: nothing can name it, so it must be left out rather than
+				// given an id that points at nothing.
+				{ Arn: `arn:aws:sqs:${R}:${A}:orders` }
+			]
+		}
+	],
+	'events list-targets-by-rule barramento-de-pedidos pedido-criado': [
+		{ Targets: [{ Id: 'notifica', Arn: `arn:aws:sns:${R}:${A}:pedidos` }] }
+	],
+
 	'sts get-caller-identity': [{ Account: A }]
 };
 
@@ -230,7 +258,13 @@ function __keyOf(argv) {
 	const at = (flag) => { const i = argv.indexOf(flag); return i === -1 ? null : argv[i + 1]; };
 	const type = at('--type-name');
 	const ident = at('--identifier') ?? at('--bucket');
-	return base + (type ? ' ' + type : '') + (ident ? ' ' + ident : '');
+	// The rule and the bus for the same reason: EventBridge is asked once per bus
+	// and once per rule, and a key that ignored them would answer the second rule
+	// with the first one's targets.
+	const bus = at('--event-bus-name');
+	const rule = at('--rule');
+	return base + (type ? ' ' + type : '') + (ident ? ' ' + ident : '') +
+		(bus ? ' ' + bus : '') + (rule ? ' ' + rule : '');
 }
 function execFileSync(_bin, argv) {
 	const key = __keyOf(argv);
@@ -268,7 +302,10 @@ try {
 			vpcIds: ['vpc-0703'],
 			tagFilters: [],
 			// Six types: three that answer, two that refuse for reasons that are
-			// normal, one that refuses for a reason that is not.
+			// normal, one that refuses for a reason that is not. `AWS::Events::Rule`
+			// is the seventh, and it is here for a different job: it is what opens
+			// the target expansion below, which is asked only when the rule itself
+			// was asked for.
 			cfnTypes: [
 				'AWS::Lambda::Function',
 				'AWS::DynamoDB::Table',
@@ -276,6 +313,7 @@ try {
 				'AWS::IAM::Role',
 				'AWS::IAM::Policy',
 				'AWS::ApiGateway::Resource',
+				'AWS::Events::Rule',
 				'AWS::Batch::JobQueue'
 			],
 			// IAM is deliberately NOT here: it is the global type whose members we want
@@ -476,6 +514,36 @@ try {
 		hints.filter((i) => i.terraformTypeHint === 'aws_network_acl_rule').length === 1
 	);
 
+	// ------------------------------------------- the targets of an EventBridge rule
+	const alvos = hints.filter((i) => i.terraformTypeHint === 'aws_cloudwatch_event_target');
+	check(
+		'the targets were expanded out of the rules, one per bus',
+		alvos.length === 2,
+		JSON.stringify(alvos)
+	);
+	// Two segments on the default bus, three on any other -- the same shape the
+	// rule's own ARN has, and the same one Struct8 composes when it adopts.
+	check(
+		'a target on the default bus is <rule>/<target id>',
+		alvos.find((a) => a.importId === 'import-lab3-daily/ingest-lambda') !== undefined,
+		JSON.stringify(alvos.map((a) => a.importId))
+	);
+	check(
+		'and on any other bus the bus comes first',
+		alvos.find((a) => a.importId === 'barramento-de-pedidos/pedido-criado/notifica') !== undefined,
+		JSON.stringify(alvos.map((a) => a.importId))
+	);
+	check(
+		'a target with no id of its own was left out, not given one',
+		!alvos.some((a) => a.importId.endsWith('/undefined') || a.importId.endsWith('/')),
+		JSON.stringify(alvos.map((a) => a.importId))
+	);
+	check(
+		'the name hint names the rule and the target, not the bus',
+		alvos.find((a) => a.nameHint === 'import-lab3-daily_ingest-lambda') !== undefined,
+		JSON.stringify(alvos.map((a) => a.nameHint))
+	);
+
 	// ----------------------------------------------------------- the failure
 	check(
 		'the service that refused is reported, not swallowed',
@@ -616,6 +684,16 @@ try {
 		'an empty type list is reported, so a silent half-scan is impossible',
 		out2.errors.some((e) => /No type list to sweep/.test(e.message)),
 		JSON.stringify(out2.errors)
+	);
+	// THE TARGET FOLLOWS ITS PARENT'S SCOPE. This run asks for no type at all, so
+	// no rule reaches the diagram -- and a target expanded here would name a rule
+	// that is not there. The calls must not happen either: `ANSWERS_TAG` holds no
+	// answer for them, so an ungated block would show up as recorded errors rather
+	// than as a crash, which is the quiet way this would rot.
+	check(
+		'with no rule in the sweep, EventBridge is never asked',
+		!calls2.some((c) => c.startsWith('events ')),
+		JSON.stringify(calls2.filter((c) => c.startsWith('events ')))
 	);
 } finally {
 	fs.rmSync(dir2, { recursive: true, force: true });

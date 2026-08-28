@@ -60,6 +60,33 @@ push_with_retry() {
     done
 }
 
+# Writes a .gz next to every file matching a name, keeping the original.
+#
+# WHY. GitHub's contents endpoint returns a file inline only up to 1 MB. Above
+# that it answers 200 -- success -- with an EMPTY body and `encoding: "none"`.
+# There is no error for Struct8 to catch: the empty answer is indistinguishable
+# from the one it gets while a file is not written yet, so a run that finished in
+# 76 seconds left the panel polling until it timed out twenty minutes later.
+#
+# Measured on 2026-08-28, on a read of 308 resources: 1,987,108 bytes, refused;
+# the scan inventory alongside it, 494,837 bytes, returned whole. That content
+# gzips to 141,690 -- 14x -- which moves the ceiling from roughly 162 resources
+# to roughly 2,300.
+#
+# BOTH NAMES ARE COMMITTED, on purpose and for now. Struct8 asks for the
+# compressed name and the file reader falls back to the plain one, so a browser
+# running an older build keeps working while builds catch up. Dropping the
+# uncompressed file is a separate step, once none of them asks for it.
+#
+# -print0/-d '' so a path with a space or a newline in it survives; `-o` after
+# the prune so .git is skipped instead of walked.
+compress_alongside() {
+  local nome="$1" f
+  while IFS= read -r -d '' f; do
+    gzip -c "$f" > "$f.gz"
+  done < <(find . -path ./.git -prune -o -name "$nome" -type f -print0)
+}
+
 # 1. LÓGICA DO PASSO 2 (GERAÇÃO DE IMPORT)
 if [ -f "$GITHUB_WORKSPACE/.needs_commit" ]; then
   echo "📥 Import operation detected. Saving the generated resources to the repository..."
@@ -71,7 +98,8 @@ if [ -f "$GITHUB_WORKSPACE/.needs_commit" ]; then
   # the deeper ones are dropped in silence -- which is exactly the account-import
   # layout, `<account>/_import/<node>/`, three levels down. Measured, not
   # reasoned: with a depth-1 match present, the depth-3 file was not staged.
-  git add -- '*generated_resources.json'
+  compress_alongside generated_resources.json
+  git add -- '*generated_resources.json' '*generated_resources.json.gz'
 
   if ! git diff --staged --quiet; then
     git commit -m "chore: generated terraform awaiting CloudMan review [skip ci]"
@@ -129,7 +157,8 @@ fi
 # account, and it is the input to the screen where states get separated.
 if [ -f "$GITHUB_WORKSPACE/.needs_scan_commit" ]; then
   echo "🔎 Scan finished. Saving the inventory to the repository..."
-  git add -- '*scan_inventory.json'
+  compress_alongside scan_inventory.json
+  git add -- '*scan_inventory.json' '*scan_inventory.json.gz'
 
   if ! git diff --staged --quiet; then
     git commit -m "chore: account scan inventory awaiting CloudMan review [skip ci]"
@@ -143,7 +172,7 @@ if [ -f "$GITHUB_WORKSPACE/.needs_cleanup" ]; then
   echo "🧹 Apply finished. Removing the import files from the repository..."
 
   # O parâmetro -u no git add pega arquivos que foram deletados
-  git add -u ./**/import.tf ./**/generated_resources.json ./**/generated_resources.tf 2>/dev/null || true
+  git add -u ./**/import.tf ./**/generated_resources.json ./**/generated_resources.json.gz ./**/generated_resources.tf 2>/dev/null || true
 
   if ! git diff --staged --quiet; then
     git commit -m "chore: cleanup import.tf and json after successful apply [skip ci]"

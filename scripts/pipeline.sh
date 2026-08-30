@@ -221,8 +221,14 @@ publish_engine_artifact() {
 # A execução continua falhando como antes. Este arquivo não é um jeito de a falha
 # passar: é o que conta ao diagrama que ela aconteceu.
 # ==============================================================================
-publish_plan_failure() {
-    local src_dir="$1" stage="$2" logfile="$3"
+#
+# UM CORPO, TRÊS AÇÕES. O texto acima descreve a regra do nome, e ela vale
+# igual para `apply` e `destroy`: cada ação tem o SEU arquivo, e dentro dele
+# sucesso e falha dividem o nome, porque é isso que interrompe a varredura.
+# Nomes separados POR AÇÃO existem pelo motivo inverso -- sem eles, o erro de um
+# apply seria servido como resposta ao próximo plan.
+_publish_failure_file() {
+    local src_dir="$1" stage="$2" logfile="$3" outfile="$4"
     local message=""
 
     if [ -n "$logfile" ] && [ -f "$logfile" ]; then
@@ -249,16 +255,122 @@ publish_plan_failure() {
             cloudman_error:   { stage: $stage, message: $message, run_url: $run_url },
             resource_changes: [],
             resource_drift:   []
-        }' > plan_result.json && gzip -9 -f plan_result.json; then
-        publish_engine_artifact "$src_dir" plan_result.json.gz
-        echo -e "${YELLOW}📄 [${src_dir}] plan_result.json.gz published with the failure reason (stage: ${stage}).${NC}"
+        }' > "$outfile" && gzip -9 -f "$outfile"; then
+        publish_engine_artifact "$src_dir" "${outfile}.gz"
+        echo -e "${YELLOW}📄 [${src_dir}] ${outfile}.gz published with the failure reason (stage: ${stage}).${NC}"
     else
         # Dentro de um `if` de propósito: uma falha AQUI não pode derrubar o
         # shell, senão o passo que só avisava passaria a interromper a execução.
-        echo -e "${RED}❌ [${src_dir}] Could not write the plan failure file.${NC}"
+        echo -e "${RED}❌ [${src_dir}] Could not write the failure file ${outfile}.${NC}"
     fi
 
-    rm -f plan_result.json plan_result.json.gz
+    rm -f "$outfile" "${outfile}.gz"
+}
+
+publish_plan_failure() {
+    _publish_failure_file "$1" "$2" "$3" plan_result.json
+}
+
+# Nome próprio, e não o do plan: o leitor de plan volta até 5 artefatos, e um
+# erro de apply sob aquele nome seria servido como resposta ao próximo Plan.
+publish_apply_failure() {
+    _publish_failure_file "$1" "$2" "$3" apply_result.json
+}
+
+# Idem, e separado do apply porque são desfechos diferentes da mesma pasta: sob
+# um nome só, a falha de um destroy responderia pelo apply anterior.
+publish_destroy_failure() {
+    _publish_failure_file "$1" "$2" "$3" destroy_result.json
+}
+
+# ==============================================================================
+# DESFECHO DE SUCESSO
+#
+# Até aqui só a falha era publicada, e só a do plan. Quem lê do lado do produto
+# ficava sem duas coisas que o ciclo precisa: os ids do que o apply criou (é
+# deles que sai o bloco `import` do teste de importação) e a confirmação de que
+# um destroy terminou.
+#
+# LISTA BRANCA, NÃO REDAÇÃO. `terraform show -json` NÃO mascara valor sensível --
+# está dito no comentário do plan, mais abaixo. O state depois de um apply é pior
+# que um plano: carrega todo atributo de todo recurso. Em vez de redigir e torcer
+# para o filtro não ter furo, aqui só quatro campos saem: endereço, tipo, nome e
+# id. É o que a importação precisa, e não há o que vazar no que não é copiado.
+#
+# Se o jq falhar, NADA é publicado -- mesma regra do plan.
+_publish_state_manifest() {
+    local src_dir="$1" action="$2" outfile="$3"
+
+    if ! terraform show -json > cloudman.state.raw.json 2>/dev/null; then
+        echo -e "${YELLOW}⚠️ [${src_dir}] Could not read the state; no ${outfile} published.${NC}"
+        rm -f cloudman.state.raw.json
+        return 0
+    fi
+
+    # Recursivo de propósito: recurso dentro de módulo é recurso, e o teste de
+    # importação precisa do endereço completo dele.
+    if jq \
+        --arg action "$action" \
+        --arg run_url "${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        'def walk_modules: (.resources // [])[] , ((.child_modules // [])[] | walk_modules);
+         {
+            timestamp: $ts,
+            cloudman_result: { action: $action, outcome: "succeeded", run_url: $run_url },
+            resources: [ (.values.root_module // {}) | walk_modules
+                         | { address, type, name, id: (.values.id // null) } ]
+         }' cloudman.state.raw.json > "$outfile" && gzip -9 -f "$outfile"; then
+        publish_engine_artifact "$src_dir" "${outfile}.gz"
+        echo -e "${GREEN}📄 [${src_dir}] ${outfile}.gz published (identities only).${NC}"
+    else
+        echo -e "${RED}❌ [${src_dir}] Could not build ${outfile}; refusing to publish it.${NC}"
+    fi
+
+    rm -f cloudman.state.raw.json "$outfile" "${outfile}.gz"
+}
+
+# O que um destroy bem-sucedido deixa para trás, e o que ele achava que ia levar.
+#
+# POR QUE OS ENDEREÇOS VÊM DE ANTES. Depois de um destroy o state está vazio, e
+# `terraform show -json` não diz mais o que existia. A lista é tirada ANTES de
+# destruir, e é o que a varredura por tag confere depois -- não é prova de que
+# sumiu, é a lista contra a qual perguntar.
+#
+# POR QUE A LIMPEZA ENTRA AQUI. Os três comandos que apagam o objeto de state no
+# S3 e os dois locks no DynamoDB terminavam em `|| echo "⚠️ Warning"`: qualquer um
+# podia falhar, a mensagem ia para o log e o run terminava com sucesso. Numa
+# rotina que cria e destrói o dia inteiro isso acumula state e lock órfãos sem
+# nada reportar. Agora o desfecho de cada um sai no arquivo.
+_publish_destroy_result() {
+    local src_dir="$1" addresses_file="$2" cleanup_status="$3" cleanup_detail="$4"
+
+    # Vazio e ilegível caem no mesmo `[]`. Passar o conteúdo cru para
+    # `--argjson` faria o jq abortar, e o desfecho inteiro deixaria de ser
+    # publicado por causa da lista -- que é a parte dispensável dele.
+    local addresses="[]"
+    if [ -s "$addresses_file" ] && jq -e . "$addresses_file" >/dev/null 2>&1; then
+        addresses=$(cat "$addresses_file")
+    fi
+
+    if jq -n \
+        --argjson addresses "$addresses" \
+        --arg cleanup "$cleanup_status" \
+        --arg detail "$cleanup_detail" \
+        --arg run_url "${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{
+            timestamp: $ts,
+            cloudman_result: { action: "destroy", outcome: "succeeded", run_url: $run_url },
+            backend_cleanup: { status: $cleanup, detail: $detail },
+            resources: $addresses
+        }' > destroy_result.json && gzip -9 -f destroy_result.json; then
+        publish_engine_artifact "$src_dir" destroy_result.json.gz
+        echo -e "${GREEN}📄 [${src_dir}] destroy_result.json.gz published (backend cleanup: ${cleanup_status}).${NC}"
+    else
+        echo -e "${RED}❌ [${src_dir}] Could not build destroy_result.json; refusing to publish it.${NC}"
+    fi
+
+    rm -f destroy_result.json destroy_result.json.gz
 }
 
 # ==============================================================================
@@ -875,8 +987,24 @@ run_terraform_process() {
 
         elif [ "$action" == "apply" ]; then
           echo -e "${color}▶️ ${label} Running terraform apply...${NC}"
-          run_tf_with_stale_lock_recovery terraform apply -auto-approve -input=false
-          APPLY_STATUS=$?
+          # `|| APPLY_STATUS=$?`, e não a chamada solta seguida de `APPLY_STATUS=$?`:
+          # com o `set -eo pipefail` do topo, um apply que falha derruba o subshell
+          # NA HORA e a linha seguinte nunca roda. O valor ficava sempre 0, e não
+          # havia onde publicar a falha. É o mesmo achado já documentado dentro de
+          # `run_tf_with_stale_lock_recovery`.
+          APPLY_STATUS=0
+          run_tf_with_stale_lock_recovery terraform apply -auto-approve -input=false || APPLY_STATUS=$?
+
+          if [ $APPLY_STATUS -ne 0 ]; then
+              publish_apply_failure "$path" apply "./.struct8-live.log"
+              # A execução continua falhando como antes -- publicar o motivo não é
+              # um jeito de a falha passar.
+              exit $APPLY_STATUS
+          fi
+
+          # Os ids do que ficou de pé. É deles que sai o bloco `import` do teste
+          # de importação, e sem isso o ciclo não fecha.
+          _publish_state_manifest "$path" apply apply_result.json
 
         # INÍCIO DA NOVA LÓGICA DE IMPORT (GERAÇÃO PARA REVISÃO)
         # TWO NAMES, ONE PASS. `import` is the original name and the old Import
@@ -1077,8 +1205,28 @@ run_terraform_process() {
 
         elif [ "$action" == "destroy" ]; then
 
-          run_tf_with_stale_lock_recovery terraform destroy -auto-approve -input=false
-          DESTROY_STATUS=$? # Captura o status do destroy
+          # ANTES de destruir: depois, o state está vazio e não há mais como
+          # dizer o que existia. Esta lista é o que a varredura por tag confere
+          # depois -- não é prova de que sumiu, é contra o que perguntar.
+          rm -f cloudman.destroy_targets.json
+          if terraform show -json > cloudman.state.raw.json 2>/dev/null; then
+            jq 'def walk_modules: (.resources // [])[] , ((.child_modules // [])[] | walk_modules);
+                [ (.values.root_module // {}) | walk_modules
+                  | { address, type, name, id: (.values.id // null) } ]' \
+              cloudman.state.raw.json > cloudman.destroy_targets.json 2>/dev/null || true
+          fi
+          rm -f cloudman.state.raw.json
+
+          # Mesma correção do apply acima: sem o `||`, o `set -e` levava o subshell
+          # embora e TODO o bloco de limpeza remota abaixo era inalcançável num
+          # destroy que falhasse.
+          DESTROY_STATUS=0
+          run_tf_with_stale_lock_recovery terraform destroy -auto-approve -input=false || DESTROY_STATUS=$?
+
+          # O desfecho da limpeza do backend, acumulado nos três comandos abaixo.
+          # `ok` até que algum falhe; o detalhe nomeia o que ficou para trás.
+          CLEANUP_STATUS="ok"
+          CLEANUP_DETAIL=""
 
           if [ $DESTROY_STATUS -eq 0 ]; then
               echo -e "${color}▶️ ${label} Destroy succeeded. Starting remote backend cleanup...${NC}"
@@ -1091,7 +1239,7 @@ run_terraform_process() {
                   if [ -n "$BACKEND_BUCKET" ] && [ -n "$S3_EXACT_KEY" ]; then
                       # 1. REMOVE DO S3 (Para a lógica de HEAD request do Struct8 funcionar)
                       echo -e "${color}🗑️ ${label} Deleting object: s3://${BACKEND_BUCKET}/${S3_EXACT_KEY}${NC}"
-                      aws s3 rm "s3://${BACKEND_BUCKET}/${S3_EXACT_KEY}" --profile backend || echo "⚠️ Warning: failed to delete the object in S3."
+                      aws s3 rm "s3://${BACKEND_BUCKET}/${S3_EXACT_KEY}" --profile backend || { CLEANUP_STATUS="partial"; CLEANUP_DETAIL="${CLEANUP_DETAIL}state object s3://${BACKEND_BUCKET}/${S3_EXACT_KEY} kept; "; echo "⚠️ Warning: failed to delete the object in S3."; }
 
                       # 2. REMOVE DO DYNAMODB (Para o Terraform não quebrar no próximo Apply)
                       if [ -n "$DYNAMODB_TABLE" ] && [ "$DYNAMODB_TABLE" != "null" ]; then
@@ -1104,7 +1252,7 @@ run_terraform_process() {
                               --table-name "$DYNAMODB_TABLE" \
                               --key "{\"LockID\": {\"S\": \"${BACKEND_BUCKET}/${S3_EXACT_KEY}\"}}" \
                               --region "$BACKEND_REGION" \
-                              --profile backend || echo "⚠️ Warning: failed to delete the real lock (or it was already gone)."
+                              --profile backend || { CLEANUP_STATUS="partial"; CLEANUP_DETAIL="${CLEANUP_DETAIL}lock ${BACKEND_BUCKET}/${S3_EXACT_KEY} kept; "; echo "⚠️ Warning: failed to delete the real lock (or it was already gone)."; }
 
                           # O padrão de LockID do Terraform no S3 é sempre: <bucket>/<key>-md5
                           LOCK_ID="${BACKEND_BUCKET}/${S3_EXACT_KEY}-md5"
@@ -1113,20 +1261,29 @@ run_terraform_process() {
                               --table-name "$DYNAMODB_TABLE" \
                               --key "{\"LockID\": {\"S\": \"$LOCK_ID\"}}" \
                               --region "$BACKEND_REGION" \
-                              --profile backend || echo "⚠️ Warning: failed to delete the DynamoDB item, or it no longer existed."
+                              --profile backend || { CLEANUP_STATUS="partial"; CLEANUP_DETAIL="${CLEANUP_DETAIL}checksum lock ${LOCK_ID} kept; "; echo "⚠️ Warning: failed to delete the DynamoDB item, or it no longer existed."; }
                       fi
                   else
                       echo -e "${color}⚠️ ${label} Bucket or key not found. Remote state kept.${NC}"
+                      CLEANUP_STATUS="skipped"; CLEANUP_DETAIL="bucket or state key not resolved; remote state kept"
                   fi
               else
                    echo -e "${color}⚠️ ${label} Terraform cache file missing. Remote state kept.${NC}"
+                   CLEANUP_STATUS="skipped"; CLEANUP_DETAIL="no .terraform/terraform.tfstate to read the backend from; remote state kept"
               fi
+
+              # Antes de apagar o cache local: o desfecho sai enquanto ainda há
+              # de onde ler, e a lista de endereços foi tirada antes do destroy.
+              _publish_destroy_result "$path" cloudman.destroy_targets.json "$CLEANUP_STATUS" "$CLEANUP_DETAIL"
 
               # 3. Limpar arquivos locais
               echo -e "${color}🧹 ${label} Removing the local terraform cache...${NC}"
               rm -rf .terraform terraform.tfstate terraform.tfstate.backup .terraform.lock.hcl
+              rm -f cloudman.destroy_targets.json
           else
               echo -e "${color}❌ ${label} Terraform destroy failed. Remote cleanup was NOT performed.${NC}"
+              publish_destroy_failure "$path" destroy "./.struct8-live.log"
+              rm -f cloudman.destroy_targets.json
               return $DESTROY_STATUS
           fi
 

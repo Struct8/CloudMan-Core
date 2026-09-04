@@ -787,9 +787,121 @@ run_terraform_process() {
               echo -e "${color}📄 HCL file generated. Converting it to JSON for the front end...${NC}"
 
               # Tenta gerar o JSON. Se falhar por erro no plano, criamos um JSON básico de sinalização
-              if terraform show -json import.tfplan > generated_resources.json 2>/dev/null; then
-                  echo -e "${color}✅ JSON generated successfully.${NC}"
+              if terraform show -json import.tfplan > generated_resources.raw.json 2>/dev/null; then
+                  # ---------------------------------------------------------------
+                  # SENSITIVE VALUES COME OUT BEFORE THE FILE EXISTS UNDER ITS FINAL
+                  # NAME. `terraform show -json` writes every value the provider read
+                  # and only FLAGS the sensitive ones (after_sensitive,
+                  # sensitive_values). publish-gitops.sh commits this file to the
+                  # customer's repository, so the raw output would put e.g. an SSM
+                  # parameter's value into git history -- which is what the plan
+                  # branch above already prevents and this branch did not: on
+                  # 2026-09-04, 87 raw files were found committed in one account.
+                  #
+                  # Unlike the plan, the values here ARE the payload -- the diagram is
+                  # rebuilt from planned_values -- so nothing is dropped wholesale.
+                  # Only the leaves the plan flags as sensitive go, and they become
+                  # `null`, not a marker string: the reader (ImportTab / planParser)
+                  # copies values straight into the node's parameters, and a marker
+                  # would be compiled into the next main.tf and written to the cloud
+                  # on apply. `null` is what every unset attribute already looks like
+                  # in this file.
+                  #
+                  # The same leaf lives in up to four sections and each is handled:
+                  # resource_changes (before/after), planned_values, prior_state and
+                  # configuration (constant_value). planned_values' own
+                  # sensitive_values was MEASURED to miss attributes that
+                  # resource_changes flags (aws_ssm_parameter.value, terraform 1.5.7),
+                  # so the flags from resource_changes are applied on top, by address.
+                  # Root module only, which is all the reader supports.
+                  #
+                  # LIMIT: this covers what the PROVIDER marks sensitive. A Lambda's
+                  # environment variables are not marked (aws provider 5.x/6.x) and
+                  # stay -- the same limit the plan branch has.
+                  #
+                  # `redacted_attributes` lists what was removed, so the diagram, or a
+                  # person reading the repository, can tell "removed" from "never set".
+                  # ---------------------------------------------------------------
+                  if jq -e '
+                    def strip($v; $s):
+                      if $s == true then null
+                      elif ($s | type) == "object" and ($v | type) == "object" then
+                        reduce ($v | keys_unsorted[]) as $k ({}; .[$k] = strip($v[$k]; ($s[$k] // false)))
+                      elif ($s | type) == "array" and ($v | type) == "array" then
+                        [ range(0; $v | length) as $i | strip($v[$i]; ($s[$i] // false)) ]
+                      else $v
+                      end;
+
+                    def child_flag($s; $k):
+                      if $s == true then true
+                      elif ($s | type) == "object" and ($k | type) == "string" then ($s[$k] // false)
+                      elif ($s | type) == "array" and ($k | type) == "number" then ($s[$k] // false)
+                      else false
+                      end;
+
+                    def strip_expr($e; $s):
+                      if ($e | type) == "array" then
+                        [ range(0; $e | length) as $i | strip_expr($e[$i]; child_flag($s; $i)) ]
+                      elif ($e | type) == "object" and ($e | has("constant_value")) then
+                        $e + { constant_value: strip($e.constant_value; $s) }
+                      elif ($e | type) == "object" then
+                        reduce ($e | keys_unsorted[]) as $k ({}; .[$k] = strip_expr($e[$k]; child_flag($s; $k)))
+                      else $e
+                      end;
+
+                    def block_of($a):
+                      if ($a | endswith("]")) then $a[:($a | rindex("["))] else $a end;
+
+                    def strip_change:
+                      . as $c
+                      | .before = strip($c.before; ($c.before_sensitive // false))
+                      | .after  = strip($c.after;  ($c.after_sensitive  // false));
+
+                    def strip_module($flags):
+                      (if has("resources") then
+                         .resources |= [ .[] | . as $r
+                           | .values = strip(strip($r.values; ($r.sensitive_values // false)); ($flags[$r.address] // false)) ]
+                       else . end)
+                      | (if has("child_modules") then .child_modules |= [ .[] | strip_module($flags) ] else . end);
+
+                    def strip_config($byblock):
+                      if has("resources") then
+                        .resources |= [ .[] | . as $r
+                          | if has("expressions") then
+                              .expressions |= (reduce ($byblock[block_of($r.address)] // [])[] as $s (.; strip_expr(.; $s)))
+                            else . end ]
+                      else . end;
+
+                    . as $plan
+                    | (reduce ($plan.resource_changes // [])[] as $rc ({}; .[$rc.address] = ($rc.change.after_sensitive // false))) as $after
+                    | (reduce ($plan.resource_changes // [])[] as $rc ({}; .[$rc.address] = ($rc.change.before_sensitive // false))) as $before
+                    | (reduce ($plan.resource_changes // [])[] as $rc ({}; .[block_of($rc.address)] += [ ($rc.change.after_sensitive // false) ])) as $byblock
+                    | (if has("resource_changes") then .resource_changes |= [ .[] | .change |= strip_change ] else . end)
+                    | (if has("resource_drift")   then .resource_drift   |= [ .[] | .change |= strip_change ] else . end)
+                    | (if (.planned_values.root_module? // null) != null
+                       then .planned_values.root_module |= strip_module($after) else . end)
+                    | (if (.prior_state.values.root_module? // null) != null
+                       then .prior_state.values.root_module |= (strip_module($before) | strip_module($after)) else . end)
+                    | (if (.configuration.root_module? // null) != null
+                       then .configuration.root_module |= strip_config($byblock) else . end)
+                    | .redacted_attributes = [ ($plan.resource_changes // [])[] | .address as $a
+                        | (.change.after_sensitive // {})
+                        | if (type == "object" or type == "array") then paths(. == true) else empty end
+                        | ($a + "." + (map(tostring) | join("."))) ]
+                  ' generated_resources.raw.json > generated_resources.json; then
+                      rm -f generated_resources.raw.json
+                      echo -e "${color}✅ JSON generated successfully (sensitive values removed).${NC}"
+                  else
+                      # Without a trustworthy redaction NOTHING reaches the repository:
+                      # failing visibly is preferable to committing a file that may hold
+                      # a secret. publish-gitops.sh only runs on success, so exiting here
+                      # is what keeps the raw file out.
+                      rm -f generated_resources.raw.json generated_resources.json
+                      echo -e "${RED}❌ Critical error: could not remove the sensitive values from the generated JSON; refusing to save it to the repository.${NC}"
+                      exit 1
+                  fi
               else
+                  rm -f generated_resources.raw.json
                   echo "{\"info\": \"The HCL was generated but the plan has validation errors. Review the .tf file by hand.\"}" > generated_resources.json
                   echo -e "${YELLOW}⚠️ Warning: could not generate the detailed JSON because the plan has errors.${NC}"
               fi

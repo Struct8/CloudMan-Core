@@ -354,9 +354,57 @@ run_terraform_process() {
             # what makes it the one action here that does not need the backend.
             echo -e "${color}⏭️  ${label} Scan: no Terraform in this folder, skipping init.${NC}"
         else
-            _stream_cmd terraform init -reconfigure -input=false \
-                -backend-config="profile=backend" \
-                -backend-config="region=$BACKEND_REGION" || INIT_STATUS=$?
+            # ---------------------------------------------------------------
+            # DEPENDENCY LOCK. Without `.terraform.lock.hcl` beside main.tf, every
+            # run downloads whichever provider release satisfies the version
+            # constraint and trusts it -- a binary from the registry, chosen anew
+            # each time, running with the deploy role's rights. The lock records
+            # the checksums of the releases that were used, and once it is in the
+            # repository `terraform init` refuses a package that does not match
+            # them ("doesn't match any of the checksums previously recorded"),
+            # readonly or not. `-lockfile=readonly` adds the other half: init may
+            # not rewrite the file on its own.
+            #
+            # Three cases, in order of how often they happen:
+            #   * lock present, configuration unchanged: readonly init, the
+            #     recorded versions are reused, the file is not touched.
+            #   * lock present, provider versions changed in the workspace: readonly
+            #     fails with "does not match configured version constraint" (or
+            #     "Inconsistent dependency lock file"). That is the customer's own
+            #     change, so init runs again with -upgrade -- the only way Terraform
+            #     re-selects a version the lock already pins -- records the new
+            #     selection, and the file goes to the repository with this run.
+            #     ONLY those messages take this path; a checksum mismatch fails the
+            #     run like any other init failure -- which is the point.
+            #   * no lock, the state's first run: init records one and it goes to
+            #     the repository.
+            # publish-gitops.sh commits the paths this run appends to
+            # .needs_lock_commit. Measured 2026-09-04 with terraform 1.15.8; the
+            # runner's 1.5.7 wording is covered by the same three phrases.
+            # ---------------------------------------------------------------
+            if [ -f .terraform.lock.hcl ]; then
+                _stream_cmd terraform init -reconfigure -input=false -lockfile=readonly \
+                    -backend-config="profile=backend" \
+                    -backend-config="region=$BACKEND_REGION" || INIT_STATUS=$?
+                if [ $INIT_STATUS -ne 0 ] && grep -qE "does not match configured version constraint|Inconsistent dependency lock file|required by this configuration but no version is selected" ./.struct8-live.log; then
+                    echo -e "${YELLOW}🔏 ${label} Provider versions changed in the workspace; recording a new dependency lock.${NC}"
+                    INIT_STATUS=0
+                    _stream_cmd terraform init -reconfigure -input=false -upgrade \
+                        -backend-config="profile=backend" \
+                        -backend-config="region=$BACKEND_REGION" || INIT_STATUS=$?
+                    if [ $INIT_STATUS -eq 0 ]; then
+                        printf '%s\n' "$path/.terraform.lock.hcl" >> "$GITHUB_WORKSPACE/.needs_lock_commit"
+                    fi
+                fi
+            else
+                _stream_cmd terraform init -reconfigure -input=false \
+                    -backend-config="profile=backend" \
+                    -backend-config="region=$BACKEND_REGION" || INIT_STATUS=$?
+                if [ $INIT_STATUS -eq 0 ] && [ -f .terraform.lock.hcl ]; then
+                    echo -e "${color}🔏 ${label} Dependency lock recorded; it goes to the repository with this run.${NC}"
+                    printf '%s\n' "$path/.terraform.lock.hcl" >> "$GITHUB_WORKSPACE/.needs_lock_commit"
+                fi
+            fi
         fi
 
         if [ $INIT_STATUS -ne 0 ]; then

@@ -576,6 +576,28 @@ debug_auth_status "BACKEND PROFILE CRIADO"
 # DEPENDÊNCIAS EXTERNAS
 # ---------------------------------------------------------
 EXTERNAL_REPOS=$(jq -c '.external_repositories // []' "$MANIFEST_PATH")
+# THE CLONE TOKEN NEVER TOUCHES THE URL, SO IT NEVER LANDS IN .git/config.
+#
+# Until 2026-09-04 the URL was https://x-access-token:<token>@github.com/...,
+# and `git clone` writes its URL to remote.origin.url -- the token stayed on the
+# runner's disk, in every external checkout, for the rest of the run, readable
+# by anything that could read a file (a `local-exec`, a provider). The
+# credential now reaches git through its environment instead: GIT_CONFIG_* is
+# read by EVERY git invocation in the loop -- clone, sparse-checkout, checkout,
+# fetch, pull, and the on-demand blob fetches a --filter=blob:none clone makes
+# at checkout time -- and is written nowhere. Same header actions/checkout
+# uses; base64 of `x-access-token:<token>`, as GitHub's basic auth wants it.
+#
+# Exported BEFORE the loop because the loop runs behind a pipe, in a subshell;
+# dropped right after it, in this shell, so terraform and the providers that
+# run later do not inherit it either (see the SECRETS_CONTEXT block at the top).
+if [ -n "${GH_CLONE_TOKEN:-}" ]; then
+    export GIT_CONFIG_COUNT=1
+    export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+    export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_CLONE_TOKEN" | base64 | tr -d '\n')"
+    export GIT_TERMINAL_PROMPT=0
+fi
+
 if [ "$EXTERNAL_REPOS" != "[]" ] && [ "$EXTERNAL_REPOS" != "null" ]; then
     echo "📦 Resolving external dependencies..."
     echo "$EXTERNAL_REPOS" | jq -c '.[]' | while read -r repo; do
@@ -585,7 +607,7 @@ if [ "$EXTERNAL_REPOS" != "[]" ] && [ "$EXTERNAL_REPOS" != "null" ]; then
         TARGET_DIR=$(echo "$repo" | jq -r '.target_dir')
         FOLDERS=$(echo "$repo" | jq -r '.folders | join(" ")')
         FULL_TARGET_DIR="./$TARGET_DIR"
-        REPO_URL="https://x-access-token:${GH_CLONE_TOKEN}@github.com/${ORG}/${REPO_NAME}.git"
+        REPO_URL="https://github.com/${ORG}/${REPO_NAME}.git"
 
         if [ ! -d "$FULL_TARGET_DIR" ]; then
             echo "⬇️  Starting sparse checkout of $ORG/$REPO_NAME..."
@@ -600,6 +622,20 @@ if [ "$EXTERNAL_REPOS" != "[]" ] && [ "$EXTERNAL_REPOS" != "null" ]; then
             (cd "$FULL_TARGET_DIR" && git sparse-checkout set $FOLDERS && git pull origin "$BRANCH")
         fi
     done
+fi
+unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GIT_TERMINAL_PROMPT
+
+# The property this block promises, checked rather than assumed: no .git/config
+# written during the clones carries the token. `-F` and the value itself, so a
+# future edit that puts it back in a URL, in any spelling, fails here and not in
+# an audit. The value is never printed.
+if [ -n "${GH_CLONE_TOKEN:-}" ]; then
+    if find . -name .terraform -prune -o -path '*/.git/config' -type f -print0 2>/dev/null \
+        | xargs -0 -r grep -lF -- "$GH_CLONE_TOKEN" 2>/dev/null | grep -q .; then
+        echo "::error::The clone token was written to a .git/config on the runner. Refusing to continue."
+        exit 1
+    fi
+    echo "🔒 Clone credential kept out of every .git/config."
 fi
 
 # ---------------------------------------------------------

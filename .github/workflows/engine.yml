@@ -82,7 +82,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 📥 Checkout Client Code
-        uses: actions/checkout@v4
+        # Third-party actions are pinned by commit SHA, never by tag. A tag is a
+        # pointer the action's owner -- or whoever takes over their account -- can
+        # move, and whatever it points at runs inside this job, with the customer's
+        # OIDC token within reach of every step and, through it, the AWS role. A
+        # commit SHA cannot be moved. The version in the comment is documentation;
+        # the SHA is what runs. To update: resolve the new tag to its commit
+        # (`gh api repos/<owner>/<repo>/git/ref/tags/<tag>`, dereferencing an
+        # annotated tag through `git/tags/<sha>`) and change both together.
+        # Audit of 2026-09-04.
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 2
 
@@ -360,7 +369,7 @@ jobs:
           echo "token=$TOKEN" >> $GITHUB_OUTPUT
 
       - name: 📥 Checkout Struct8 Engine
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # Canonical name. This named the PREVIOUS organization's repository
           # and only worked through GitHub's rename redirect. A redirect is not
@@ -383,7 +392,7 @@ jobs:
       - name: 🛠️ Setup Terraform
         # Um run de traffic nao chama terraform nenhuma vez.
         if: steps.manifest_check.outputs.action != 'traffic'
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
         with:
           terraform_version: "1.5.7"  # Adicione esta linha
           terraform_wrapper: false    # Recomendado para scripts bash complexos como o seu
@@ -428,7 +437,7 @@ jobs:
         # Nao ha plano nem resultado de apply para publicar: o que este run
         # produz e uma escrita na nuvem, e ela ja aparece no log.
         if: always() && steps.manifest_check.outputs.action != 'traffic'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: engine-output
           path: ${{ runner.temp }}/struct8-artifacts

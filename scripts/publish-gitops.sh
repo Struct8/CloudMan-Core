@@ -167,6 +167,26 @@ if [ -f "$GITHUB_WORKSPACE/.needs_scan_commit" ]; then
   fi
 fi
 
+# 1d. THE DEPENDENCY LOCK
+#
+# `.terraform.lock.hcl` beside a state's main.tf: the checksums of the
+# provider releases that state used. With it in the repository, a later run
+# refuses a package that does not match, and the versions only move when the
+# workspace changes them. pipeline.sh appends to .needs_lock_commit the path
+# of each lock it recorded (a state's first run, or provider versions changed);
+# a run that only reused the committed lock leaves nothing here.
+if [ -f "$GITHUB_WORKSPACE/.needs_lock_commit" ]; then
+  echo "🔏 Saving the dependency lock of the states that recorded one..."
+  while IFS= read -r lock; do
+    if [ -f "$lock" ]; then git add -- "$lock"; fi
+  done < "$GITHUB_WORKSPACE/.needs_lock_commit"
+  if ! git diff --staged --quiet; then
+    git commit -m "chore: terraform dependency lock recorded by the engine [skip ci]"
+    push_with_retry "dependency lock"
+    echo "✅ Dependency lock pushed to the repository."
+  fi
+fi
+
 # 2. LÓGICA DO PASSO 4 (LIMPEZA PÓS-APPLY)
 if [ -f "$GITHUB_WORKSPACE/.needs_cleanup" ]; then
   echo "🧹 Apply finished. Removing the import files from the repository..."

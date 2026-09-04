@@ -281,7 +281,19 @@ jobs:
               # runs when the manifest declares a PRIVATE external repository.
               # Until 2026-07-28 the shared repository was (wrongly) public, so the
               # step's `if:` skipped everything.
-              GATEKEEPER_URL="https://dev.app.struct8.com/st/GithubGateKeeper-dev"
+              # WHERE IT GOES, since 2026-09-04: the Struct8 Worker on the
+              # edge, not the AWS Lambda that answered here until then. Same
+              # action, same body, same response envelope -- and two
+              # restrictions the Lambda never had: only a job running THIS
+              # workflow may trade a token (it is checked by the
+              # `job_workflow_ref` claim, which GitHub fills in and a workflow
+              # cannot write), and what comes back is read-only.
+              #
+              # No redirector in front of it, on purpose. The one at
+              # app.struct8.com resolves which stage to serve from a browser
+              # COOKIE, and a runner has none -- so a machine caller has to
+              # name the backend, which is what this `case` table is for.
+              GATEKEEPER_URL="https://dev.collab.cf.struct8.com/api/github"
               AUDIENCE="https://struct8.com/gitops"
               ;;
             *)

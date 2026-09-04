@@ -16,6 +16,7 @@
 #
 # Entradas vem por env, declaradas no step: GH_CLONE_TOKEN, LOGIN_REGION,
 # SECRETS_CONTEXT, GH_TOKEN, MANIFEST_PATH_INPUT.
+# SECRETS_CONTEXT and GH_CLONE_TOKEN are un-exported right after set -eo (see there).
 
 # ==============================================================================
 # CONFIGURAÇÕES E CORES
@@ -26,6 +27,30 @@
 # mudanca de arquivo teria alterado a semantica de falha do pipeline inteiro.
 set -eo pipefail
 export LC_ALL=C.UTF-8   # >>> NOVO — garante que `grep -P` (usado no backstop de lock) funcione, independente do locale padrão do runner
+
+# ------------------------------------------------------------------------------
+# THE SECRETS STAY IN THIS SHELL AND OUT OF EVERY CHILD PROCESS.
+#
+# SECRETS_CONTEXT is `toJSON(secrets)`: every secret of the caller's repository
+# and organisation, serialised. That transport is unavoidable -- the names the
+# manifest asks for (AUTH_CLOUDFLARE_<account>, or a `secret_name` the customer
+# chose) cannot be declared statically in the workflow. What was not
+# unavoidable is the step's `env:` EXPORTING it: `terraform`, every provider
+# plugin, `git`, `aws`, `gh` and any `local-exec` a plan runs (the AWS
+# generator emits one for the ECS cleanup) inherited the whole blob.
+#
+# `export -n` keeps the value as a plain shell variable -- the lookups below
+# (`echo "$SECRETS_CONTEXT" | jq ...`, here and in the sourced
+# scripts/auth/*.sh) read it exactly as before -- and removes it from the
+# environment handed to child processes. Same for GH_CLONE_TOKEN, which is only
+# ever spliced into a clone URL. GH_TOKEN stays exported on purpose: `gh` is a
+# child process and reads it from the environment.
+#
+# What a child still sees is what its provider needs and nothing else:
+# CLOUDFLARE_API_TOKEN for the account the state uses, AWS credentials through
+# named profiles. Audit of 2026-09-04, medium finding.
+# ------------------------------------------------------------------------------
+export -n SECRETS_CONTEXT GH_CLONE_TOKEN
 
 echo "🕐 Step started at $(date -u '+%H:%M:%S') UTC"
 

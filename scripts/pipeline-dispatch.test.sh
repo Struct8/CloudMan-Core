@@ -121,6 +121,28 @@ check "traffic runs and exits before PASSO 3, so it never reaches the chain" "2"
 serves_traffic=$(grep -c "read, scan, traffic\." "$PIPELINE")
 check "the unknown-action message names traffic among what is served" "1" "$serves_traffic"
 
+# --------------------------------------------- the dependency lock retry
+# A readonly init refuses two different changes, and only one of them was
+# recognised. Changing a provider's VERSION says "does not match configured
+# version constraint"; ADDING one says "Provider dependency changes detected"
+# -- and that fell straight through to a plain failure. The effect was that a
+# state holding only AWS could never take a Lambda whose code comes from a
+# repository, because the archive_file brings hashicorp/archive with it.
+#
+# Measured on the runner on 2026-09-05: init installed BOTH providers and then
+# died refusing to record the new one, so nothing was wrong with the
+# configuration -- only with what the engine was willing to write down.
+lock_retry=$(grep -c 'Provider dependency changes detected" \./\.struct8-live\.log' "$PIPELINE")
+check "the lock retry recognises a provider being ADDED, not only re-versioned" "1" "$lock_retry"
+
+# The other half, and the reason this is a list of phrases instead of a
+# catch-all: a package whose checksum does not match what the lock recorded has
+# to fail the run. Re-running init with -upgrade on THAT would record the
+# impostor and hand it the deploy role.
+retry_line=$(grep 'grep -qE "does not match configured version constraint' "$PIPELINE" | head -1)
+checksum_on_retry=$(printf '%s' "$retry_line" | grep -c 'checksum' || true)
+check "a checksum mismatch stays OFF the retry path" "0" "$checksum_on_retry"
+
 echo
 if [ "$failures" -eq 0 ]; then
   echo "ALL CASES PASSED"

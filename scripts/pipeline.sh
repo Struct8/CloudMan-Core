@@ -660,9 +660,13 @@ run_terraform_process() {
             # Three cases, in order of how often they happen:
             #   * lock present, configuration unchanged: readonly init, the
             #     recorded versions are reused, the file is not touched.
-            #   * lock present, provider versions changed in the workspace: readonly
-            #     fails with "does not match configured version constraint" (or
-            #     "Inconsistent dependency lock file"). That is the customer's own
+            #   * lock present, the provider SET or its versions changed in the
+            #     workspace: readonly fails with "does not match configured version
+            #     constraint", "Inconsistent dependency lock file", or -- when a
+            #     provider is ADDED rather than moved -- "Provider dependency changes
+            #     detected". Adding is what a Lambda taking its code from a repository
+            #     does to a state that had only AWS: it brings hashicorp/archive for
+            #     the archive_file. That is the customer's own
             #     change, so init runs again with -upgrade -- the only way Terraform
             #     re-selects a version the lock already pins -- records the new
             #     selection, and the file goes to the repository with this run.
@@ -672,14 +676,17 @@ run_terraform_process() {
             #     the repository.
             # publish-gitops.sh commits the paths this run appends to
             # .needs_lock_commit. Measured 2026-09-04 with terraform 1.15.8; the
-            # runner's 1.5.7 wording is covered by the same three phrases.
+            # runner's 1.5.7 wording is covered by the same phrases -- and the
+            # added-provider one was measured on the runner itself on 2026-09-05,
+            # on an apply that installed both providers and then refused to record
+            # the new one.
             # ---------------------------------------------------------------
             if [ -f .terraform.lock.hcl ]; then
                 _stream_cmd terraform init -reconfigure -input=false -lockfile=readonly \
                     -backend-config="profile=backend" \
                     -backend-config="region=$BACKEND_REGION" || INIT_STATUS=$?
-                if [ $INIT_STATUS -ne 0 ] && grep -qE "does not match configured version constraint|Inconsistent dependency lock file|required by this configuration but no version is selected" ./.struct8-live.log; then
-                    echo -e "${YELLOW}🔏 ${label} Provider versions changed in the workspace; recording a new dependency lock.${NC}"
+                if [ $INIT_STATUS -ne 0 ] && grep -qE "does not match configured version constraint|Inconsistent dependency lock file|required by this configuration but no version is selected|Provider dependency changes detected" ./.struct8-live.log; then
+                    echo -e "${YELLOW}🔏 ${label} Provider set changed in the workspace; recording a new dependency lock.${NC}"
                     INIT_STATUS=0
                     _stream_cmd terraform init -reconfigure -input=false -upgrade \
                         -backend-config="profile=backend" \

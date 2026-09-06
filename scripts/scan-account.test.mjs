@@ -231,13 +231,38 @@ const ANSWERS = {
 	// Two buses, because the id carries the bus only when the bus is not the
 	// default one and one bus alone cannot show that. The rules themselves come
 	// from the sweep above; what is expanded here is only what lives inside them.
+	// Three rules from the sweep, and one of them is AWS's own -- the shape a real
+	// account has: ECS creates `ecs-managed-capacity-provider-rule` for a capacity
+	// provider and AWS refuses PutRule/DeleteRule on it.
 	'cloudcontrol list-resources AWS::Events::Rule': [
-		{ ResourceDescriptions: [{ Identifier: 'import-lab3-daily', Properties: '{}' }] }
+		{
+			ResourceDescriptions: [
+				{ Identifier: `arn:aws:events:${R}:${A}:rule/import-lab3-daily`, Properties: '{}' },
+				{
+					Identifier: `arn:aws:events:${R}:${A}:rule/ecs-managed-capacity-provider-rule`,
+					Properties: '{}'
+				}
+			]
+		}
 	],
 	'events list-event-buses': [
 		{ EventBuses: [{ Name: 'default' }, { Name: 'barramento-de-pedidos' }] }
 	],
-	'events list-rules default': [{ Rules: [{ Name: 'import-lab3-daily' }] }],
+	// `ManagedBy` is answered HERE and nowhere else in the scan: Cloud Control's
+	// GetResource for a rule does not carry it.
+	'events list-rules default': [
+		{
+			Rules: [
+				{ Name: 'import-lab3-daily' },
+				{ Name: 'ecs-managed-capacity-provider-rule', ManagedBy: 'ecs.amazonaws.com' }
+			]
+		}
+	],
+	// Answered so a regression does not crash the stub. The assertion is that a
+	// managed rule's targets are never asked for.
+	'events list-targets-by-rule default ecs-managed-capacity-provider-rule': [
+		{ Targets: [{ Id: 'ecs-managed-capacity-provider-target', Arn: `arn:aws:ecs:${R}:${A}:cluster/c` }] }
+	],
 	'events list-rules barramento-de-pedidos': [{ Rules: [{ Name: 'pedido-criado' }] }],
 	'events list-targets-by-rule default import-lab3-daily': [
 		{
@@ -618,6 +643,36 @@ try {
 		!alvos.some((a) => a.importId.endsWith('/undefined') || a.importId.endsWith('/')),
 		JSON.stringify(alvos.map((a) => a.importId))
 	);
+
+	// ------------------------------------- a rule AWS created for its own service
+	//
+	// `ManagedBy` is answered by `list-rules` and by nothing else the scan calls --
+	// Cloud Control's GetResource for a rule does not carry it. AWS refuses PutRule
+	// and DeleteRule on one, so importing it is a resource the account cannot
+	// change and Terraform cannot destroy.
+	const regraDaAws = out.items.find((i) =>
+		String(i.importId ?? '').endsWith('rule/ecs-managed-capacity-provider-rule')
+	);
+	check(
+		'a rule AWS manages is marked with who owns it, so Struct8 drops it knowingly',
+		regraDaAws?.ownedBy === 'ecs.amazonaws.com',
+		JSON.stringify(regraDaAws)
+	);
+	// THE CONTROL: marking every rule would satisfy that too, and lose the
+	// account's own.
+	const regraDoCliente = out.items.find((i) =>
+		String(i.importId ?? '').endsWith('rule/import-lab3-daily')
+	);
+	check(
+		"and the account's own rule is left unmarked",
+		regraDoCliente !== undefined && regraDoCliente.ownedBy === undefined,
+		JSON.stringify(regraDoCliente)
+	);
+	check(
+		'and no target of it reached the inventory',
+		!alvos.some((a) => String(a.importId).includes('ecs-managed-capacity-provider')),
+		JSON.stringify(alvos.map((a) => a.importId))
+	);
 	check(
 		'the name hint names the rule and the target, not the bus',
 		alvos.find((a) => a.nameHint === 'import-lab3-daily_ingest-lambda') !== undefined,
@@ -645,6 +700,17 @@ try {
 
 	// ------------------------------------------------- the flags actually sent
 	const calls = JSON.parse(fs.readFileSync(path.join(dir, 'calls.json'), 'utf-8'));
+
+	// The saving that comes with the mark: a managed rule's targets belong to the
+	// same rule and carry the same answer, so asking for them spends a call per
+	// managed rule to produce rows that are dropped on arrival.
+	check(
+		'the targets of a managed rule are never asked for',
+		!calls.some(
+			(c) => c.includes('list-targets-by-rule') && c.includes('ecs-managed-capacity-provider-rule')
+		),
+		JSON.stringify(calls.filter((c) => c.includes('list-targets-by-rule')))
+	);
 
 	// ------------------------------------------------ detail runs AFTER the region
 	//

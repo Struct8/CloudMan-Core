@@ -124,6 +124,27 @@ const ANSWERS = {
 	'cloudcontrol get-resource AWS::S3::Bucket bucket-noutra-regiao': [
 		{ ResourceDescription: { Identifier: 'bucket-noutra-regiao', Properties: '{}' } }
 	],
+	// A type AWS fills with its own catalogue. Asked of IAM, which can filter by
+	// owner, instead of Cloud Control, which cannot: in a real account this is 93
+	// rows in one call rather than 1667 over seventeen pages, and the 1574 left
+	// behind are AWS's own policies that get discarded further along anyway.
+	'iam list-policies': [
+		{
+			Policies: [
+				{ Arn: 'arn:aws:iam::262578989263:policy/deploy-can-write', PolicyName: 'deploy-can-write' }
+			]
+		}
+	],
+	// Answered so a regression does not crash the stub. The assertion is that the
+	// sweep never asks this, because IAM already answered it.
+	'cloudcontrol list-resources AWS::IAM::ManagedPolicy': [
+		{
+			ResourceDescriptions: [
+				{ Identifier: 'arn:aws:iam::262578989263:policy/deploy-can-write', Properties: '{}' },
+				{ Identifier: 'arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess', Properties: '{}' }
+			]
+		}
+	],
 	's3api get-bucket-location bucket-aqui': [{ LocationConstraint: null }],
 	's3api get-bucket-location bucket-noutra-regiao': [{ LocationConstraint: 'sa-east-1' }],
 	// A type with no LIST handler at all. Normal across a sweep this wide, and a
@@ -240,10 +261,22 @@ const ANSWERS = {
 // over the whole file: if it ever changes, this fails loudly instead of
 // silently testing nothing.
 const original = fs.readFileSync(SOURCE, 'utf-8');
+// TWO markers now, because the script reaches outside in two ways: the AWS CLI
+// for the handful of `ec2`/`s3api` calls, and the in-process Cloud Control client
+// for the several hundred that used to be child processes. Both are matched
+// exactly rather than by regex, so that a change to either fails loudly here
+// instead of silently testing nothing -- or, worse, reaching a real account.
 const IMPORT_LINE = "import { execFileSync, execFile } from 'node:child_process';";
-if (!original.includes(IMPORT_LINE)) {
-	console.log(`FAIL - scan-account.mjs no longer imports execFileSync the way this test stubs it`);
-	process.exit(1);
+const CLOUD_CONTROL_LINE =
+	"import { cloudControl, resolveCredentials } from './lib/cloud-control.mjs';";
+for (const [what, line] of [
+	['the AWS CLI', IMPORT_LINE],
+	['the Cloud Control client', CLOUD_CONTROL_LINE]
+]) {
+	if (!original.includes(line)) {
+		console.log(`FAIL - scan-account.mjs no longer imports ${what} the way this test stubs it`);
+		process.exit(1);
+	}
 }
 
 const stub = `
@@ -281,20 +314,64 @@ function execFileSync(_bin, argv) {
 	if (page && page.THROWS) { const e = new Error(page.THROWS); e.stderr = page.THROWS; throw e; }
 	return JSON.stringify(page);
 }
-// The sweep runs many calls at once and so takes the callback form. Same table,
-// same keys -- only the shape of the answer differs, which keeps the concurrent
-// path and the sequential one honest about testing the same thing.
+// Cloud Control, answered from the SAME table and under the same keys the CLI
+// used. The keys are still written \`cloudcontrol list-resources <Type>\` on
+// purpose: what changed is how the question travels, not which question is asked,
+// and keeping the table identical is what makes that claim testable.
+function resolveCredentials() {
+	return { accessKeyId: 'AKIAFAKE', secretAccessKey: 'fake', sessionToken: null };
+}
+// The bucket location loop asks S3 once per bucket and does it concurrently, so
+// it takes the callback form. Same table, same keys -- only the shape of the
+// answer differs, which keeps the concurrent path and the sequential one honest
+// about testing the same thing.
 function execFile(bin, argv, _opts, cb) {
 	try { cb(null, execFileSync(bin, argv), ''); }
 	catch (e) { cb(e, '', e.stderr ?? e.message); }
 }
+// One type answers SLOWLY, and that is what makes the overlap observable. With
+// every answer instant, all seven types finish inside one batch of microtasks and
+// the reads -- which are woken by a listing finishing -- never get a turn before
+// the last one. That would leave the ordering assertion below passing or failing
+// on the event loop rather than on the design.
+const __SLOW = { 'AWS::IAM::Role': 40 };
+function cloudControl(operation, payload) {
+	const argv =
+		operation === 'ListResources'
+			? ['cloudcontrol', 'list-resources', '--type-name', payload.TypeName]
+			: ['cloudcontrol', 'get-resource', '--type-name', payload.TypeName, '--identifier', payload.Identifier];
+	const answer = () => {
+		try {
+			return { ok: true, value: JSON.parse(execFileSync('aws', argv)) };
+		} catch (e) {
+			// The real client turns a refusal into \`{ok:false, message}\` carrying the
+			// CLI's own \`<Exception>: <text>\` wording, which is what the caller's
+			// regexes read. The stub has to hand back the same shape or every failure
+			// would be classified as a success with no answer.
+			return { ok: false, message: String(e.stderr ?? e.message) };
+		}
+	};
+	const wait = operation === 'ListResources' ? (__SLOW[payload.TypeName] ?? 0) : 0;
+	// The call is recorded when it is answered, so a slow listing lands late in
+	// \`calls.json\` -- which is the order the assertion reads.
+	return wait ? new Promise((r) => setTimeout(() => r(answer()), wait)) : Promise.resolve(answer());
+}
 process.on('exit', () => { try { fs.writeFileSync('calls.json', JSON.stringify(__CALLS, null, 1)); } catch {} });
 `;
+
+/**
+ * The script with both outside calls swapped for the table.
+ *
+ * The Cloud Control import is deleted rather than rewritten: the copy runs from a
+ * temp directory, so a relative import would not resolve there even if the stub
+ * did not already define both names.
+ */
+const patched = (body) => original.replace(IMPORT_LINE, body).replace(CLOUD_CONTROL_LINE, '');
 
 let callsFromMainRun = [];
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'struct8-scan-'));
 try {
-	fs.writeFileSync(path.join(dir, 'scan-account.mjs'), original.replace(IMPORT_LINE, stub));
+	fs.writeFileSync(path.join(dir, 'scan-account.mjs'), patched(stub));
 	fs.writeFileSync(
 		path.join(dir, 'scan_scope.json'),
 		JSON.stringify({
@@ -314,7 +391,10 @@ try {
 				'AWS::IAM::Policy',
 				'AWS::ApiGateway::Resource',
 				'AWS::Events::Rule',
-				'AWS::Batch::JobQueue'
+				'AWS::Batch::JobQueue',
+				// Swept like any other type as far as Struct8 is concerned. What the
+				// scanner does with it is the subject of the assertions below.
+				'AWS::IAM::ManagedPolicy'
 			],
 			// IAM is deliberately NOT here: it is the global type whose members we want
 			// to discover BY REFERENCE, not a candidate to ask what it uses.
@@ -597,6 +677,46 @@ try {
 			!calls.some((c) => c.startsWith('cloudcontrol get-resource') && c.includes('AWS::IAM::Role')),
 		JSON.stringify(calls.filter((c) => c.startsWith('cloudcontrol get-resource')))
 	);
+	// The owner filter, which is the whole reason it is asked of IAM: Cloud Control
+	// would answer the account's 93 policies alongside AWS's 1574, over seventeen
+	// pages, and everything AWS owns would be dropped further along regardless.
+	check(
+		'a type AWS fills with its own catalogue is asked of the service that can filter by owner',
+		calls.some((c) => c.startsWith('iam list-policies') && c.includes('--scope Local')),
+		JSON.stringify(calls.filter((c) => c.startsWith('iam ')))
+	);
+	check(
+		'and the sweep does not ask Cloud Control for it as well',
+		!calls.some(
+			(c) => c.startsWith('cloudcontrol list-resources') && c.includes('AWS::IAM::ManagedPolicy')
+		),
+		JSON.stringify(calls.filter((c) => c.includes('ManagedPolicy')))
+	);
+	// THE CONTROL: dropping the type entirely would satisfy both checks above and
+	// lose every policy the account actually wrote.
+	check(
+		"and the account's own policy is in the inventory",
+		out.items.some((i) => i.importId === 'arn:aws:iam::262578989263:policy/deploy-can-write'),
+		JSON.stringify(out.items.filter((i) => i.cfnType === 'AWS::IAM::ManagedPolicy'))
+	);
+
+	// The two passes overlap. `calls.json` keeps the order they went out in, so the
+	// question "did a read start before the listing finished" is answerable here:
+	// a detail read must appear before the LAST listing, which cannot happen if the
+	// read waits for the sweep to end.
+	//
+	// It is worth asserting because the passes ask different Cloud Control
+	// operations, and those have separate rate capacity -- measured 2026-09-06 on
+	// 60 types and 60 roles, 12.3 s of listings and 14.7 s of reads took 16.0 s
+	// together against 27.1 s one after the other.
+	const lastList = calls.findLastIndex((c) => c.startsWith('cloudcontrol list-resources'));
+	const firstRead = calls.findIndex((c) => c.startsWith('cloudcontrol get-resource'));
+	check(
+		'a detail read goes out before the sweep has finished listing',
+		firstRead !== -1 && lastList !== -1 && firstRead < lastList,
+		`primeira leitura em ${firstRead}, ultima listagem em ${lastList}`
+	);
+
 	// Kept for the second run below, which asserts something about THIS one: the
 	// directory is gone by then.
 	callsFromMainRun = calls;
@@ -650,7 +770,7 @@ try {
 		check('the tag-run stub was built from the same shape as the main one', false);
 	}
 
-	fs.writeFileSync(path.join(dir2, 'scan-account.mjs'), original.replace(IMPORT_LINE, stubTag));
+	fs.writeFileSync(path.join(dir2, 'scan-account.mjs'), patched(stubTag));
 	// No vpcIds and no cfnTypes: this run is ONLY the tag path, so anything that
 	// shows up came from it.
 	fs.writeFileSync(

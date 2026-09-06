@@ -916,13 +916,46 @@ for (const group of aws('ec2', 'describe-security-groups', vpcFilter)?.SecurityG
 // scope: with `AWS::Events::Rule` absent from the sweep no rule reaches the
 // diagram, so a target would name a rule that is not there -- and the calls
 // below would be spent to produce it.
+//
+// A RULE AWS CREATED FOR ONE OF ITS OWN SERVICES IS MARKED, NOT DROPPED HERE.
+// `list-rules` answers `ManagedBy` -- `ecs.amazonaws.com` on the rule ECS creates
+// for a capacity provider -- and AWS refuses `PutRule` and `DeleteRule` on one, so
+// importing it produces a resource the account cannot change and Terraform cannot
+// destroy. Marking rather than dropping is the same division the rest of this file
+// keeps: the engine reports what the account holds, Struct8 decides what it
+// accepts, and `ownedBy` is the field it already reads to drop a row knowingly --
+// the NAT's address above arrives the same way.
+//
+// IT HAS TO BE MARKED HERE because nothing else can see it: Cloud Control's
+// `GetResource` for `AWS::Events::Rule` answers `EventBusName, EventPattern,
+// Description, State, Targets, Id, Arn, RuleName, Tags, Name` and no `ManagedBy`
+// (measured 2026-09-06 against the ECS rule in 952133486861). `list-rules`, which
+// this block already calls, is the only place in the scan where the fact appears.
 if (cfnTypes.includes('AWS::Events::Rule')) {
+	/** The sweep's own row for a rule, so the mark lands on what Struct8 reads. */
+	const sweptRule = (bus, name) => {
+		const tail = bus === 'default' ? `rule/${name}` : `rule/${bus}/${name}`;
+		return items.find(
+			(i) => i.cfnType === 'AWS::Events::Rule' && String(i.importId ?? '').endsWith(tail)
+		);
+	};
+
 	for (const bus of aws('events', 'list-event-buses')?.EventBuses ?? []) {
 		if (!bus.Name) continue;
 		const rules = aws('events', 'list-rules', ['--event-bus-name', bus.Name])?.Rules ?? [];
 		for (const rule of rules) {
 			if (!rule.Name) continue;
 			const scopedRule = bus.Name === 'default' ? rule.Name : `${bus.Name}/${rule.Name}`;
+
+			if (rule.ManagedBy) {
+				const row = sweptRule(bus.Name, rule.Name);
+				if (row) row.ownedBy = String(rule.ManagedBy);
+				// Its targets are not asked for. They belong to the same rule, so they
+				// carry the same answer, and reading them would spend a call per
+				// managed rule to produce rows that are dropped on arrival.
+				continue;
+			}
+
 			const targets =
 				aws('events', 'list-targets-by-rule', [
 					'--rule',

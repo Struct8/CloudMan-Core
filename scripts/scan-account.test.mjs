@@ -1089,5 +1089,117 @@ try {
 	fs.rmSync(dir3, { recursive: true, force: true });
 }
 
+// ------------------------- a fourth scan: the resources that have no region
+//
+// CloudFront, IAM and Route 53 answer the tagging API in us-east-1 and NOWHERE
+// else. Measured on 952133486861 (2026-09-10): asked in us-west-2 it returns 0
+// rows for the three; asked in us-east-1, 72, 1 and 15.
+//
+// So a sweep of any other region was losing them twice over. With a tag filter as
+// the scope they never arrived at all -- the roles included, not just the
+// CloudFront distribution that surfaced this. Without one they arrived from Cloud
+// Control carrying an identifier and nothing else, which put that account's
+// fifteen distributions on the selection screen as bare ids for the person to
+// tell apart.
+const OESTE = 'us-west-2';
+const CDN = 'E3RF0AX60CH06U';
+const dir4 = fs.mkdtempSync(path.join(os.tmpdir(), 'struct8-scan-global-'));
+try {
+	const ANSWERS_GLOBAL = {
+		'cloudcontrol list-resources AWS::CloudFront::Distribution': [
+			{ ResourceDescriptions: [{ Identifier: CDN }] }
+		],
+		// One key serves every call, so the pages ARE the sequence: the sweep's own
+		// region answers nothing -- as us-west-2 does on the real account -- and
+		// us-east-1 answers, for the tag pass and again for the naming pass.
+		'resourcegroupstaggingapi get-resources': [
+			{ ResourceTagMappingList: [], PaginationToken: '' },
+			{
+				ResourceTagMappingList: [
+					{
+						ResourceARN: `arn:aws:cloudfront::${A}:distribution/${CDN}`,
+						Tags: [{ Key: 'Name', Value: 'cdn-aberta' }]
+					}
+				],
+				PaginationToken: ''
+			}
+		],
+		'sts get-caller-identity': [{ Account: A }]
+	};
+	const stubGlobal = stub.replace(
+		`const __ANSWERS = ${JSON.stringify(ANSWERS)};`,
+		`const __ANSWERS = ${JSON.stringify(ANSWERS_GLOBAL)};`
+	);
+	if (stubGlobal === stub) {
+		check('the global-run stub was built from the same shape as the main one', false);
+	}
+
+	fs.writeFileSync(path.join(dir4, 'scan-account.mjs'), patched(stubGlobal));
+	fs.writeFileSync(
+		path.join(dir4, 'scan_scope.json'),
+		JSON.stringify({
+			region: OESTE,
+			vpcIds: [],
+			tagFilters: ['State=Site'],
+			cfnTypes: ['AWS::CloudFront::Distribution'],
+			cfnDetailTypes: [],
+			globalServices: ['cloudfront', 'iam', 'route53']
+		})
+	);
+	execFileSync('node', ['scan-account.mjs'], { cwd: dir4, encoding: 'utf-8', stdio: 'pipe' });
+
+	const out4 = JSON.parse(fs.readFileSync(path.join(dir4, 'scan_inventory.json'), 'utf-8'));
+	const calls4 = JSON.parse(fs.readFileSync(path.join(dir4, 'calls.json'), 'utf-8'));
+	const tagging = calls4.filter((c) => c.startsWith('resourcegroupstaggingapi get-resources'));
+
+	check(
+		'the sweep still asks its own region for tags',
+		tagging.some((c) => c.includes(`--region ${OESTE}`)),
+		JSON.stringify(tagging)
+	);
+	check(
+		'and asks us-east-1 too, which is the only region that answers for them',
+		tagging.some((c) => c.includes('--region us-east-1')),
+		JSON.stringify(tagging)
+	);
+	// NARROWED, and that is the half that keeps it honest: unnarrowed, the second
+	// call would drag every tagged resource of us-east-1 into a sweep of Oregon.
+	check(
+		'narrowed to the services with no region, never the whole of us-east-1',
+		tagging
+			.filter((c) => c.includes('--region us-east-1'))
+			.every((c) => c.includes('--resource-type-filters cloudfront iam route53')),
+		JSON.stringify(tagging.filter((c) => c.includes('--region us-east-1')))
+	);
+	// And the tag filter travels on it -- a scope is a scope in both regions.
+	check(
+		'carrying the same tag filter the person asked for',
+		tagging.some((c) => c.includes('--region us-east-1') && c.includes('Key=State,Values=Site')),
+		JSON.stringify(tagging.filter((c) => c.includes('--region us-east-1')))
+	);
+
+	const swept4 = out4.items.find((i) => i.importId === CDN);
+	check('the distribution is in the inventory', !!swept4, JSON.stringify(out4.items));
+	// THE POINT OF THE NAMING PASS: without it this row is `E3RF0AX60CH06U` and
+	// nothing else, and the person picks theirs out of fifteen by id.
+	check(
+		'and it arrives with the name its tag gives it',
+		swept4?.tags?.Name === 'cdn-aberta',
+		JSON.stringify(swept4)
+	);
+} finally {
+	fs.rmSync(dir4, { recursive: true, force: true });
+}
+
+// THE CONTROL, and the one that would rot quietly: an older Struct8 sends no
+// `globalServices`, and then none of the above may happen. The main run at the top
+// of this file is exactly that scan -- no tag filter, no list of global services
+// -- and it must not reach the tagging API in any region.
+check(
+	'with no global services declared, us-east-1 is never asked',
+	!callsFromMainRun.some((c) => c.startsWith('resourcegroupstaggingapi')),
+	JSON.stringify(callsFromMainRun.filter((c) => c.startsWith('resourcegroupstaggingapi')))
+);
+
 console.log(failures === 0 ? '\nALL CASES PASSED' : `\n${failures} CASE(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

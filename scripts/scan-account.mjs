@@ -68,6 +68,11 @@ const region = argOf('region') || scope.region || process.env.AWS_REGION || null
 const outPath = argOf('out', 'scan_inventory.json');
 const vpcIds = allOf('vpc').length ? allOf('vpc') : (scope.vpcIds ?? []);
 const tagFilters = allOf('tag').length ? allOf('tag') : (scope.tagFilters ?? []);
+// The services whose resources have no region. Struct8 sends them for the same
+// reason it sends the types: that is catalog knowledge, and this script holds
+// none. Absent -- an older Struct8 -- everything below is skipped and the sweep
+// behaves exactly as it did.
+const globalServices = scope.globalServices ?? [];
 // The types to sweep. Struct8 sends them because Struct8 is what owns the
 // catalog -- this script deliberately knows no CloudMan type names, so that a
 // resource added to the catalog costs nothing here.
@@ -108,11 +113,11 @@ const errors = [];
  * actually act on under three hundred that mean "this type never lists, for
  * anyone" -- and would make a complete scan read as a broken one.
  */
-function aws(service, operation, extra = [], expected = null) {
+function aws(service, operation, extra = [], expected = null, inRegion = region) {
 	try {
 		const out = execFileSync(
 			'aws',
-			[service, operation, '--region', region, '--output', 'json', ...extra],
+			[service, operation, '--region', inRegion, '--output', 'json', ...extra],
 			{ encoding: 'utf-8', maxBuffer: 64 * 1024 * 1024 }
 		);
 		return JSON.parse(out);
@@ -692,6 +697,34 @@ const detailPool = Promise.all(
 // resources carry this tag", and `tagFilters` is a scope input. It is no longer
 // the default path, so its two defects -- silent about the untagged, still
 // answering for the destroyed -- only reach someone who asked for a tag filter.
+
+/** Every row the tagging API answers in `inRegion`, following its pages. */
+const taggedRows = (inRegion, extra) => {
+	const rows = [];
+	let token = null;
+	do {
+		const page = aws(
+			'resourcegroupstaggingapi',
+			'get-resources',
+			token ? [...extra, '--pagination-token', token] : extra,
+			null,
+			inRegion
+		);
+		if (!page) break;
+		rows.push(...(page.ResourceTagMappingList ?? []));
+		token = page.PaginationToken || null;
+	} while (token);
+	return rows;
+};
+
+// A resource with no region is tagged in us-east-1 and NOWHERE else. Measured on
+// 952133486861 (2026-09-10): asked in us-west-2 the tagging API answers 0 rows
+// for `iam`, `route53` and `cloudfront`; asked in us-east-1, 72, 1 and 15.
+const GLOBAL_TAG_REGION = 'us-east-1';
+
+/** The same query, narrowed to the services that have no region. */
+const globalOnly = (extra) => [...extra, '--resource-type-filters', ...globalServices];
+
 if (tagFilters.length) {
 	const extra = ['--resources-per-page', '100'];
 	for (const filter of tagFilters) {
@@ -699,19 +732,51 @@ if (tagFilters.length) {
 		extra.push('--tag-filters', value ? `Key=${key},Values=${value}` : `Key=${key}`);
 	}
 
-	let token = null;
-	do {
-		const page = aws(
-			'resourcegroupstaggingapi',
-			'get-resources',
-			token ? [...extra, '--pagination-token', token] : extra
-		);
-		if (!page) break;
-		for (const row of page.ResourceTagMappingList ?? []) {
+	for (const row of taggedRows(region, extra)) push(row.ResourceARN, { tags: tagsOf(row.Tags) });
+
+	// THE SAME QUESTION AGAIN IN US-EAST-1, and narrowed, which is the half that
+	// keeps it honest: unnarrowed it would drag every tagged resource of us-east-1
+	// into a sweep of somewhere else. Without it, a tag-scoped sweep of any other
+	// region loses the account-wide rows outright -- not only the CloudFront
+	// distribution in front of a bucket, the roles with it.
+	if (region !== GLOBAL_TAG_REGION && globalServices.length) {
+		for (const row of taggedRows(GLOBAL_TAG_REGION, globalOnly(extra))) {
 			push(row.ResourceARN, { tags: tagsOf(row.Tags) });
 		}
-		token = page.PaginationToken || null;
-	} while (token);
+	}
+}
+
+// ---------------------------- layer 1a-bis-2: a name for the rows with no region
+//
+// Nothing else gives them one. Tags reach a row from the tagging API -- asked
+// only on a tag filter, above -- or from the EC2 network listings; a Cloud
+// Control listing answers an identifier and nothing more. So a sweep of Oregon
+// offers the account's distributions as `E3RF0AX60CH06U`, and the person doing
+// the import has to find theirs among fifteen by id.
+//
+// IT ENRICHES, IT NEVER PUSHES. This API still answers for resources destroyed
+// hours earlier, which is why it stopped being the sweep's source. A tagged ARN
+// with no row already in `items` is dropped here, so that defect cannot come back
+// in through this door.
+if (globalServices.length) {
+	// Cloud Control identifies a distribution by its id and a role by its name,
+	// while the tagging API answers a full ARN. Same match as the detail read.
+	const tail = (value) => String(value).split(/[/:]/).pop();
+	const byId = new Map();
+	for (const item of items) {
+		if (item.importId) byId.set(String(item.importId), item);
+	}
+
+	let named = 0;
+	for (const row of taggedRows(GLOBAL_TAG_REGION, globalOnly(['--resources-per-page', '100']))) {
+		const hit = byId.get(String(row.ResourceARN)) ?? byId.get(tail(row.ResourceARN));
+		if (!hit || hit.tags) continue;
+		hit.tags = tagsOf(row.Tags);
+		named++;
+	}
+	if (named) {
+		console.error(`scan-account: ${named} row(s) with no region arrived with their tags.`);
+	}
 }
 
 // ------------------------------------------- layer 1a-ter: S3 answers globally

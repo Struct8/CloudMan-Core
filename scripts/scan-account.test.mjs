@@ -321,8 +321,11 @@ function __keyOf(argv) {
 	// with the first one's targets.
 	const bus = at('--event-bus-name');
 	const rule = at('--rule');
+	// And the parent a child type is listed from, so one balancer's listeners are
+	// answered apart from another's.
+	const model = at('--resource-model');
 	return base + (type ? ' ' + type : '') + (ident ? ' ' + ident : '') +
-		(bus ? ' ' + bus : '') + (rule ? ' ' + rule : '');
+		(bus ? ' ' + bus : '') + (rule ? ' ' + rule : '') + (model ? ' ' + model : '');
 }
 function execFileSync(_bin, argv) {
 	const key = __keyOf(argv);
@@ -363,7 +366,7 @@ const __SLOW = { 'AWS::IAM::Role': 40 };
 function cloudControl(operation, payload) {
 	const argv =
 		operation === 'ListResources'
-			? ['cloudcontrol', 'list-resources', '--type-name', payload.TypeName]
+			? ['cloudcontrol', 'list-resources', '--type-name', payload.TypeName, ...(payload.ResourceModel ? ['--resource-model', payload.ResourceModel] : [])]
 			: ['cloudcontrol', 'get-resource', '--type-name', payload.TypeName, '--identifier', payload.Identifier];
 	const answer = () => {
 		try {
@@ -883,6 +886,207 @@ try {
 	);
 } finally {
 	fs.rmSync(dir2, { recursive: true, force: true });
+}
+
+// ------------------------------------ a third scan: the children, and the names
+//
+// A listener lists only FROM its balancer: Cloud Control refuses the plain LIST
+// and names the property it wants in the resource model. Struct8 declares which
+// child comes from which parent (`cfnChildTypes`), and the scanner asks once per
+// parent the sweep found. The same run covers what the detail read now records
+// for a swept row: its tags, the name CloudFormation spells after the type, and
+// the auto scaling group that launched an instance.
+const dir3 = fs.mkdtempSync(path.join(os.tmpdir(), 'struct8-scan-child-'));
+try {
+	const LB = `arn:aws:elasticloadbalancing:${R}:${A}:loadbalancer/app/application-load-balancer/2b0ab14600dda1c1`;
+	const LISTENER = `arn:aws:elasticloadbalancing:${R}:${A}:listener/app/application-load-balancer/2b0ab14600dda1c1/720b7f319126eff1`;
+	const TG = `arn:aws:elasticloadbalancing:${R}:${A}:targetgroup/web-target-group/fa33c1c324570f6f`;
+	const ANSWERS_CHILD = {
+		'cloudcontrol list-resources AWS::ElasticLoadBalancingV2::LoadBalancer': [
+			{ ResourceDescriptions: [{ Identifier: LB, Properties: '{}' }] }
+		],
+		// Answered ONLY under the balancer's model: a plain ask has no entry, which
+		// the stub reports as an unexpected call.
+		[`cloudcontrol list-resources AWS::ElasticLoadBalancingV2::Listener {"LoadBalancerArn":"${LB}"}`]: [
+			{ ResourceDescriptions: [{ Identifier: LISTENER, Properties: '{}' }] }
+		],
+		[`cloudcontrol get-resource AWS::ElasticLoadBalancingV2::LoadBalancer ${LB}`]: [
+			{
+				ResourceDescription: {
+					Identifier: LB,
+					Properties: JSON.stringify({
+						LoadBalancerArn: LB,
+						LoadBalancerName: 'application-load-balancer',
+						Tags: [{ Key: 'Name', Value: 'application-load-balancer' }, { Key: 'State', Value: 'alb-web-servers' }]
+					})
+				}
+			}
+		],
+		[`cloudcontrol get-resource AWS::ElasticLoadBalancingV2::Listener ${LISTENER}`]: [
+			{
+				ResourceDescription: {
+					Identifier: LISTENER,
+					Properties: JSON.stringify({
+						ListenerArn: LISTENER,
+						LoadBalancerArn: LB,
+						Port: 80,
+						Protocol: 'HTTP',
+						DefaultActions: [{ Type: 'forward', TargetGroupArn: TG }]
+					})
+				}
+			}
+		],
+		'cloudcontrol list-resources AWS::EC2::Instance': [
+			{
+				ResourceDescriptions: [
+					{ Identifier: 'i-0492eb0a111f90cb4', Properties: '{}' },
+					{ Identifier: 'i-0fefd2d2339113deb', Properties: '{}' }
+				]
+			}
+		],
+		// Launched by the group: AWS stamps the group's name on it. `KeyName` is the
+		// key pair, and must not become the instance's name.
+		'cloudcontrol get-resource AWS::EC2::Instance i-0492eb0a111f90cb4': [
+			{
+				ResourceDescription: {
+					Identifier: 'i-0492eb0a111f90cb4',
+					Properties: JSON.stringify({
+						InstanceId: 'i-0492eb0a111f90cb4',
+						KeyName: 'oregon-keypair',
+						Tags: [
+							{ Key: 'aws:autoscaling:groupName', Value: 'web-server-asg' },
+							{ Key: 'Name', Value: 'web-server-asg' }
+						]
+					})
+				}
+			}
+		],
+		'cloudcontrol get-resource AWS::EC2::Instance i-0fefd2d2339113deb': [
+			{
+				ResourceDescription: {
+					Identifier: 'i-0fefd2d2339113deb',
+					Properties: JSON.stringify({
+						InstanceId: 'i-0fefd2d2339113deb',
+						KeyName: 'oregon-keypair',
+						Tags: [{ Key: 'Name', Value: 'nat-instance' }]
+					})
+				}
+			}
+		],
+		// No `Tags` at all in this read: the name comes from the property
+		// CloudFormation spells after the type.
+		'cloudcontrol list-resources AWS::EC2::LaunchTemplate': [
+			{ ResourceDescriptions: [{ Identifier: 'lt-0d6e73a1434f8d838', Properties: '{}' }] }
+		],
+		'cloudcontrol get-resource AWS::EC2::LaunchTemplate lt-0d6e73a1434f8d838': [
+			{
+				ResourceDescription: {
+					Identifier: 'lt-0d6e73a1434f8d838',
+					Properties: JSON.stringify({
+						LaunchTemplateName: 'web-server-launch-template',
+						LaunchTemplateId: 'lt-0d6e73a1434f8d838',
+						LatestVersionNumber: 1
+					})
+				}
+			}
+		],
+		'sts get-caller-identity': [{ Account: A }]
+	};
+	const stubChild = stub.replace(
+		`const __ANSWERS = ${JSON.stringify(ANSWERS)};`,
+		`const __ANSWERS = ${JSON.stringify(ANSWERS_CHILD)};`
+	);
+	if (stubChild === stub) {
+		check('the child-run stub was built from the same shape as the main one', false);
+	}
+	fs.writeFileSync(path.join(dir3, 'scan-account.mjs'), patched(stubChild));
+	fs.writeFileSync(
+		path.join(dir3, 'scan_scope.json'),
+		JSON.stringify({
+			region: R,
+			vpcIds: [],
+			tagFilters: [],
+			cfnTypes: [
+				'AWS::ElasticLoadBalancingV2::LoadBalancer',
+				'AWS::EC2::Instance',
+				'AWS::EC2::LaunchTemplate'
+			],
+			cfnDetailTypes: [
+				'AWS::ElasticLoadBalancingV2::LoadBalancer',
+				'AWS::ElasticLoadBalancingV2::Listener',
+				'AWS::EC2::Instance',
+				'AWS::EC2::LaunchTemplate'
+			],
+			cfnChildTypes: [
+				{
+					type: 'AWS::ElasticLoadBalancingV2::Listener',
+					parent: 'AWS::ElasticLoadBalancingV2::LoadBalancer',
+					model: 'LoadBalancerArn'
+				}
+			]
+		})
+	);
+	execFileSync('node', ['scan-account.mjs'], { cwd: dir3, encoding: 'utf-8', stdio: 'pipe' });
+
+	const out3 = JSON.parse(fs.readFileSync(path.join(dir3, 'scan_inventory.json'), 'utf-8'));
+	const calls3 = JSON.parse(fs.readFileSync(path.join(dir3, 'calls.json'), 'utf-8'));
+	const row = (id) => out3.items.find((i) => i.importId === id);
+
+	check(
+		'the listener came, listed from its balancer',
+		row(LISTENER)?.cfnType === 'AWS::ElasticLoadBalancingV2::Listener',
+		JSON.stringify(out3.items.map((i) => i.importId))
+	);
+	const listenerAsks = calls3.filter((c) =>
+		c.startsWith('cloudcontrol list-resources --type-name AWS::ElasticLoadBalancingV2::Listener')
+	);
+	check(
+		'and it was asked WITH the resource model, never plainly',
+		listenerAsks.length === 1 && listenerAsks[0].includes('--resource-model {"LoadBalancerArn":'),
+		JSON.stringify(listenerAsks)
+	);
+	check(
+		'after its parent was listed',
+		calls3.findIndex((c) => c.startsWith('cloudcontrol list-resources --type-name AWS::ElasticLoadBalancingV2::LoadBalancer')) <
+			calls3.findIndex((c) => c.startsWith('cloudcontrol list-resources --type-name AWS::ElasticLoadBalancingV2::Listener'))
+	);
+	check(
+		'the listener was read in detail and names its balancer',
+		row(LB)?.referencedBy?.includes(LISTENER),
+		JSON.stringify(row(LB))
+	);
+	check('the scope echo counts the children', out3.scope.cfnChildTypeCount === 1, JSON.stringify(out3.scope));
+
+	// ---- what the detail read records on a swept row
+	check(
+		'a swept row now carries the tags its detail read answered',
+		row(LB)?.tags?.Name === 'application-load-balancer' && row(LB)?.tags?.State === 'alb-web-servers',
+		JSON.stringify(row(LB)?.tags)
+	);
+	check(
+		'the instance the group launched comes marked as owned by it',
+		row('i-0492eb0a111f90cb4')?.ownedBy === 'web-server-asg',
+		JSON.stringify(row('i-0492eb0a111f90cb4'))
+	);
+	check(
+		'and the one nobody launched comes with its Name and no owner',
+		row('i-0fefd2d2339113deb')?.tags?.Name === 'nat-instance' && row('i-0fefd2d2339113deb')?.ownedBy == null,
+		JSON.stringify(row('i-0fefd2d2339113deb'))
+	);
+	check(
+		"a read with no Tags names the row by CloudFormation's <Type>Name property",
+		row('lt-0d6e73a1434f8d838')?.nameHint === 'web-server-launch-template',
+		JSON.stringify(row('lt-0d6e73a1434f8d838'))
+	);
+	// THE CONTROL: `KeyName` on an instance is its key pair, not its name. The
+	// convention reads `InstanceName`, which does not exist, so nothing is written.
+	check(
+		'and a Name tag is never displaced by another *Name property',
+		row('i-0fefd2d2339113deb')?.nameHint == null && row('i-0492eb0a111f90cb4')?.nameHint == null,
+		JSON.stringify([row('i-0fefd2d2339113deb')?.nameHint, row('i-0492eb0a111f90cb4')?.nameHint])
+	);
+} finally {
+	fs.rmSync(dir3, { recursive: true, force: true });
 }
 
 console.log(failures === 0 ? '\nALL CASES PASSED' : `\n${failures} CASE(S) FAILED`);

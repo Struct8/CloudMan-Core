@@ -76,6 +76,10 @@ const cfnTypes = allOf('type').length ? allOf('type') : (scope.cfnTypes ?? []);
 // sends it because only the catalog knows which types can become a node -- asking
 // every swept row would be one call per resource in the account.
 const cfnDetailTypes = allOf('detail').length ? allOf('detail') : (scope.cfnDetailTypes ?? []);
+// The types Cloud Control lists only from a parent -- `{ type, parent, model }`,
+// in the order the children depend on each other. Struct8 declares them next
+// to the types it sweeps, for the same reason: it holds the catalog.
+const cfnChildTypes = Array.isArray(scope.cfnChildTypes) ? scope.cfnChildTypes : [];
 // Echoed into the answer, and that is its whole job.
 //
 // `scan_inventory.json` sits at a fixed path, so the file the PREVIOUS scan wrote
@@ -340,6 +344,7 @@ const readOne = async (row, onThrottle) => {
 	// So every string VALUE in the answer is offered too, matched whole against
 	// what the sweep found -- values, not a search through the text, because a
 	// substring hit would tie together resources that merely share a prefix.
+	let parsed = null;
 	try {
 		const walk = (value) => {
 			if (typeof value === 'string') {
@@ -350,9 +355,39 @@ const readOne = async (row, onThrottle) => {
 				Object.values(value).forEach(walk);
 			}
 		};
-		walk(JSON.parse(properties));
+		parsed = JSON.parse(properties);
+		walk(parsed);
 	} catch {
 		// Properties that will not parse still gave up their ARNs above.
+	}
+
+	// WHAT THE ROW IS CALLED, AND WHO LAUNCHED IT. Both live in this read and
+	// nowhere else for a row the sweep answered: the sweep gives an identifier and
+	// nothing more, and the tagging API runs only on ask. Left out, Struct8 named
+	// the balancer after its ARN and the instance after its id while the account
+	// had `Name` on both.
+	//
+	// `Tags` is the one property every taggable type spells the same way. The
+	// name property follows CloudFormation's own convention, `<Type>Name`
+	// (`LaunchTemplateName`, `FunctionName`), and is read only when there is no
+	// `Name` tag to prefer -- the convention is also what keeps an instance's
+	// `KeyName`, which names its key pair, out of it.
+	//
+	// `aws:autoscaling:groupName` is the tag AWS stamps on what an auto scaling
+	// group launched, and it is visible here and here only. Marked the way the
+	// NAT gateway's address is (`ownedBy`), so Struct8 drops the row knowingly:
+	// adopting the instance would hand Terraform a resource the group replaces
+	// at will. Measured 2026-09-10 on 952133486861/us-west-2, three instances of
+	// `web-server-asg` offered as resources of their own.
+	if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+		const tags = Array.isArray(parsed.Tags) ? tagsOf(parsed.Tags) : {};
+		if (Object.keys(tags).length) row.tags = { ...tags, ...(row.tags ?? {}) };
+		const owner = tags['aws:autoscaling:groupName'];
+		if (typeof owner === 'string' && owner && row.ownedBy == null) row.ownedBy = owner;
+		const named = parsed[`${String(row.cfnType ?? '').split('::').pop()}Name`];
+		if (!tags.Name && typeof named === 'string' && named.trim() && row.nameHint == null) {
+			row.nameHint = named.trim();
+		}
 	}
 
 	for (const name of names) {
@@ -554,21 +589,28 @@ const detailPool = Promise.all(
 	 */
 	const sweptByType = new Map();
 
-	async function sweep(type, onThrottle) {
-		const earlier = sweptByType.get(type);
+	async function sweep(type, onThrottle, model = null) {
+		// One listing per parent when a model is given: one balancer's listeners are
+		// not another's, and a retry takes back only its own rows.
+		const sweptKey = model ? `${type}\u0000${model}` : type;
+		const earlier = sweptByType.get(sweptKey);
 		if (earlier?.length) {
 			const drop = new Set(earlier);
 			for (let i = items.length - 1; i >= 0; i--) if (drop.has(items[i])) items.splice(i, 1);
 		}
 		const mine = [];
-		sweptByType.set(type, mine);
+		sweptByType.set(sweptKey, mine);
 
 		let token = null;
 		let complete = false;
 		do {
 			const page = await cloudControlAsync(
 				'ListResources',
-				token ? { TypeName: type, NextToken: token } : { TypeName: type },
+				{
+					TypeName: type,
+					...(model ? { ResourceModel: model } : {}),
+					...(token ? { NextToken: token } : {})
+				},
 				(message) => {
 					if (onThrottle && isThrottle(message)) {
 						onThrottle(type);
@@ -603,6 +645,40 @@ const detailPool = Promise.all(
 		const again = throttled.splice(0, throttled.length);
 		console.error(`scan-account: ${again.length} type(s) rate limited -- asking again, ${width} at a time.`);
 		await inParallel(again, width, (type) => sweep(type, width > 1 ? (t) => throttled.push(t) : null));
+	}
+
+	// ---------------------------------------- the types listed from a parent
+	//
+	// A listener lists from its load balancer and a rule from its listener: the
+	// LIST handler refuses a plain call and names the property it wants in the
+	// resource model. The sweep above counts those refusals among the types with
+	// no usable LIST, which is true of the call and false of the account -- and a
+	// balancer imported without its listener is refused by the compile, since a
+	// balancer that listens on nothing forwards nothing. Measured 2026-09-10 on
+	// 952133486861/us-west-2: the listener of `application-load-balancer` absent
+	// from every scan of the account.
+	//
+	// Struct8 says which child comes from which parent and under which property
+	// (`cfnChildTypes`), in the order they depend on each other, so a child of a
+	// child is asked after its parent has been listed. One listing per parent the
+	// sweep found, with the same ladder underneath as the sweep itself.
+	for (const child of cfnChildTypes) {
+		if (!child?.type || !child?.parent || !child?.model) continue;
+		const asks = items
+			.filter((i) => i.cfnType === child.parent && i.importId)
+			.map((i) => ({ type: child.type, model: JSON.stringify({ [child.model]: String(i.importId) }) }));
+		if (!asks.length) continue;
+		const throttledAsks = [];
+		await inParallel(asks, 8, (ask) => sweep(ask.type, () => throttledAsks.push(ask), ask.model));
+		for (let width = 4; width >= 1 && throttledAsks.length; width = Math.floor(width / 2)) {
+			const again = throttledAsks.splice(0, throttledAsks.length);
+			console.error(
+				`scan-account: ${again.length} listing(s) of ${child.type} rate limited -- asking again, ${width} at a time.`
+			);
+			await inParallel(again, width, (ask) =>
+				sweep(ask.type, width > 1 ? () => throttledAsks.push(ask) : null, ask.model)
+			);
+		}
 	}
 
 	if (skipped) {
@@ -994,7 +1070,13 @@ fs.writeFileSync(
 			// The type list is echoed as a count, not in full: it is hundreds of
 			// entries, Struct8 already has it, and the number is what tells someone
 			// reading this file whether the sweep was as wide as they meant.
-			scope: { vpcIds, tagFilters, cfnTypeCount: cfnTypes.length, cfnDetailTypeCount: cfnDetailTypes.length },
+			scope: {
+				vpcIds,
+				tagFilters,
+				cfnTypeCount: cfnTypes.length,
+				cfnDetailTypeCount: cfnDetailTypes.length,
+				cfnChildTypeCount: cfnChildTypes.length
+			},
 			items,
 			detailUnread,
 			errors

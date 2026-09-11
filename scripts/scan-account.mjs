@@ -250,6 +250,35 @@ const push = (arn, extra = {}) => {
 const tagsOf = (list) =>
 	Object.fromEntries((list ?? []).map((t) => [t.Key ?? t.key, t.Value ?? t.value]));
 
+/**
+ * The ARN a Cloud Control listing carries inside its properties, when it does.
+ *
+ * The identifier and the ARN are not the same string for every type, and when
+ * they differ the reference that points at the resource uses the ARN while the
+ * row is keyed by the identifier -- so they never meet. Measured on
+ * 952133486861 (2026-09-10): `AWS::CloudFront::KeyValueStore` lists as
+ * `Identifier: "kvs-validacao"` with `Properties` holding
+ * `{"Id":"17f7e222-...","Arn":"arn:aws:cloudfront::...:key-value-store/17f7e222-...","Name":"kvs-validacao"}`,
+ * and the function that reads that store names it BY ARN. Neither the ARN nor
+ * its tail is the name, so the store was never marked and never offered.
+ *
+ * KEPT OUT OF `arn`, deliberately. That field feeds the frontend's drop rules and
+ * its type resolution, and filling it for hundreds of rows that never had one
+ * would change what the selection screen shows for reasons that have nothing to
+ * do with this. Only the matching below reads it.
+ */
+const listedArn = (properties) => {
+	if (typeof properties !== 'string') return null;
+	try {
+		const parsed = JSON.parse(properties);
+		const arn = parsed?.Arn ?? parsed?.ARN ?? parsed?.arn;
+		return typeof arn === 'string' && arn.startsWith('arn:') ? arn : null;
+	} catch {
+		// Properties that will not parse simply carry no ARN for this purpose.
+		return null;
+	}
+};
+
 // ------------------------------- the detail read, running DURING the sweep
 //
 // WHY IT STARTS HERE instead of after the sweep, where it reads. The two passes
@@ -626,9 +655,20 @@ const detailPool = Promise.all(
 			);
 			if (!page) break;
 			for (const row of page.ResourceDescriptions ?? []) {
-				// No ARN: Cloud Control does not answer one. The type and the import id
-				// are what the frontend needs, and they are both here.
-				if (row.Identifier) mine.push(push(null, { cfnType: type, importId: row.Identifier }));
+				// `arn` stays null: the frontend's drop rules and type resolution read
+				// that field, and Cloud Control does not answer an ARN for most types.
+				// What the properties DO carry, when they carry it, goes in `listedArn`
+				// and is read by the matching at the end of the detail pass -- see the
+				// note there.
+				if (row.Identifier) {
+					mine.push(
+						push(null, {
+							cfnType: type,
+							importId: row.Identifier,
+							...(listedArn(row.Properties) ? { listedArn: listedArn(row.Properties) } : {})
+						})
+					);
+				}
 			}
 			token = page.NextToken || null;
 			complete = !token;
@@ -883,11 +923,19 @@ if (cfnDetailTypes.length) {
 	// being equal outright -- whichever the type happens to use.
 	const tail = (value) => String(value).split(/[/:]/).pop();
 	const byIdentifier = new Map();
+	const key = (value, row) => {
+		const k = String(value);
+		if (!byIdentifier.has(k)) byIdentifier.set(k, []);
+		if (!byIdentifier.get(k).includes(row)) byIdentifier.get(k).push(row);
+	};
 	for (const row of items) {
-		if (!row.importId) continue;
-		const id = String(row.importId);
-		if (!byIdentifier.has(id)) byIdentifier.set(id, []);
-		byIdentifier.get(id).push(row);
+		if (row.importId) key(row.importId, row);
+		// AND BY THE ARN THE LISTING CARRIED, when the two are different strings.
+		// A key value store lists as `kvs-validacao` and the function that reads it
+		// names `arn:...:key-value-store/17f7e222-...`; the identifier is the name,
+		// the ARN's tail is a UUID, and neither lookup below could ever meet the
+		// other (952133486861, 2026-09-10 -- the store was never offered).
+		if (row.listedArn) key(row.listedArn, row);
 	}
 
 	let marked = 0;

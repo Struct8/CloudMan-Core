@@ -1201,5 +1201,84 @@ check(
 	JSON.stringify(callsFromMainRun.filter((c) => c.startsWith('resourcegroupstaggingapi')))
 );
 
+// ----------- a fifth scan: when the identifier and the ARN are different strings
+//
+// A key value store lists as `Identifier: "kvs-validacao"` -- its NAME -- while
+// its properties carry `Arn: arn:...:key-value-store/<uuid>`. The function that
+// reads the store names it BY ARN, whose tail is that uuid. So the identifier is
+// a name, the reference is a uuid, and the two lookups in the detail pass could
+// never meet: measured on 952133486861 (2026-09-10), the store was never marked
+// and never reached the selection screen, while the function that reads it did.
+const FN = 'arn:aws:cloudfront::262578989263:function/viewer-request-kvs1';
+const KVS_UUID = '17f7e222-474c-4b49-a69e-ecccfb4e6297';
+const KVS_ARN = `arn:aws:cloudfront::262578989263:key-value-store/${KVS_UUID}`;
+const dir5 = fs.mkdtempSync(path.join(os.tmpdir(), 'struct8-scan-arn-'));
+try {
+	const ANSWERS_ARN = {
+		'cloudcontrol list-resources AWS::CloudFront::Function': [
+			{ ResourceDescriptions: [{ Identifier: FN, Properties: JSON.stringify({ FunctionARN: FN }) }] }
+		],
+		'cloudcontrol list-resources AWS::CloudFront::KeyValueStore': [
+			{
+				ResourceDescriptions: [
+					{
+						Identifier: 'kvs-validacao',
+						Properties: JSON.stringify({ Id: KVS_UUID, Arn: KVS_ARN, Name: 'kvs-validacao' })
+					}
+				]
+			}
+		],
+		[`cloudcontrol get-resource AWS::CloudFront::Function ${FN}`]: [
+			{
+				ResourceDescription: {
+					Identifier: FN,
+					Properties: JSON.stringify({
+						FunctionARN: FN,
+						FunctionConfig: { KeyValueStoreAssociations: [{ KeyValueStoreARN: KVS_ARN }] }
+					})
+				}
+			}
+		],
+		'sts get-caller-identity': [{ Account: A }]
+	};
+	const stubArn = stub.replace(
+		`const __ANSWERS = ${JSON.stringify(ANSWERS)};`,
+		`const __ANSWERS = ${JSON.stringify(ANSWERS_ARN)};`
+	);
+	if (stubArn === stub) {
+		check('the arn-run stub was built from the same shape as the main one', false);
+	}
+
+	fs.writeFileSync(path.join(dir5, 'scan-account.mjs'), patched(stubArn));
+	fs.writeFileSync(
+		path.join(dir5, 'scan_scope.json'),
+		JSON.stringify({
+			region: R,
+			vpcIds: [],
+			tagFilters: [],
+			cfnTypes: ['AWS::CloudFront::Function', 'AWS::CloudFront::KeyValueStore'],
+			cfnDetailTypes: ['AWS::CloudFront::Function']
+		})
+	);
+	execFileSync('node', ['scan-account.mjs'], { cwd: dir5, encoding: 'utf-8', stdio: 'pipe' });
+
+	const out5 = JSON.parse(fs.readFileSync(path.join(dir5, 'scan_inventory.json'), 'utf-8'));
+	const store = out5.items.find((i) => i.importId === 'kvs-validacao');
+
+	check('the store is in the inventory', !!store, JSON.stringify(out5.items));
+	// THE POINT: the function named it by ARN and the row is keyed by its name.
+	check(
+		'and it says the function names it, matched on the ARN the listing carried',
+		(store?.referencedBy ?? []).includes(FN),
+		JSON.stringify(store)
+	);
+	// THE CONTROL: `arn` stays empty. That field feeds the frontend's drop rules
+	// and its type resolution, and filling it for every swept row would change the
+	// selection screen for reasons that have nothing to do with this matching.
+	check('while the row itself still carries no arn', store?.arn == null, JSON.stringify(store));
+} finally {
+	fs.rmSync(dir5, { recursive: true, force: true });
+}
+
 console.log(failures === 0 ? '\nALL CASES PASSED' : `\n${failures} CASE(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

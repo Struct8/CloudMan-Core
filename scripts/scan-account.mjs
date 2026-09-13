@@ -85,6 +85,11 @@ const cfnDetailTypes = allOf('detail').length ? allOf('detail') : (scope.cfnDeta
 // in the order the children depend on each other. Struct8 declares them next
 // to the types it sweeps, for the same reason: it holds the catalog.
 const cfnChildTypes = Array.isArray(scope.cfnChildTypes) ? scope.cfnChildTypes : [];
+// And the types it lists only within a slice of a service -- `{ type, model,
+// values }`, where the slice is a constant and not another resource. Same reason
+// it arrives declared rather than known here: only the catalog can enumerate a
+// service's namespaces.
+const cfnValueTypes = Array.isArray(scope.cfnValueTypes) ? scope.cfnValueTypes : [];
 // Echoed into the answer, and that is its whole job.
 //
 // `scan_inventory.json` sits at a fixed path, so the file the PREVIOUS scan wrote
@@ -478,7 +483,15 @@ const readOne = async (row, onThrottle) => {
 		// AWS-generated UUID in the name that is its import id.
 		//
 		// It costs no call: this is the same answer the block above already parsed.
-		if (row.cfnType === 'AWS::AutoScaling::ScalingPolicy') {
+		// OS DOIS SERVICOS DE ESCALA. O Application Auto Scaling escala servico ECS,
+		// tabela DynamoDB, replica Aurora, e cria o mesmo par AlarmHigh/AlarmLow com o
+		// mesmo UUID no nome. `GetResource` responde `PolicyType` para ele igual --
+		// medido em 952133486861/us-west-2: `hub-scale-cpu` volta
+		// `"PolicyType":"TargetTrackingScaling"`.
+		if (
+			row.cfnType === 'AWS::AutoScaling::ScalingPolicy' ||
+			row.cfnType === 'AWS::ApplicationAutoScaling::ScalingPolicy'
+		) {
 			const policyType = typeof parsed.PolicyType === 'string' ? parsed.PolicyType.trim() : '';
 			if (policyType) row.scalingPolicyType = policyType;
 		}
@@ -830,6 +843,41 @@ const detailPool = Promise.all(
 			const again = throttledAsks.splice(0, throttledAsks.length);
 			console.error(
 				`scan-account: ${again.length} listing(s) of ${child.type} rate limited -- asking again, ${width} at a time.`
+			);
+			await inParallel(again, width, (ask) =>
+				sweep(ask.type, width > 1 ? () => throttledAsks.push(ask) : null, ask.model)
+			);
+		}
+	}
+
+	// ------------------------------- layer 1a-ter: the types listed by a VALUE
+	//
+	// Same refusal as the children above -- `Missing or invalid ResourceModel` --
+	// and a different answer to it. There the missing property is a parent's id,
+	// which the sweep already found; here it is one of a service's own namespaces,
+	// which no resource carries. Struct8 enumerates them (`cfnValueTypes`) because
+	// it is the side that holds the catalog, and one listing goes out per value.
+	//
+	// Measured on 952133486861/us-west-2, 13/09/2026: without the namespace,
+	// `AWS::ApplicationAutoScaling::ScalableTarget` answers `Value null at
+	// 'serviceNamespace'` and the policy answers `Required property:
+	// [ServiceNamespace]`; with `{"ServiceNamespace":"ecs"}` the two answer the
+	// scalable target and the policy that were scaling that account's `hub`
+	// service. Fifteen listings per type per scan, of which fourteen usually
+	// answer nothing -- the same cost shape as any other type in the sweep.
+	for (const scoped of cfnValueTypes) {
+		if (!scoped?.type || !scoped?.model || !Array.isArray(scoped.values)) continue;
+		const asks = scoped.values.map((value) => ({
+			type: scoped.type,
+			model: JSON.stringify({ [scoped.model]: String(value) })
+		}));
+		if (!asks.length) continue;
+		const throttledAsks = [];
+		await inParallel(asks, 8, (ask) => sweep(ask.type, () => throttledAsks.push(ask), ask.model));
+		for (let width = 4; width >= 1 && throttledAsks.length; width = Math.floor(width / 2)) {
+			const again = throttledAsks.splice(0, throttledAsks.length);
+			console.error(
+				`scan-account: ${again.length} listing(s) of ${scoped.type} rate limited -- asking again, ${width} at a time.`
 			);
 			await inParallel(again, width, (ask) =>
 				sweep(ask.type, width > 1 ? () => throttledAsks.push(ask) : null, ask.model)
@@ -1299,7 +1347,8 @@ fs.writeFileSync(
 				tagFilters,
 				cfnTypeCount: cfnTypes.length,
 				cfnDetailTypeCount: cfnDetailTypes.length,
-				cfnChildTypeCount: cfnChildTypes.length
+				cfnChildTypeCount: cfnChildTypes.length,
+				cfnValueTypeCount: cfnValueTypes.length
 			},
 			items,
 			detailUnread,

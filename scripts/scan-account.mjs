@@ -455,6 +455,33 @@ const readOne = async (row, onThrottle) => {
 			);
 			if (registered.length) row.registeredTargets = registered;
 		}
+
+		// WHICH SCALING POLICIES OWN THEIR ALARMS, which decides whether those
+		// alarms may be imported at all.
+		//
+		// A target tracking policy does not use an alarm somebody wrote: EC2 Auto
+		// Scaling CREATES the pair (`AlarmHigh`/`AlarmLow`), keeps them, and
+		// replaces or deletes them when it needs to -- the service documents that
+		// nobody else should create, edit or delete them. Imported, they become
+		// Terraform's: a `destroy` deletes what AWS asks nobody to delete, and the
+		// day the service replaces one, the state points at a name that is gone.
+		//
+		// A STEP SCALING POLICY IS THE OPPOSITE, and is why the type of the alarm
+		// cannot answer this on its own. There the person writes the alarm and
+		// points it at the policy, so it is theirs and belongs in the import. From
+		// the outside the two are the same thing -- an alarm whose action is a
+		// scaling policy -- and only `PolicyType` separates them.
+		//
+		// Measured on 952133486861/us-west-2 (2026-09-13): `cpu-scale` on `hub-asg`
+		// answers `TargetTrackingScaling`, and the two `TargetTracking-hub-asg-Alarm*`
+		// alarms it owns were arriving as resources of the diagram, each carrying an
+		// AWS-generated UUID in the name that is its import id.
+		//
+		// It costs no call: this is the same answer the block above already parsed.
+		if (row.cfnType === 'AWS::AutoScaling::ScalingPolicy') {
+			const policyType = typeof parsed.PolicyType === 'string' ? parsed.PolicyType.trim() : '';
+			if (policyType) row.scalingPolicyType = policyType;
+		}
 	}
 
 	for (const name of names) {

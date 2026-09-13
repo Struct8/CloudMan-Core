@@ -422,6 +422,39 @@ const readOne = async (row, onThrottle) => {
 		if (!tags.Name && typeof named === 'string' && named.trim() && row.nameHint == null) {
 			row.nameHint = named.trim();
 		}
+		// WHAT A TARGET GROUP HOLDS, which this read is the only place to learn.
+		//
+		// Terraform models membership as a resource of its own,
+		// `aws_lb_target_group_attachment`, and gives `aws_lb_target_group` no
+		// field for it -- so the configuration `terraform plan
+		// -generate-config-out` writes comes back with no targets on it, and
+		// nothing downstream has anything to put back. CloudFormation keeps them
+		// inline, so the answer already parsed above holds what the rest of the
+		// scan cannot say.
+		//
+		// Measured on 952133486861/us-west-2 (2026-09-13): `tg-k6-dashboard`
+		// answers `"Targets":[{"Port":5665,"Id":"i-0a5ff1e001ff4ea7a"}]`, and
+		// without this the group reached the diagram with no connection to the
+		// instance it fronts, while that instance reached it with no connection at
+		// all. The group in front of an auto scaling group was spared only because
+		// the GROUP names the target group back, which is a different reading.
+		//
+		// GATED ON THE TYPE, not on the property being there. `Targets` is also
+		// what an `AWS::Events::Rule` calls the destinations of a rule, and those
+		// are a different thing entirely -- writing them here would hand Struct8 a
+		// list of Lambdas and queues as if they were registered behind a load
+		// balancer.
+		//
+		// It costs no call: this is the same answer the tags and the reference
+		// matching above already read.
+		if (row.cfnType === 'AWS::ElasticLoadBalancingV2::TargetGroup' && Array.isArray(parsed.Targets)) {
+			const registered = parsed.Targets.filter(
+				(target) => target && typeof target.Id === 'string' && target.Id.trim()
+			).map((target) =>
+				target.Port == null ? { id: target.Id.trim() } : { id: target.Id.trim(), port: target.Port }
+			);
+			if (registered.length) row.registeredTargets = registered;
+		}
 	}
 
 	for (const name of names) {

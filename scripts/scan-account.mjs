@@ -482,6 +482,57 @@ const readOne = async (row, onThrottle) => {
 			const policyType = typeof parsed.PolicyType === 'string' ? parsed.PolicyType.trim() : '';
 			if (policyType) row.scalingPolicyType = policyType;
 		}
+
+		// WHAT A LAUNCH TEMPLATE RUNS UNDER, which Cloud Control does not answer.
+		//
+		// `GetResource` for `AWS::EC2::LaunchTemplate` comes back with four
+		// properties -- `LaunchTemplateId`, `LaunchTemplateName`,
+		// `DefaultVersionNumber`, `LatestVersionNumber` -- and nothing of
+		// `LaunchTemplateData`. The instance profile the template names is simply
+		// not in the answer the harvest above walks, so no better harvesting
+		// reaches it. Measured on 952133486861/us-west-2, 2026-09-13.
+		//
+		// WHY THE EDGE MATTERS. The reference graph is what keeps a global resource
+		// in an import: an instance profile enters because something being imported
+		// names it. `hub-asg_profile` was named by `i-003e7f4a6f67ff3f9` and by
+		// nothing else -- the instance the auto scaling group launched, which the
+		// block above marks `ownedBy` and Struct8 drops on purpose, because the
+		// group replaces it at will. So the profile arrived referenced by nothing
+		// and stayed out, its role went with it, the satellite inside the scaling
+		// group came up blank, and the launch template compiled with no
+		// `iam_instance_profile`. `terraform plan` then offered to REMOVE the
+		// profile from the template -- every instance the group launches would lose
+		// its role -- and the adoption refused the whole state over that one field.
+		//
+		// The template IS in the import and it DOES name the profile. Recording
+		// that is all the graph was missing.
+		//
+		// BOTH VERSIONS, in one call: a scaling group may launch `$Default` or
+		// `$Latest`, and which one it pins is not known here. Reading the two costs
+		// the same request and leaves no version out.
+		//
+		// THIS ONE COSTS A CALL, unlike the two blocks above, which read an answer
+		// already parsed. It is one call per launch template -- a type an account
+		// has few of -- and there is no other way to see the data.
+		if (row.cfnType === 'AWS::EC2::LaunchTemplate') {
+			const templateId = parsed.LaunchTemplateId ?? row.importId;
+			const versions = await awsAsync('ec2', 'describe-launch-template-versions', [
+				'--launch-template-id',
+				String(templateId),
+				'--versions',
+				'$Default',
+				'$Latest'
+			]);
+			for (const version of versions?.LaunchTemplateVersions ?? []) {
+				const profile = version?.LaunchTemplateData?.IamInstanceProfile;
+				// Either spelling. The template may name the profile by ARN or by
+				// name, and the matching downstream accepts both: a row is keyed by
+				// its `importId` AND by the ARN the listing carried.
+				for (const value of [profile?.Arn, profile?.Name]) {
+					if (typeof value === 'string' && value.trim()) names.add(value.trim());
+				}
+			}
+		}
 	}
 
 	for (const name of names) {

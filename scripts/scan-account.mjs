@@ -1097,9 +1097,34 @@ if (cfnDetailTypes.length) {
 		if (row.listedArn) key(row.listedArn, row);
 	}
 
+	// AND BY THE ARN WITHOUT THE SUFFIX THE REFERENCE ITSELF ADDS.
+	//
+	// An alarm that an Application Auto Scaling target tracking policy created names
+	// that policy in `AlarmActions` -- with `:createdBy/<uuid>` on the end, which the
+	// policy's own ARN does not carry. Neither lookup below could reach it: the full
+	// string is longer than the policy's ARN, and the tail is that UUID.
+	//
+	// Measured on 952133486861/us-west-2, 13/09/2026:
+	//
+	//   alarme    ...:policyName/hub-scale-cpu:createdBy/491d63a3-acba-4810-814f-5ec16c3fb792
+	//   politica  ...:policyName/hub-scale-cpu
+	//
+	// EC2 Auto Scaling adds no such suffix, which is why the same rule always worked
+	// there and never here: the two alarms of `hub-scale-cpu` were reaching the
+	// diagram as resources, each with an AWS-owned UUID inside its Terraform address.
+	const semSufixoDeCriacao = (value) => {
+		const texto = String(value);
+		const corte = texto.indexOf(':createdBy/');
+		return corte < 0 ? texto : texto.slice(0, corte);
+	};
+
 	let marked = 0;
 	for (const [arn, users] of namedBy) {
-		const hits = byIdentifier.get(arn) ?? byIdentifier.get(tail(arn)) ?? [];
+		const hits =
+			byIdentifier.get(arn) ??
+			byIdentifier.get(semSufixoDeCriacao(arn)) ??
+			byIdentifier.get(tail(arn)) ??
+			[];
 		for (const row of hits) {
 			// Itself does not count: a resource whose own ARN appears in its own
 			// configuration would otherwise look like something else needs it.

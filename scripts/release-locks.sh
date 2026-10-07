@@ -38,7 +38,12 @@ jq -c '.pipeline_stages[].states[]' "$MANIFEST_PATH" | while read -r state; do
 
     who=$(echo "$item" | jq -r '.Item.Info.S // empty' | jq -r '.Who // empty' 2>/dev/null)
 
-    if [ "$who" == "runner@${RUN_TAG}" ]; then
+    # Any user name in front of the tag: GitHub's hosted runner takes locks as
+    # `runner@<tag>`, a runner the customer's repository names (CodeBuild, see
+    # `.github/actions/engine-run`) as `root@<tag>`. The tag is what names this
+    # run, and the match is anchored at the end, so `gh-12-1` never takes
+    # `gh-12-10`.
+    if [[ "$who" == *"@${RUN_TAG}" ]]; then
         echo "🔓 Lock on ${bucket}/${key} belongs to this run (${RUN_TAG}). Releasing..."
         aws dynamodb delete-item --table-name "$table" \
             --key "{\"LockID\": {\"S\": \"${bucket}/${key}\"}}" \

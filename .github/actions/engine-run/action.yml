@@ -1,0 +1,276 @@
+# The GitOps engine as a composite action, for a job that runs on a runner the
+# customer's own repository names: the CodeBuild project that
+# `.github/workflows/struct8-engine-local.yml` puts in `runs-on`.
+#
+# WHY IT EXISTS
+#
+# `engine.yml` fixes `runs-on: ubuntu-latest`, and GitHub lets a reusable
+# workflow use the caller's own runners only when both have the same owner. The
+# engine belongs to Struct8 and the GitOps repository to the customer, so the
+# job that runs on the customer's runner has to be defined in a file of the
+# customer's repository. That file holds no engine logic: its one step calls
+# this action, pinned to the engine channel (`@devlocal`, `@main`, ...).
+#
+# THE STEPS ARE engine.yml's, ONE FOR ONE
+#
+# Same names, same order, same commands, same `if:`. The reasoning behind each
+# step lives in the comments of engine.yml and is not repeated here. Two
+# substitutions, because a composite action cannot read the `secrets` context:
+#
+#   secrets.GITHUB_TOKEN  ->  github.token          (the same token)
+#   toJSON(secrets)       ->  inputs.secrets_json   (the caller passes toJSON(secrets))
+#
+# `scripts/engine-run-parity.test.mjs` fails when the two lists differ in
+# anything else, so a change to a step of engine.yml lands here in the same
+# commit. A composite action does not export its inputs as INPUT_* variables,
+# so the secrets reach the pipeline step only through SECRETS_CONTEXT, which
+# pipeline.sh takes out of the environment of every child process, as it does
+# on GitHub's machine.
+#
+# WHAT DIFFERS ON THAT RUNNER, AND WHERE IT IS HANDLED
+#
+# - The job runs as root, in a container. The lock tag in pipeline.sh sets the
+#   hostname without sudo there, which needs the CodeBuild project in
+#   privileged mode, and says in the log when the tag did not stick.
+# - The image may lack a tool. pipeline.sh names it before touching any state.
+#   CodeBuild's aws/codebuild/standard:8.0 (Ubuntu 24.04) ships all of them.
+# - The three steps after the pipeline run inside this action, with
+#   engine.yml's conditions. After a cancellation the runner may not reach
+#   them; a lock left behind is then released by the next run of the same
+#   state, which confirms through the API that the owner run finished.
+#
+# HOW IT IS CALLED, from `.github/workflows/struct8-engine-local.yml` of the
+# GitOps repository, which the Struct8 app writes:
+#
+#   on:
+#     workflow_call:
+#       inputs:
+#         stage: { type: string, required: false, default: dev }
+#         runner_project: { type: string, required: true }
+#   permissions: { id-token: write, contents: write, actions: read }
+#   jobs:
+#     deploy:
+#       runs-on: codebuild-${{ inputs.runner_project }}-${{ github.run_id }}-${{ github.run_attempt }}
+#       steps:
+#         - uses: Struct8/cloudman-core/.github/actions/engine-run@<channel>
+#           with:
+#             stage: ${{ inputs.stage }}
+#             secrets_json: ${{ toJSON(secrets) }}
+#
+# The AWS role accepts that job only when its stack has
+# AllowLocalEngineWorkflow=true (CloudFrontTemplate/TerraformBackend.yml in
+# Struct8/CloudMan): the job runs that file, not engine.yml, and the role's
+# trust names the workflow.
+name: Struct8 GitOps Engine
+description: >-
+  The steps of the Struct8 engine workflow (engine.yml), for a job on a runner
+  that the GitOps repository itself names in runs-on, such as a CodeBuild
+  project.
+
+inputs:
+  stage:
+    description: Which Struct8 backend the run talks to. Same meaning and default as the engine.yml input.
+    required: false
+    default: "dev"
+  default_region:
+    description: Region the engine logs in to. Same meaning and default as the engine.yml input.
+    required: false
+    default: "us-east-1"
+  engine_ref:
+    description: >-
+      Channel of the engine scripts used when the manifest names none. Same
+      meaning and default as the engine.yml input.
+    required: false
+    default: "main"
+  secrets_json:
+    description: >-
+      toJSON(secrets) of the calling workflow. The manifest names secrets that
+      cannot be declared in advance, and a composite action cannot read the
+      secrets context.
+    required: true
+
+outputs:
+  manifest_path:
+    description: The manifest this run executed.
+    value: ${{ steps.manifest_check.outputs.manifest_path }}
+  action:
+    description: The operation in the manifest (plan, apply, destroy, traffic, ...).
+    value: ${{ steps.manifest_check.outputs.action }}
+
+runs:
+  using: composite
+  steps:
+    - name: 📥 Checkout Client Code
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      with:
+        fetch-depth: 2
+    - name: 🧐 Analyze Manifest Requirements
+      id: manifest_check
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        ENGINE_REF_INPUT: ${{ inputs.engine_ref }}
+      shell: bash
+      run: |
+        echo "🔍 Identifying which folder triggered the pipeline..."
+        ENGINE_REF_DEFAULT="${ENGINE_REF_INPUT:-main}"
+        MANIFEST_PATH=$(git diff --name-only HEAD^ HEAD 2>/dev/null | grep "manifest.json" | head -n 1 || true)
+        if [ -z "$MANIFEST_PATH" ] || [ ! -f "$MANIFEST_PATH" ]; then
+          MANIFEST_PATH=$(find . -name "manifest.json" -not -path "*/.*" -print -quit)
+        fi
+        echo "========================================================="
+        echo "📂 [PATH] MANIFEST SELECTED DURING ANALYSIS:"
+        echo "Path: ${MANIFEST_PATH:-none found}"
+        echo "========================================================="
+        if [ -z "$MANIFEST_PATH" ]; then
+          echo "⚠️ No manifest found. Assuming the default flow (false)."
+          echo "needs_private_access=false" >> $GITHUB_OUTPUT
+          echo "action=apply" >> $GITHUB_OUTPUT
+          echo "engine_ref=$ENGINE_REF_DEFAULT" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+        if [ ! -s "$MANIFEST_PATH" ]; then
+           echo "⚠️ manifest.json exists but is empty."
+           echo "needs_private_access=false" >> $GITHUB_OUTPUT
+           echo "action=apply" >> $GITHUB_OUTPUT
+           echo "engine_ref=$ENGINE_REF_DEFAULT" >> $GITHUB_OUTPUT
+           exit 0
+        fi
+        if ! jq -e . "$MANIFEST_PATH" >/dev/null 2>&1; then
+           echo "❌ CRITICAL ERROR: $MANIFEST_PATH contains invalid JSON."
+           exit 1
+        fi
+        EXTERNAL_REPOS=$(jq -c '.external_repositories // []' "$MANIFEST_PATH")
+        NEEDS_ACCESS="false"
+        if [ "$EXTERNAL_REPOS" != "[]" ] && [ "$EXTERNAL_REPOS" != "null" ]; then
+          echo "📦 Checking visibility of the external repositories..."
+          while IFS= read -r repo; do
+            ORG=$(echo "$repo" | jq -r '.org')
+            REPO_NAME=$(echo "$repo" | jq -r '.repo_name')
+            echo "🔍 Querying the GitHub API for: $ORG/$REPO_NAME"
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/$ORG/$REPO_NAME")
+            if [ "$HTTP_STATUS" == "200" ]; then
+              echo "   ✅ Public (HTTP 200). No external token required."
+            else
+              echo "   🔒 Private (HTTP $HTTP_STATUS). Backend token required."
+              NEEDS_ACCESS="true"
+              break
+            fi
+          done < <(echo "$EXTERNAL_REPOS" | jq -c '.[]')
+        else
+          echo "ℹ️ No external repository declared in the manifest."
+        fi
+        echo "📊 Gatekeeper analysis result: $NEEDS_ACCESS"
+        ENGINE_REF=$(jq -r '.engine_ref // empty' "$MANIFEST_PATH")
+        [ -z "$ENGINE_REF" ] && ENGINE_REF="$ENGINE_REF_DEFAULT"
+        case "$ENGINE_REF" in
+          devlocal|dev|test|alpha|main) ;;
+          *)
+            echo "❌ Engine channel '$ENGINE_REF' is not one this engine serves."
+            echo "   Served today: devlocal, dev, test, alpha, main."
+            exit 1
+            ;;
+        esac
+        echo "⚙️ Engine scripts channel: $ENGINE_REF"
+        echo "needs_private_access=$NEEDS_ACCESS" >> $GITHUB_OUTPUT
+        echo "manifest_path=$MANIFEST_PATH" >> $GITHUB_OUTPUT
+        MANIFEST_ACTION=$(jq -r '.action // "apply"' "$MANIFEST_PATH")
+        echo "⚡ Manifest action: $MANIFEST_ACTION"
+        echo "action=$MANIFEST_ACTION" >> $GITHUB_OUTPUT
+        echo "engine_ref=$ENGINE_REF" >> $GITHUB_OUTPUT
+    - name: 🔑 Struct8 Auth Bridge
+      id: gatekeeper
+      if: steps.manifest_check.outputs.needs_private_access == 'true'
+      shell: bash
+      env:
+        STAGE_INPUT: ${{ inputs.stage }}
+      run: |
+        STAGE="${STAGE_INPUT:-dev}"
+        case "$STAGE" in
+          dev)
+            GATEKEEPER_URL="https://dev.collab.cf.struct8.com/api/github"
+            AUDIENCE="https://struct8.com/gitops"
+            ;;
+          *)
+            echo "❌ Stage '$STAGE' has no backend mapped in this engine."
+            echo "   Mapped today: dev. Add the case above when the stage is created."
+            exit 1
+            ;;
+        esac
+        echo "🚀 Environment: $STAGE"
+        echo "🔗 Calling the Gatekeeper at: $GATEKEEPER_URL"
+        OIDC_RESPONSE=$(curl -s -w '\n%{http_code}' \
+          -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUDIENCE")
+        OIDC_HTTP=$(echo "$OIDC_RESPONSE" | tail -n1)
+        OIDC_BODY=$(echo "$OIDC_RESPONSE" | sed '$d')
+        ID_TOKEN=$(echo "$OIDC_BODY" | jq -r '.value // empty')
+        if [ -z "$ID_TOKEN" ]; then
+          echo "❌ GitHub refused to issue an OIDC token (HTTP $OIDC_HTTP)."
+          echo "   Requested audience: $AUDIENCE"
+          echo "   Response: $OIDC_BODY"
+          exit 1
+        fi
+        RESPONSE=$(curl -s -X POST "$GATEKEEPER_URL" \
+          -H "Content-Type: application/json" \
+          -d "{
+            \"action\": \"exchange_oidc_for_token\",
+            \"params\": {
+              \"oidc_token\": \"$ID_TOKEN\",
+              \"github_repo\": \"${{ github.repository }}\"
+            }
+          }")
+        TOKEN=$(echo $RESPONSE | jq -r .token)
+        if [ "$TOKEN" == "null" ] || [ -z "$TOKEN" ]; then
+          echo "❌ Authentication failed ($STAGE). AWS API Gateway response: $RESPONSE"
+          exit 1
+        fi
+        echo "✅ Authenticated successfully against $STAGE!"
+        echo "token=$TOKEN" >> $GITHUB_OUTPUT
+    - name: 📥 Checkout Struct8 Engine
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      with:
+        repository: Struct8/CloudMan-Core
+        path: .struct8-engine
+        ref: ${{ steps.manifest_check.outputs.engine_ref || inputs.engine_ref }}
+        token: ${{ steps.gatekeeper.outputs.token || github.token }}
+    - name: 🛠️ Setup Terraform
+      if: steps.manifest_check.outputs.action != 'traffic'
+      uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+      with:
+        terraform_version: "1.5.7"  # Adicione esta linha
+        terraform_wrapper: false    # Recomendado para scripts bash complexos como o seu
+    - name: 🚀 Run Modular Pipeline
+      shell: bash
+      env:
+        GH_CLONE_TOKEN: ${{ steps.gatekeeper.outputs.token || github.token }}
+        LOGIN_REGION: ${{ inputs.default_region || 'us-east-1' }}
+        SECRETS_CONTEXT: ${{ inputs.secrets_json }}
+        GH_TOKEN: ${{ github.token }}   # >>> NOVO — autentica o `gh run view` do backstop (camada 4)
+        MANIFEST_PATH_INPUT: ${{ steps.manifest_check.outputs.manifest_path }}
+      run: bash .struct8-engine/scripts/pipeline.sh
+    - name: 📤 Publish Engine Output
+      if: always() && steps.manifest_check.outputs.action != 'traffic'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: engine-output
+        path: ${{ runner.temp }}/struct8-artifacts
+        retention-days: 1
+        compression-level: 0
+        if-no-files-found: ignore
+    - name: 🔓 Release orphaned locks after cancellation/timeout
+      if: always() && !success()
+      shell: bash
+      env:
+        RUN_TAG: "gh-${{ github.run_id }}-${{ github.run_attempt }}"
+        DEFAULT_REGION: ${{ inputs.default_region || 'us-east-1' }}
+      run: |
+        [ -f .struct8-engine/scripts/release-locks.sh ] || exit 0
+        MANIFEST_PATH="${{ steps.manifest_check.outputs.manifest_path }}" bash .struct8-engine/scripts/release-locks.sh
+    - name: 💾 Push / Cleanup GitOps State
+      if: success() && steps.manifest_check.outputs.action != 'traffic'
+      shell: bash
+      run: |
+        bash .struct8-engine/scripts/publish-gitops.sh

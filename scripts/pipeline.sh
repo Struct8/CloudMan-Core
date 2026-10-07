@@ -51,6 +51,11 @@ export LC_ALL=C.UTF-8   # >>> NOVO — garante que `grep -P` (usado no backstop 
 # named profiles. Audit of 2026-09-04, medium finding.
 # ------------------------------------------------------------------------------
 export -n SECRETS_CONTEXT GH_CLONE_TOKEN
+# The same blob under the name the action's input would have, should a runner
+# ever export composite inputs as INPUT_* (GitHub documents that it does not).
+# A no-op on every runner today; here so `.github/actions/engine-run` cannot
+# reopen the finding above by a change outside this repository.
+unset INPUT_SECRETS_JSON
 
 echo "🕐 Step started at $(date -u '+%H:%M:%S') UTC"
 
@@ -66,8 +71,54 @@ NC='\033[0m'
 # usuário@hostname (não existe flag pra injetar metadado direto), então
 # esse truque deixa todo lock criado por este job identificável depois.
 # Runners hospedados do GitHub têm sudo sem senha.
+#
+# A runner the customer's repository names (the CodeBuild project of
+# `.github/actions/engine-run`) runs the job as root, in a container: there the
+# command goes without sudo, which the image may not even have, and it only
+# takes with the project in privileged mode. Read back either way, because the
+# tag is what lets a later run confirm through the API that the owner of a lock
+# has finished -- and on a runner whose cleanup step a cancellation can skip,
+# that check is the only thing that ever releases the lock.
 RUN_TAG="gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-sudo hostname "$RUN_TAG" 2>/dev/null || true
+if [ "$(id -u)" -eq 0 ]; then
+    hostname "$RUN_TAG" 2>/dev/null || true
+else
+    sudo hostname "$RUN_TAG" 2>/dev/null || true
+fi
+if [ "$(hostname 2>/dev/null)" != "$RUN_TAG" ]; then
+    echo "⚠️  The hostname is '$(hostname 2>/dev/null)', not '$RUN_TAG'."
+    echo "   Locks this run takes will not name it, so a lock left behind by a cancellation"
+    echo "   is not released by the next run and has to be released by hand."
+fi
+
+# ------------------------------------------------------------------------------
+# PREFLIGHT: the tools this script and the scripts it sources call, checked
+# before any state is touched.
+#
+# GitHub's hosted image ships every one of them, so there this never fires. It
+# is for a runner the customer's repository names, whose image is someone
+# else's choice: without it, a missing tool surfaced in the middle of a state,
+# after `terraform init` had taken the lock, as a bare "command not found".
+# `terraform` is left out on a traffic run, which never calls it -- the workflow
+# skips the Terraform setup for that action.
+# ------------------------------------------------------------------------------
+_missing_tools=()
+for _tool in jq aws git curl node gh stdbuf gzip base64 sha256sum; do
+    command -v "$_tool" >/dev/null 2>&1 || _missing_tools+=("$_tool")
+done
+_preflight_action="apply"
+if command -v jq >/dev/null 2>&1 && [ -f "${MANIFEST_PATH_INPUT:-}" ]; then
+    _preflight_action=$(jq -r '.action // "apply"' "$MANIFEST_PATH_INPUT" 2>/dev/null || echo "apply")
+fi
+if [ "$_preflight_action" != "traffic" ] && ! command -v terraform >/dev/null 2>&1; then
+    _missing_tools+=("terraform")
+fi
+if [ ${#_missing_tools[@]} -gt 0 ]; then
+    echo "❌ This runner lacks: ${_missing_tools[*]}"
+    echo "   The engine calls them, and no state was touched. Use an image that ships them."
+    exit 1
+fi
+unset _tool _missing_tools _preflight_action
 
 ENGINE_PATH=$(readlink -f .struct8-engine)
 AUTH_SCRIPTS="$ENGINE_PATH/scripts/auth"

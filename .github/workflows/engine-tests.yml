@@ -1,0 +1,40 @@
+# The engine's own tests, on every pull request to a channel branch.
+#
+# The five channels only take changes through pull requests, so this is the one
+# place every change to the engine passes. Until this file, the tests below ran
+# only when someone remembered to run them -- which is not a test of anything
+# for the one that matters most here: `engine-run-parity.test.mjs` is what keeps
+# `.github/actions/engine-run` (the engine on a runner the customer's repository
+# names) from drifting away from `engine.yml`.
+#
+# They need no AWS, no Terraform and no secret: node and bash, which GitHub's
+# hosted image ships. Read-only token, and nothing here is called by customers.
+name: Engine tests
+
+on:
+  pull_request:
+    branches: [devlocal, dev, test, alpha, main]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: The engine action has the steps of engine.yml
+        run: node scripts/engine-run-parity.test.mjs
+
+      - name: Account scan
+        run: node scripts/scan-account.test.mjs
+
+      - name: Lambda source completion
+        run: node scripts/complete-lambda-source.test.mjs
+
+      - name: Generated configuration sanitizer
+        run: node scripts/sanitize-generated-config.test.mjs
+
+      - name: Pipeline dispatch
+        run: bash scripts/pipeline-dispatch.test.sh

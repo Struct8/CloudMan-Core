@@ -360,6 +360,33 @@ publish_destroy_failure() {
 }
 
 # ==============================================================================
+# THE STATE HAS TO LIVE IN THE BACKEND.
+#
+# `terraform init -backend-config=...` over code with no `backend` block does
+# not fail. Terraform prints "Missing backend configuration" as a WARNING, falls
+# back to a local state in the runner's folder and carries on -- and the runner,
+# with that state, is discarded when the run ends. Measured on 2026-10-12
+# (952133486861/wordpress-loadtest): an apply created every resource into a
+# state nobody kept, the next apply stopped on "already exists" for each one,
+# and two destroys started from an empty state, reported success and deleted
+# nothing.
+#
+# The app writes the block when its compile finds the backend bucket, and it
+# refuses to send a plan or an apply whose code has none. A destroy sends no
+# code: it runs the main.tf already in the repository, which may have been
+# pushed before that refusal existed. Hence this check, before init, for every
+# action that runs Terraform.
+#
+# Prints the remote backends declared in the folder's `.tf` files, one per
+# line. `local` is left out: it is the same state on the runner, written down.
+# ==============================================================================
+remote_backend_names() {
+    { grep -hoE '^[[:space:]]*backend[[:space:]]+"[A-Za-z0-9_]+"[[:space:]]*\{' -- *.tf 2>/dev/null || true; } \
+        | sed -E 's/^[[:space:]]*backend[[:space:]]+"([A-Za-z0-9_]+)".*/\1/' \
+        | { grep -vx 'local' || true; }
+}
+
+# ==============================================================================
 # DESFECHO DE SUCESSO
 #
 # Até aqui só a falha era publicada, e só a do plan. Quem lê do lado do produto
@@ -681,6 +708,35 @@ run_terraform_process() {
         # credencial ou backend chegava ao diagrama como plano velho, igual a
         # todas as outras falhas.
         INIT_STATUS=0
+
+        # No backend block, no Terraform: see `remote_backend_names`. Scan and
+        # traffic are left out because neither runs init nor touches state.
+        # The reason goes to the file the app reads for this action, so the
+        # refusal reaches the diagram instead of only the Actions log.
+        if [ "$action" != "scan" ] && [ "$action" != "traffic" ] && [ -z "$(remote_backend_names)" ]; then
+            {
+                echo "Error: no backend block in this state's Terraform code"
+                echo ""
+                echo "No .tf file in ${path} declares a backend block. Terraform would keep the"
+                echo "state on this runner and discard it when the run ends: what an apply creates"
+                echo "would belong to no state, and a destroy would delete nothing. Nothing ran."
+                if [ "$action" == "destroy" ]; then
+                    echo "A destroy runs the main.tf already in the repository. Compile the state and"
+                    echo "run a plan, which sends the compiled code to the repository, then destroy it."
+                else
+                    echo "Compile the state again and run it again."
+                fi
+                echo "If the compiled code still has no backend block, connect the GitOps Workspace"
+                echo "to the S3 bucket that holds the states."
+            } | tee ./.struct8-live.log
+            case "$action" in
+                plan|drift) publish_plan_failure "$path" init "./.struct8-live.log" ;;
+                apply)      publish_apply_failure "$path" apply "./.struct8-live.log" ;;
+                destroy)    publish_destroy_failure "$path" destroy "./.struct8-live.log" ;;
+            esac
+            exit 1
+        fi
+
         if [ "$action" == "scan" ]; then
             # A scan is not Terraform. Its folder holds the manifest and the
             # scope and no `.tf` at all, so there is no configuration for init

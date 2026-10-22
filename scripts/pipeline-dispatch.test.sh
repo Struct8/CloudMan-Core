@@ -115,11 +115,39 @@ traffic_exit=$(awk '/PASSO 2: PREPARA/{f=1} f && /PASSO 3: EXECU/{exit} f' "$PIP
   | grep -cE 'if \[ "\$action" == "traffic" \]; then|^            exit 0$')
 check "traffic runs and exits before PASSO 3, so it never reaches the chain" "2" "$traffic_exit"
 
+# ------------------------------------------ state_rm leaves before the chain
+#
+# The same arrangement as traffic, one step earlier: right after init and
+# BEFORE the credentials of PASSO 2, because removing from the state touches
+# only the state, and the action exists for the runs where the state's own
+# cloud is what fails. Removing the exit sends it to the else.
+init_to_passo2=$(awk '/PASSO 1: TERRAFORM INIT/{f=1} f && /PASSO 2: PREPARA/{exit} f' "$PIPELINE" | tr -d '\r')
+state_rm_exit=$(printf '%s\n' "$init_to_passo2" \
+  | grep -cE '^        if \[ "\$action" == "state_rm" \]; then$|^            remove_from_state "\$path" "\$state_rm_addresses" "\$label" \|\| exit \$\?$|^            exit 0$')
+check "state_rm runs and exits before PASSO 2, so it signs in to nothing and never reaches the chain" "3" "$state_rm_exit"
+
+state_rm_after_init=$(printf '%s\n' "$init_to_passo2" | awk '/INIT_STATUS -ne 0/{i=NR} /"\$action" == "state_rm" \]; then$/ && /^        if/{s=NR} END{print (i && s && i < s) ? "yes" : "no"}')
+check "and only after init has reached the state" "yes" "$state_rm_after_init"
+
+# ---------------------------------- the sign-in for providers left in the state
+#
+# In PASSO 2, after the manifest's own credentials (it never replaces them) and
+# before the target sign-in. Placed after the target sign-in it would still
+# work, but placed before `additional_auth` it would read the state for a token
+# the manifest was about to bring.
+passo2=$(awk '/PASSO 2: PREPARA/{f=1} f && /PASSO 3: EXECU/{exit} f' "$PIPELINE" | tr -d '\r')
+order=$(printf '%s\n' "$passo2" | awk '
+  /done < <\(echo "\$additional_auth"/ {a=NR}
+  /^            sign_in_providers_left_in_state "\$label"$/ {s=NR}
+  /local script_file="\$AUTH_SCRIPTS/ {t=NR}
+  END {print (a && s && t && a < s && s < t) ? "yes" : "no"}')
+check "the sign-in for providers left in the state sits between additional_auth and the target" "yes" "$order"
+
 # The list a client reads when their engine is older than the action the app
 # sent. Naming only what the chain serves would tell them the NAME is wrong,
 # when what is old is the engine.
-serves_traffic=$(grep -c "read, scan, traffic\." "$PIPELINE")
-check "the unknown-action message names traffic among what is served" "1" "$serves_traffic"
+serves_traffic=$(grep -c "read, scan, traffic, state_rm\." "$PIPELINE")
+check "the unknown-action message names traffic and state_rm among what is served" "1" "$serves_traffic"
 
 # --------------------------------------------- the dependency lock retry
 # A readonly init refuses two different changes, and only one of them was

@@ -44,3 +44,9 @@ jobs:
 
       - name: Google Cloud sign-in and the gcs backend
         run: bash scripts/google-backend.test.sh
+
+      - name: Reading a state
+        run: node scripts/state-entries.test.mjs
+
+      - name: Providers left in the state, and removing from the state
+        run: bash scripts/state-rm.test.sh

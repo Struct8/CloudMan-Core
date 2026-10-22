@@ -92,7 +92,7 @@ check "traffic is left out of the check" "yes" "$(grep -q '"\$action" != "traffi
 
 block=$(sed -n "${guard_line},/^        fi\$/p" "$body")
 check "the refusal fails the state" "yes" "$(grep -q '^[[:space:]]*exit 1$' <<< "$block" && echo yes || echo no)"
-for publisher in publish_plan_failure publish_apply_failure publish_destroy_failure; do
+for publisher in publish_plan_failure publish_apply_failure publish_destroy_failure publish_state_rm_failure; do
   check "the refusal is published through $publisher" "yes" "$(grep -q "$publisher" <<< "$block" && echo yes || echo no)"
 done
 check "the message starts at an Error: line, where the failure file begins reading" "yes" \

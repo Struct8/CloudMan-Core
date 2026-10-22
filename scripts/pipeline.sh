@@ -362,6 +362,12 @@ publish_destroy_failure() {
     _publish_failure_file "$1" "$2" "$3" destroy_result.json
 }
 
+# A removal from the state has its own file for the same reason: under the
+# destroy's name, a removal that failed would answer for the last destroy.
+publish_state_rm_failure() {
+    _publish_failure_file "$1" "$2" "$3" state_rm_result.json
+}
+
 # ==============================================================================
 # THE STATE HAS TO LIVE IN THE BACKEND.
 #
@@ -398,6 +404,7 @@ publish_state_refusal() {
         plan|drift) publish_plan_failure "$path" init "$logfile" ;;
         apply)      publish_apply_failure "$path" apply "$logfile" ;;
         destroy)    publish_destroy_failure "$path" destroy "$logfile" ;;
+        state_rm)   publish_state_rm_failure "$path" state_rm "$logfile" ;;
     esac
 }
 
@@ -601,6 +608,309 @@ _publish_destroy_result() {
     rm -f destroy_result.json destroy_result.json.gz
 }
 
+STATE_ENTRIES="$ENGINE_PATH/scripts/state-entries.mjs"
+
+# ==============================================================================
+# A PROVIDER THE STATE STILL USES, AND THE MANIFEST BRINGS NO CREDENTIAL FOR.
+#
+# A state can hold resources of a provider its code no longer declares. The case
+# that brought this in is 952133486861/CDNMain, on 2026-10-22: an AWS state whose
+# CloudFront distribution had written a CNAME in a Cloudflare zone. The
+# connection left the diagram, the compile stopped sending the Cloudflare
+# credential (`additional_auth`), and the record stayed in the state. Terraform
+# still has to reach that record -- to refresh it on a plan, and to delete it on
+# the apply that drops it or on a destroy -- so it started the Cloudflare
+# provider with an empty configuration, and Cloudflare refused the call: error
+# 9106, "Missing X-Auth-Key, X-Auth-Email or Authorization headers". Two applies
+# and two destroys failed that way within an hour, and nothing in the diagram
+# could put the credential back.
+#
+# A resource the code does not declare is reached through the provider's DEFAULT
+# configuration, which the Cloudflare provider reads from CLOUDFLARE_API_TOKEN.
+# Exporting the token is enough for the run to go on as if the manifest had
+# brought it: the record is refreshed, and deleted by the apply or the destroy
+# that drops it.
+#
+# WHICH TOKEN. The account comes from the state itself -- `account_id`, or
+# `account.id` on a zone -- and the secret is AUTH_CLOUDFLARE_<account>, the name
+# the app writes. A state that names no account uses the repository's
+# Cloudflare secret when there is exactly one. Anything else is left alone, with
+# a warning naming the resources: the run then fails the way it did before, and
+# a token picked at random would be the wrong fix.
+#
+# WHAT IT DOES NOT COVER: a resource under an aliased configuration (the AWS
+# account of another state, `provider "aws" { alias = ... }`). Terraform refuses
+# to run without that block in the code, whatever credential is around. Such a
+# resource leaves the state through `state_rm`, below.
+#
+# Runs inside the state's folder, after init and after the manifest's own
+# credentials. Never fails the run: what it cannot settle, Terraform reports.
+# ==============================================================================
+sign_in_providers_left_in_state() {
+    local label="$1" use="" accounts=() secret="" token="" candidates="" count=0
+
+    # Already signed in, through the state's own provider or `additional_auth`.
+    [ -n "${CLOUDFLARE_API_TOKEN:-}" ] && return 0
+    # Init installs every provider the state names, not only the ones the code
+    # declares, and records each in the lock file. Without Cloudflare there,
+    # there is nothing to look for, and the state is not read.
+    grep -qs 'registry.terraform.io/cloudflare/cloudflare' .terraform.lock.hcl || return 0
+
+    use=$(terraform state pull 2>/dev/null \
+        | node "$STATE_ENTRIES" provider-use registry.terraform.io/cloudflare/cloudflare 2>/dev/null) || use=""
+    [ -z "$use" ] && return 0
+
+    echo -e "${YELLOW}🔎 ${label} The state holds Cloudflare resources, and the manifest brings no Cloudflare credential:${NC}"
+    printf '%s\n' "$use" | sed -n '2,$p' | sed 's/^/   - /'
+
+    read -r -a accounts <<< "$(printf '%s\n' "$use" | sed -n '1p')"
+    if [ ${#accounts[@]} -eq 1 ]; then
+        secret="AUTH_CLOUDFLARE_${accounts[0]^^}"
+    elif [ ${#accounts[@]} -eq 0 ]; then
+        candidates=$(echo "$SECRETS_CONTEXT" \
+            | jq -r 'keys[] | select(ascii_upcase | startswith("AUTH_CLOUDFLARE_"))' 2>/dev/null) || candidates=""
+        count=$(printf '%s' "$candidates" | grep -c . || true)
+        if [ "$count" -eq 1 ]; then
+            secret="$candidates"
+        fi
+    fi
+
+    if [ -z "$secret" ]; then
+        if [ ${#accounts[@]} -gt 1 ]; then
+            echo "⚠️  ${label} They belong to ${#accounts[@]} Cloudflare accounts (${accounts[*]}), and one token signs in to one. No credential was added."
+        else
+            echo "⚠️  ${label} The state names no Cloudflare account, and the repository does not hold exactly one AUTH_CLOUDFLARE_ secret. No credential was added."
+        fi
+        return 0
+    fi
+
+    # Matched without regard to case: the secret names the account in capitals,
+    # and the state writes it in lowercase.
+    token=$(echo "$SECRETS_CONTEXT" \
+        | jq -r --arg key "$secret" \
+            'first(to_entries[] | select((.key | ascii_upcase) == ($key | ascii_upcase)) | .value) // empty' \
+        2>/dev/null) || token=""
+    if [ -z "$token" ] || [ "$token" == "null" ]; then
+        echo "⚠️  ${label} The repository has no secret ${secret}. No credential was added."
+        return 0
+    fi
+
+    export CLOUDFLARE_API_TOKEN="$token"
+    echo "🔑 ${label} Signed in to Cloudflare with ${secret}, so Terraform can reach them."
+}
+
+# ==============================================================================
+# The version of the state object in the bucket, or nothing.
+#
+# Taken before and after a removal and published with it. The bucket keeps the
+# previous version (S3 with versioning, Cloud Storage with object versioning),
+# and this is the number that brings it back. Best effort: a bucket without
+# versioning answers nothing, and the removal does not wait on it.
+#
+# Runs inside the state's folder, after init.
+# ==============================================================================
+state_object_version() {
+    local backend_file=".terraform/terraform.tfstate" backend="" bucket="" key="" cred="" token="" work="" code="" version=""
+
+    [ -f "$backend_file" ] || return 0
+    backend=$(jq -r '.backend.type // empty' "$backend_file" 2>/dev/null) || backend=""
+
+    case "$backend" in
+        s3)
+            bucket=$(jq -r '.backend.config.bucket // empty' "$backend_file" 2>/dev/null) || bucket=""
+            bucket="${bucket:-$BACKEND_BUCKET}"
+            key=$(jq -r '.backend.config.key // empty' "$backend_file" 2>/dev/null) || key=""
+            if [ -n "$bucket" ] && [ -n "$key" ]; then
+                version=$(aws s3api head-object --bucket "$bucket" --key "$key" \
+                    --profile backend --region "$BACKEND_REGION" \
+                    --query VersionId --output text 2>/dev/null) || version=""
+            fi
+            ;;
+        gcs)
+            bucket=$(jq -r '.backend.config.bucket // empty' "$backend_file" 2>/dev/null) || bucket=""
+            key=$(gcs_object_name "$(jq -r '.backend.config.prefix // empty' "$backend_file" 2>/dev/null)" tfstate)
+            cred=$(jq -r '.backend.config.credentials // empty' "$backend_file" 2>/dev/null) || cred=""
+            cred="${cred:-$(google_credential_file backend)}"
+            if [ -n "$bucket" ] && token=$(google_access_token "$cred" 2>/dev/null) && work=$(mktemp -d); then
+                code=$(_google_api GET "$(gcs_object_url "$bucket" "$key")" "$work/meta" "$token")
+                if [ "$code" == "200" ]; then
+                    version=$(jq -r '.generation // empty' "$work/meta" 2>/dev/null) || version=""
+                fi
+                rm -rf "$work"
+            fi
+            ;;
+    esac
+
+    # What the AWS CLI prints for an object in a bucket without versioning.
+    case "$version" in None|null) version="" ;; esac
+    printf '%s' "$version"
+}
+
+# What a removal from the state did: the instances it took, the serial and the
+# object version of the state on each side, and what the state holds now.
+#
+# Read from files node wrote -- identities only, never attribute values -- and
+# by `--slurpfile` rather than `--argjson`: what a state holds can run past the
+# size of a command line.
+_publish_state_rm_result() {
+    local src_dir="$1" removed_file="$2" after_file="$3" version_before="$4" version_after="$5"
+
+    # An unreadable file becomes `{}`, and the fields read from it become null.
+    # The removal already happened; losing its record over the list of what is
+    # left would be the worse outcome.
+    local f
+    for f in "$removed_file" "$after_file"; do
+        if ! [ -s "$f" ] || ! jq -e . "$f" >/dev/null 2>&1; then
+            echo '{}' > "$f"
+        fi
+    done
+
+    if jq -n \
+        --slurpfile removed "$removed_file" \
+        --slurpfile after "$after_file" \
+        --arg version_before "$version_before" \
+        --arg version_after "$version_after" \
+        --arg run_url "${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '($removed[0]) as $r | ($after[0]) as $a |
+         {
+            timestamp: $ts,
+            cloudman_result: { action: "state_rm", outcome: "succeeded", run_url: $run_url },
+            removed: ($r.matched // []),
+            state_before: {
+                serial: $r.serial, lineage: $r.lineage,
+                object_version: (if $version_before == "" then null else $version_before end)
+            },
+            state_after: {
+                serial: $a.serial, lineage: $a.lineage,
+                object_version: (if $version_after == "" then null else $version_after end)
+            },
+            resources: ($a.resources // null)
+         }' > state_rm_result.json && gzip -9 -f state_rm_result.json; then
+        publish_engine_artifact "$src_dir" state_rm_result.json.gz
+        echo -e "${GREEN}📄 [${src_dir}] state_rm_result.json.gz published.${NC}"
+    else
+        echo -e "${RED}❌ [${src_dir}] Could not build state_rm_result.json; refusing to publish it.${NC}"
+    fi
+
+    rm -f state_rm_result.json state_rm_result.json.gz
+}
+
+# Prints the lines given, one per argument, to the console and to the log the
+# failure file reads, and publishes the refusal. The first line has to start
+# with `Error:`: that is where the failure file begins reading.
+_refuse_state_rm() {
+    local path="$1" stage="$2"
+    shift 2
+    printf '%s\n' "$@" | tee ./.struct8-live.log
+    publish_state_rm_failure "$path" "$stage" "./.struct8-live.log"
+}
+
+# ==============================================================================
+# REMOVES RESOURCES FROM A STATE, AND NOTHING FROM THE CLOUD.
+#
+# `terraform state rm`, for what Terraform cannot get past on its own: a
+# resource the state holds that no run can reach any more. Struct8 runs
+# Terraform only on this runner, so until this action the only way out was
+# someone with the backend's credentials running the command by hand. Nor can
+# the code ask for it: the `removed` block is Terraform 1.7, and the engine runs
+# 1.5.7.
+#
+# What it guarantees:
+#   - Every address has to name something in the state, or nothing is removed.
+#     The refusal lists the ones that named nothing.
+#   - It does not sign in to the state's cloud. `state rm` reads and writes the
+#     state and calls no provider, and this action is for the runs where a
+#     provider is what fails.
+#   - It takes the state lock, through the recovery the other actions use.
+#   - The version of the state object before and after goes out with the
+#     result, so a removal made by mistake can be undone from the bucket.
+#
+# The resource is NOT deleted in the cloud. Struct8 stops managing it, and if
+# the code still declares it, the next apply tries to create it again.
+#
+# Runs inside the state's folder, after init. `requested` holds the addresses,
+# one per line.
+# ==============================================================================
+remove_from_state() {
+    local path="$1" requested="$2" label="$3"
+    local requests=() line="" state_json="" gone="" status=0
+    local version_before="" version_after=""
+    local removed_file="cloudman.state_rm.removed.json" after_file="cloudman.state_rm.after.json"
+
+    while IFS= read -r line; do
+        if [ -n "$line" ]; then requests+=("$line"); fi
+    done <<< "$requested"
+
+    if [ ${#requests[@]} -eq 0 ]; then
+        _refuse_state_rm "$path" request \
+            "Error: no resource named to remove from the state" \
+            "" \
+            "The request to remove resources from the state of ${path} names none. Nothing changed."
+        return 1
+    fi
+
+    # One read of the state for both questions. It stays in this shell and
+    # reaches node on stdin; it is never written to disk.
+    if ! state_json=$(terraform state pull 2>./.struct8-live.log); then
+        cat ./.struct8-live.log
+        publish_state_rm_failure "$path" read "./.struct8-live.log"
+        return 1
+    fi
+
+    if ! gone=$(printf '%s' "$state_json" | node "$STATE_ENTRIES" missing "${requests[@]}") \
+        || ! printf '%s' "$state_json" | node "$STATE_ENTRIES" resolve "${requests[@]}" > "$removed_file"; then
+        state_json=""
+        rm -f "$removed_file"
+        _refuse_state_rm "$path" read \
+            "Error: the state of ${path} could not be listed" \
+            "" \
+            "The engine read the state and could not list what it holds. Nothing changed."
+        return 1
+    fi
+    state_json=""
+
+    if [ -n "$gone" ]; then
+        rm -f "$removed_file"
+        local gone_lines=()
+        while IFS= read -r line; do
+            if [ -n "$line" ]; then gone_lines+=("  - ${line}"); fi
+        done <<< "$gone"
+        _refuse_state_rm "$path" request \
+            "Error: the state of ${path} does not hold every resource named" \
+            "" \
+            "Not in the state:" \
+            "${gone_lines[@]}" \
+            "" \
+            "Nothing was removed, the other resources named included."
+        return 1
+    fi
+
+    echo "🗑️  ${label} Removing from the state; the resources stay in the cloud:"
+    printf '   - %s\n' "${requests[@]}"
+
+    version_before=$(state_object_version)
+
+    # `--` ends the options: an address never reaches Terraform as a flag.
+    run_tf_with_stale_lock_recovery terraform state rm -lock=true -- "${requests[@]}" || status=$?
+    if [ $status -ne 0 ]; then
+        echo "❌ ${label} terraform state rm failed."
+        publish_state_rm_failure "$path" state_rm "./.struct8-live.log"
+        rm -f "$removed_file"
+        return $status
+    fi
+
+    version_after=$(state_object_version)
+
+    if ! terraform state pull 2>/dev/null | node "$STATE_ENTRIES" list > "$after_file"; then
+        rm -f "$after_file"
+    fi
+
+    _publish_state_rm_result "$path" "$removed_file" "$after_file" "$version_before" "$version_after"
+    rm -f "$removed_file" "$after_file"
+    echo -e "${GREEN}✅ ${label} Removed from the state.${NC}"
+}
+
 # ==============================================================================
 # DIVISÃO BLUE/GREEN
 #
@@ -766,6 +1076,9 @@ run_terraform_process() {
     # A divisão blue/green a gravar, quando `action` é `traffic`. Vazio nas
     # outras ações, que nem chegam a olhar.
     local traffic_json=${6:-}
+    # The addresses to take out of the state, one per line, when `action` is
+    # `state_rm`. Empty for every other action.
+    local state_rm_addresses=${7:-}
     local label="[$path]"
 
     local color=$BLUE
@@ -851,6 +1164,10 @@ run_terraform_process() {
                 if [ "$action" == "destroy" ]; then
                     echo "A destroy runs the main.tf already in the repository. Compile the state and"
                     echo "run a plan, which sends the compiled code to the repository, then destroy it."
+                elif [ "$action" == "state_rm" ]; then
+                    echo "A removal from the state runs on the main.tf already in the repository. Compile"
+                    echo "the state and run a plan, which sends the compiled code to the repository, then"
+                    echo "remove the resources again."
                 else
                     echo "Compile the state again and run it again."
                 fi
@@ -861,6 +1178,7 @@ run_terraform_process() {
                 plan|drift) publish_plan_failure "$path" init "./.struct8-live.log" ;;
                 apply)      publish_apply_failure "$path" apply "./.struct8-live.log" ;;
                 destroy)    publish_destroy_failure "$path" destroy "./.struct8-live.log" ;;
+                state_rm)   publish_state_rm_failure "$path" state_rm "./.struct8-live.log" ;;
             esac
             exit 1
         fi
@@ -957,8 +1275,25 @@ run_terraform_process() {
             # leitura de plan atribuir a um plan uma falha que não foi dele.
             if [ "$action" == "plan" ] || [ "$action" == "drift" ]; then
                 publish_plan_failure "$path" init "./.struct8-live.log"
+            # The removal's file is its own, so no other action's reader can
+            # take this failure for its answer.
+            elif [ "$action" == "state_rm" ]; then
+                publish_state_rm_failure "$path" init "./.struct8-live.log"
             fi
             exit $INIT_STATUS
+        fi
+
+        # ---------------------------------------------------------
+        # REMOVAL FROM THE STATE: leaves before the credentials
+        # ---------------------------------------------------------
+        # Here, before PASSO 2, on purpose. `state rm` touches only the state,
+        # which init already reached with the backend's credentials. Signing in
+        # to the state's own cloud would add one more way to fail, to an action
+        # that exists for the runs where something about that cloud already
+        # fails. See `remove_from_state`.
+        if [ "$action" == "state_rm" ]; then
+            remove_from_state "$path" "$state_rm_addresses" "$label" || exit $?
+            exit 0
         fi
 
         # ---------------------------------------------------------
@@ -1081,6 +1416,14 @@ run_terraform_process() {
                         ;;
                 esac
             done < <(echo "$additional_auth" | jq -c '.[]')
+        fi
+
+        # After the manifest's own credentials, which it never replaces: a
+        # provider the state still uses and nothing above signed in to. Scan
+        # and traffic are left out because neither runs init or reads state.
+        # See `sign_in_providers_left_in_state`.
+        if [ "$action" != "scan" ] && [ "$action" != "traffic" ]; then
+            sign_in_providers_left_in_state "$label"
         fi
 
         local script_file="$AUTH_SCRIPTS/${provider}.sh"
@@ -1768,11 +2111,12 @@ run_terraform_process() {
           # nothing in this chain, and the run finished GREEN having done
           # nothing at all. The app was then left waiting for a file that was
           # never going to arrive, with no failure anywhere to point at.
-          # `traffic` is in the list even though it never reaches here: it exits
-          # further up, before Terraform. The list says what this engine serves,
-          # and leaving it out would tell a client running an older engine that
-          # the name is wrong, when what is wrong is the engine version.
-          echo -e "${RED}❌ Unknown action '$action'. This engine serves: plan, drift, apply, destroy, import, read, scan, traffic.${NC}"
+          # `traffic` and `state_rm` are in the list even though neither reaches
+          # here: both exit further up, before PASSO 3. The list says what this
+          # engine serves, and leaving one out would tell a client running an
+          # older engine that the name is wrong, when what is wrong is the
+          # engine version.
+          echo -e "${RED}❌ Unknown action '$action'. This engine serves: plan, drift, apply, destroy, import, read, scan, traffic, state_rm.${NC}"
           exit 1
         fi
     )
@@ -2167,6 +2511,7 @@ SCH_TARGET_AUTH=()
 SCH_ADD_AUTH=()
 SCH_ACTION=()
 SCH_TRAFFIC=()
+SCH_STATE_RM=()
 SCH_DEPS=()
 SCH_STATUS=()
 SCH_PID=()
@@ -2250,6 +2595,7 @@ run_dependency_schedule() {
         # em vez de uma escrita nela.
         SCH_ACTION+=("$(echo "$state" | jq -r '.action // empty')")
         SCH_TRAFFIC+=("$(echo "$state" | jq -c '.traffic // empty')")
+        SCH_STATE_RM+=("$(echo "$state" | jq -r '(.state_rm.addresses? // []) | if type == "array" then .[] else empty end | strings')")
         SCH_DEPS+=("$(echo "$state" | jq -r '(.depends_on // [])[]')")
         SCH_STATUS+=("pending")
         SCH_PID+=("")
@@ -2304,7 +2650,7 @@ run_dependency_schedule() {
                     set +e
                     run_terraform_process "$path" "${SCH_ACTION[$k]:-$ACTION}" \
                         "${SCH_TARGET_AUTH[$k]}" "${SCH_PROVIDER[$k]}" "${SCH_ADD_AUTH[$k]}" \
-                        "${SCH_TRAFFIC[$k]}"
+                        "${SCH_TRAFFIC[$k]}" "${SCH_STATE_RM[$k]}"
                     echo "$?" > "$SCH_DONE_DIR/$k"
                 ) &
                 SCH_PID[$k]=$!
@@ -2421,6 +2767,10 @@ for (( i=0; i<$TOTAL_STAGES; i++ )); do
         state_action=$(echo "$state" | jq -r '.action // empty')
         [ -z "$state_action" ] && state_action="$ACTION"
         traffic=$(echo "$state" | jq -c '.traffic // empty')
+        # What a `state_rm` takes out of this state, one address per line. The
+        # same per-state field as `traffic`, for the same reason: the action can
+        # be this state's alone.
+        state_rm_addresses=$(echo "$state" | jq -r '(.state_rm.addresses? // []) | if type == "array" then .[] else empty end | strings')
 
         if [ ! -d "$path" ]; then
              echo "⚠️  Directory $path does not exist. Skipping."
@@ -2437,7 +2787,7 @@ for (( i=0; i<$TOTAL_STAGES; i++ )); do
             # outcome to the wrong state would clear the badge of a resource that
             # is still being created.
             report_state_progress "$path" "running" "$STATE_INDEX" "$STATE_TOTAL"
-            run_terraform_process "$path" "$state_action" "$target_auth" "$provider" "$additional_auth" "$traffic" &
+            run_terraform_process "$path" "$state_action" "$target_auth" "$provider" "$additional_auth" "$traffic" "$state_rm_addresses" &
             PAR_PIDS+=("$!")
             PAR_PATHS+=("$path")
             PAR_IDX+=("$STATE_INDEX")
@@ -2451,7 +2801,7 @@ for (( i=0; i<$TOTAL_STAGES; i++ )); do
             fi
         else
             report_state_progress "$path" "running" "$STATE_INDEX" "$STATE_TOTAL"
-            run_terraform_process "$path" "$state_action" "$target_auth" "$provider" "$additional_auth" "$traffic"
+            run_terraform_process "$path" "$state_action" "$target_auth" "$provider" "$additional_auth" "$traffic" "$state_rm_addresses"
             if [ $? -ne 0 ]; then
                 report_state_progress "$path" "failed" "$STATE_INDEX" "$STATE_TOTAL"
                 failed=1

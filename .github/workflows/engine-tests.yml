@@ -38,3 +38,9 @@ jobs:
 
       - name: Pipeline dispatch
         run: bash scripts/pipeline-dispatch.test.sh
+
+      - name: No state runs without a backend block
+        run: bash scripts/remote-backend-guard.test.sh
+
+      - name: Google Cloud sign-in and the gcs backend
+        run: bash scripts/google-backend.test.sh

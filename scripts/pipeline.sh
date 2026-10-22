@@ -130,6 +130,9 @@ fi
 
 chmod +x $AUTH_SCRIPTS/*.sh
 source "$AUTH_SCRIPTS/aws.sh"
+# Here, and not only when a Google state signs in: the bucket that holds the
+# states can be in Cloud Storage. See `authenticate_backend`.
+source "$AUTH_SCRIPTS/google.sh"
 # Credencial efêmera de escrita no R2. Sourced, e não só presente na pasta:
 # `cloudflare.sh` define auth_cloudflare() e ninguém o carrega -- a
 # autenticação da Cloudflare que ROLA de verdade é o bloco inline mais abaixo.
@@ -384,6 +387,128 @@ remote_backend_names() {
     { grep -hoE '^[[:space:]]*backend[[:space:]]+"[A-Za-z0-9_]+"[[:space:]]*\{' -- *.tf 2>/dev/null || true; } \
         | sed -E 's/^[[:space:]]*backend[[:space:]]+"([A-Za-z0-9_]+)".*/\1/' \
         | { grep -vx 'local' || true; }
+}
+
+# Publishes a refusal that stops a state before Terraform runs, through the file
+# the app reads for the state's action. Same mapping as the backend-block check
+# in run_terraform_process.
+publish_state_refusal() {
+    local path="$1" action="$2" logfile="$3"
+    case "$action" in
+        plan|drift) publish_plan_failure "$path" init "$logfile" ;;
+        apply)      publish_apply_failure "$path" apply "$logfile" ;;
+        destroy)    publish_destroy_failure "$path" destroy "$logfile" ;;
+    esac
+}
+
+# ==============================================================================
+# WHAT INIT HANDS THE BACKEND, BY THE BACKEND THE CODE DECLARES.
+#
+# The s3 backend reads the AWS profile `backend`, written by auth_aws before any
+# state runs. The gcs backend reads the credential file auth_google wrote for the
+# state bucket, passed as `credentials`: without it the backend signs in with
+# the Application Default Credentials, which are the state's own project once
+# the target is signed in, and `credentials` comes first in its order.
+#
+# The backend has to be the GitOps Workspace's. Handed the other backend's
+# arguments, init stops on `An argument named "profile" is not expected here`,
+# which does not name the cause; the refusal below does.
+#
+# Run from the state's folder. Sets BACKEND_INIT_ARGS, or prints the refusal,
+# starting at an `Error:` line, and returns 1.
+# ==============================================================================
+backend_init_args() {
+    local backend workspace_provider="${BACKEND_PROVIDER:-aws}" cred_file
+    local code_label workspace_label
+
+    backend=$(remote_backend_names | sed -n 1p)
+    BACKEND_INIT_ARGS=()
+
+    case "${backend}:${workspace_provider}" in
+        s3:aws)
+            BACKEND_INIT_ARGS=(-backend-config="profile=backend" -backend-config="region=$BACKEND_REGION")
+            return 0
+            ;;
+        gcs:google)
+            cred_file=$(google_credential_file backend)
+            if [ -f "$cred_file" ]; then
+                BACKEND_INIT_ARGS=(-backend-config="credentials=$cred_file")
+                return 0
+            fi
+            # authenticate_backend writes down why it has no file.
+            if [ -s "${cred_file%.json}.error" ]; then
+                cat "${cred_file%.json}.error"
+            else
+                echo "Error: no Google Cloud sign-in for the bucket that holds the states"
+                echo ""
+                echo "The run did not sign in to Cloud Storage before this state."
+            fi
+            echo "Nothing ran."
+            return 1
+            ;;
+        s3:*|gcs:*)
+            case "$backend" in
+                s3)  code_label="Amazon S3" ;;
+                gcs) code_label="Cloud Storage" ;;
+            esac
+            case "$workspace_provider" in
+                aws)    workspace_label="Amazon S3" ;;
+                google) workspace_label="Cloud Storage" ;;
+                *)      workspace_label="'${workspace_provider}'" ;;
+            esac
+            echo "Error: the state's backend does not match the GitOps Workspace"
+            echo ""
+            echo "This state's Terraform code keeps its state in ${code_label} (backend \"${backend}\"),"
+            echo "and the GitOps Workspace keeps its states in ${workspace_label}. Nothing ran."
+            echo "Compile the state again and run it again."
+            return 1
+            ;;
+        *)
+            echo "Error: the engine cannot open the backend \"${backend}\""
+            echo ""
+            echo "This state's Terraform code keeps its state in a backend \"${backend}\". The engine"
+            echo "opens states in Amazon S3 (backend \"s3\") and in Cloud Storage (backend \"gcs\")."
+            echo "Nothing ran."
+            return 1
+            ;;
+    esac
+}
+
+# ==============================================================================
+# SIGNS IN TO THE BUCKET THAT HOLDS THE STATES, once per run, before any state.
+#
+# The cloud is the GitOps Workspace's: `backend_global_config.provider` in the
+# manifest, and AWS when the manifest has no such field, which was the only
+# kind there was. Signing in to AWS whatever the workspace held made a customer
+# with only Google Cloud need an AWS account.
+#
+# A Google failure does not stop the run here. It is written down beside the
+# credential file, and each state refuses in `backend_init_args` with the
+# reason, through the file the app reads for its action. Stopping here would
+# reach only the Actions log.
+# ==============================================================================
+authenticate_backend() {
+    local backend_json="$1" cred_file
+    case "$BACKEND_PROVIDER" in
+        aws)
+            # Cria o profile [backend] em ~/.aws/credentials
+            auth_aws "{\"role_arn\": \"$BACKEND_ROLE\", \"region\": \"$BACKEND_REGION\"}" "backend"
+            debug_auth_status "BACKEND PROFILE CRIADO"
+            ;;
+        google)
+            cred_file=$(google_credential_file backend)
+            rm -f "${cred_file%.json}.error"
+            if ! auth_google "$backend_json" backend; then
+                rm -f "$cred_file"
+                mkdir -p "$(dirname "$cred_file")"
+                printf '%s\n' "$AUTH_FAILURE_MESSAGE" > "${cred_file%.json}.error"
+                printf "${RED}❌ %s${NC}\n" "$AUTH_FAILURE_MESSAGE"
+            fi
+            ;;
+        *)
+            printf "${YELLOW}⚠️  The GitOps Workspace keeps its states in '%s', which this engine does not sign in to.${NC}\n" "$BACKEND_PROVIDER"
+            ;;
+    esac
 }
 
 # ==============================================================================
@@ -702,6 +827,9 @@ run_terraform_process() {
         # Isso força o Terraform a salvar no .terraform/terraform.tfstate que
         # ele DEVE usar o profile 'backend' para operações de estado (S3/Dynamo),
         # ignorando as variáveis de ambiente que vamos carregar no passo 2.
+        # That is the s3 backend. The gcs backend gets the state bucket's
+        # credential file the same way, for the same reason: see
+        # `backend_init_args`.
 
         # Via `_stream_cmd` pelo mesmo motivo que o plan: é ele que grava o log
         # de onde a mensagem de erro é lida. Sem isso, um init que falha por
@@ -727,7 +855,7 @@ run_terraform_process() {
                     echo "Compile the state again and run it again."
                 fi
                 echo "If the compiled code still has no backend block, connect the GitOps Workspace"
-                echo "to the S3 bucket that holds the states."
+                echo "to the bucket that holds the states."
             } | tee ./.struct8-live.log
             case "$action" in
                 plan|drift) publish_plan_failure "$path" init "./.struct8-live.log" ;;
@@ -735,6 +863,19 @@ run_terraform_process() {
                 destroy)    publish_destroy_failure "$path" destroy "./.struct8-live.log" ;;
             esac
             exit 1
+        fi
+
+        # The credential init hands the backend depends on which backend the
+        # code declares and where the GitOps Workspace keeps its states. Written
+        # straight to the log file, and not through a pipe: a pipe would run the
+        # function in a subshell, and BACKEND_INIT_ARGS would not come back.
+        BACKEND_INIT_ARGS=()
+        if [ "$action" != "scan" ] && [ "$action" != "traffic" ]; then
+            if ! backend_init_args > ./.struct8-live.log; then
+                cat ./.struct8-live.log
+                publish_state_refusal "$path" "$action" "./.struct8-live.log"
+                exit 1
+            fi
         fi
 
         if [ "$action" == "scan" ]; then
@@ -790,22 +931,19 @@ run_terraform_process() {
             # ---------------------------------------------------------------
             if [ -f .terraform.lock.hcl ]; then
                 _stream_cmd terraform init -reconfigure -input=false -lockfile=readonly \
-                    -backend-config="profile=backend" \
-                    -backend-config="region=$BACKEND_REGION" || INIT_STATUS=$?
+                    "${BACKEND_INIT_ARGS[@]}" || INIT_STATUS=$?
                 if [ $INIT_STATUS -ne 0 ] && grep -qE "does not match configured version constraint|Inconsistent dependency lock file|required by this configuration but no version is selected|Provider dependency changes detected" ./.struct8-live.log; then
                     echo -e "${YELLOW}🔏 ${label} Provider set changed in the workspace; recording a new dependency lock.${NC}"
                     INIT_STATUS=0
                     _stream_cmd terraform init -reconfigure -input=false -upgrade \
-                        -backend-config="profile=backend" \
-                        -backend-config="region=$BACKEND_REGION" || INIT_STATUS=$?
+                        "${BACKEND_INIT_ARGS[@]}" || INIT_STATUS=$?
                     if [ $INIT_STATUS -eq 0 ]; then
                         printf '%s\n' "$path/.terraform.lock.hcl" >> "$GITHUB_WORKSPACE/.needs_lock_commit"
                     fi
                 fi
             else
                 _stream_cmd terraform init -reconfigure -input=false \
-                    -backend-config="profile=backend" \
-                    -backend-config="region=$BACKEND_REGION" || INIT_STATUS=$?
+                    "${BACKEND_INIT_ARGS[@]}" || INIT_STATUS=$?
                 if [ $INIT_STATUS -eq 0 ] && [ -f .terraform.lock.hcl ]; then
                     echo -e "${color}🔏 ${label} Dependency lock recorded; it goes to the repository with this run.${NC}"
                     printf '%s\n' "$path/.terraform.lock.hcl" >> "$GITHUB_WORKSPACE/.needs_lock_commit"
@@ -950,7 +1088,29 @@ run_terraform_process() {
         if [ -f "$script_file" ]; then
             echo "🔶 Authenticating $provider (target)..."
             source "$script_file"
-            "auth_${provider}" "$auth_json" "target"
+
+            # A sign-in that fails used to end the state under `set -e` with
+            # nothing published, and the diagram kept showing the previous plan.
+            # The reason now goes to the file the app reads. auth_google leaves
+            # it in AUTH_FAILURE_MESSAGE; a script that leaves none gets the
+            # generic line.
+            AUTH_FAILURE_MESSAGE=""
+            AUTH_STATUS=0
+            "auth_${provider}" "$auth_json" "target" || AUTH_STATUS=$?
+            if [ $AUTH_STATUS -ne 0 ]; then
+                {
+                    if [ -n "$AUTH_FAILURE_MESSAGE" ]; then
+                        printf '%s\n' "$AUTH_FAILURE_MESSAGE"
+                    else
+                        echo "Error: could not sign in to the state's cloud (${provider})"
+                        echo ""
+                        echo "The sign-in ended with status ${AUTH_STATUS}."
+                    fi
+                    echo "No resource was changed."
+                } | tee ./.struct8-live.log
+                publish_state_refusal "$path" "$action" "./.struct8-live.log"
+                exit 1
+            fi
 
             # Debug: Mostra que agora estamos logados como TARGET
             if [ "$provider" == "aws" ]; then
@@ -1530,8 +1690,23 @@ run_terraform_process() {
           if [ $DESTROY_STATUS -eq 0 ]; then
               echo -e "${color}▶️ ${label} Destroy succeeded. Starting remote backend cleanup...${NC}"
 
+              BACKEND_TYPE=$(jq -r '.backend.type // empty' .terraform/terraform.tfstate 2>/dev/null || true)
+              if [ "$BACKEND_TYPE" == "gcs" ]; then
+                  # Cloud Storage: only the state object. The destroy released
+                  # its own `.tflock`, and the gcs backend keeps no checksum
+                  # beside the state, so there is no second item to remove.
+                  GCS_BUCKET=$(jq -r '.backend.config.bucket // empty' .terraform/terraform.tfstate)
+                  GCS_OBJECT=$(gcs_object_name "$(jq -r '.backend.config.prefix // empty' .terraform/terraform.tfstate)" tfstate)
+                  GCS_CREDENTIALS=$(jq -r '.backend.config.credentials // empty' .terraform/terraform.tfstate)
+                  if [ -n "$GCS_BUCKET" ]; then
+                      echo -e "${color}🗑️ ${label} Deleting object: gs://${GCS_BUCKET}/${GCS_OBJECT}${NC}"
+                      gcs_delete_object "${GCS_CREDENTIALS:-$(google_credential_file backend)}" "$GCS_BUCKET" "$GCS_OBJECT" || { CLEANUP_STATUS="partial"; CLEANUP_DETAIL="${CLEANUP_DETAIL}state object gs://${GCS_BUCKET}/${GCS_OBJECT} kept; "; echo "⚠️ Warning: failed to delete the object in Cloud Storage."; }
+                  else
+                      echo -e "${color}⚠️ ${label} Bucket not found. Remote state kept.${NC}"
+                      CLEANUP_STATUS="skipped"; CLEANUP_DETAIL="bucket not resolved; remote state kept"
+                  fi
               # Extrai a Key EXATA e a Tabela do DynamoDB que o Terraform está usando
-              if [ -f ".terraform/terraform.tfstate" ]; then
+              elif [ -f ".terraform/terraform.tfstate" ]; then
                   S3_EXACT_KEY=$(jq -r '.backend.config.key // empty' .terraform/terraform.tfstate)
                   DYNAMODB_TABLE=$(jq -r '.backend.config.dynamodb_table // empty' .terraform/terraform.tfstate)
 
@@ -1636,6 +1811,11 @@ ACTION=$(jq -r '.action // "apply"' "$MANIFEST_PATH")
 export BACKEND_ROLE=$(jq -r '.backend_global_config.role_arn' "$MANIFEST_PATH")
 export BACKEND_REGION=$(jq -r '.backend_global_config.region' "$MANIFEST_PATH")
 export BACKEND_BUCKET=$(jq -r '.backend_global_config.bucket // empty' "$MANIFEST_PATH")
+# The cloud of the bucket that holds the states: `aws` or `google`. A manifest
+# without the field is from before Cloud Storage, so AWS.
+BACKEND_PROVIDER=$(jq -r '.backend_global_config.provider // empty' "$MANIFEST_PATH")
+export BACKEND_PROVIDER="${BACKEND_PROVIDER:-aws}"
+export BACKEND_PROVIDER="${BACKEND_PROVIDER,,}"
 
 # >>> NOVO — quem disparou, pro RoleSessionName (= coluna "User name" do
 # CloudTrail). Ver o bloco grande em scripts/auth/aws.sh. O `// empty`
@@ -1658,12 +1838,9 @@ echo "👤 Triggered by: ${CLOUDMAN_TRIGGERED_BY:-(no field in the manifest -- f
 if [ "$ACTION" == "traffic" ]; then
     echo "⏭️  Backend profile skipped: traffic does not touch Terraform state."
 else
-    echo "🔑 Setting up the backend profile..."
+    echo "🔑 Setting up the backend profile (${BACKEND_PROVIDER})..."
     _mark "antes do auth do backend"
-
-    # Cria o profile [backend] em ~/.aws/credentials
-    auth_aws "{\"role_arn\": \"$BACKEND_ROLE\", \"region\": \"$BACKEND_REGION\"}" "backend"
-    debug_auth_status "BACKEND PROFILE CRIADO"
+    authenticate_backend "$(jq -c '.backend_global_config // {}' "$MANIFEST_PATH")"
     _mark "depois do auth do backend"
 fi
 

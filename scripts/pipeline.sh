@@ -395,6 +395,32 @@ remote_backend_names() {
         | { grep -vx 'local' || true; }
 }
 
+# ==============================================================================
+# THE ACTIONS THAT RUN WITH NO BACKEND AT ALL.
+#
+# Scan and traffic never run init. The import draft does -- `read`, which the
+# account scan sends, and `import`, the Import tab's name for the same pass --
+# but it writes no state: it is a `terraform plan -generate-config-out` over
+# the import blocks, and the state is written by the apply that comes after,
+# from the state's own folder. The account scan's draft folder,
+# `_import/<key>/`, holds only `imports.tf`, with no backend block on purpose.
+#
+# Measured on 2026-10-29: the backend-block check above refused that folder
+# ("no backend block in this state's Terraform code"), and every account-scan
+# import stopped at the read pass from 2026-10-12, when the check went in, with
+# nothing in the account touched. A draft whose folder DOES declare a backend
+# (the Import tab writes its header into the state's folder) still runs with it.
+#
+# Returns 0 when the action runs with no backend. Run from the state's folder.
+# ==============================================================================
+runs_without_backend() {
+    case "$1" in
+        scan|traffic) return 0 ;;
+        read|import)  [ -z "$(remote_backend_names)" ] ;;
+        *)            return 1 ;;
+    esac
+}
+
 # Publishes a refusal that stops a state before Terraform runs, through the file
 # the app reads for the state's action. Same mapping as the backend-block check
 # in run_terraform_process.
@@ -1150,11 +1176,12 @@ run_terraform_process() {
         # todas as outras falhas.
         INIT_STATUS=0
 
-        # No backend block, no Terraform: see `remote_backend_names`. Scan and
-        # traffic are left out because neither runs init nor touches state.
+        # No backend block, no Terraform: see `remote_backend_names`. Scan,
+        # traffic and the import draft are left out: none of them writes state.
+        # See `runs_without_backend`.
         # The reason goes to the file the app reads for this action, so the
         # refusal reaches the diagram instead of only the Actions log.
-        if [ "$action" != "scan" ] && [ "$action" != "traffic" ] && [ -z "$(remote_backend_names)" ]; then
+        if ! runs_without_backend "$action" && [ -z "$(remote_backend_names)" ]; then
             {
                 echo "Error: no backend block in this state's Terraform code"
                 echo ""
@@ -1187,8 +1214,9 @@ run_terraform_process() {
         # code declares and where the GitOps Workspace keeps its states. Written
         # straight to the log file, and not through a pipe: a pipe would run the
         # function in a subshell, and BACKEND_INIT_ARGS would not come back.
+        # An action with no backend gets none, and init keeps the draft local.
         BACKEND_INIT_ARGS=()
-        if [ "$action" != "scan" ] && [ "$action" != "traffic" ]; then
+        if ! runs_without_backend "$action"; then
             if ! backend_init_args > ./.struct8-live.log; then
                 cat ./.struct8-live.log
                 publish_state_refusal "$path" "$action" "./.struct8-live.log"

@@ -10,7 +10,9 @@
 # HOW. `remote_backend_names` is lifted out of pipeline.sh and run over folders
 # written here, so the function under test is the real one. The second half
 # reads run_terraform_process and checks that the refusal comes before the first
-# `terraform init` and leaves scan and traffic alone. Nothing here needs AWS,
+# `terraform init` and leaves alone the actions `runs_without_backend` names:
+# scan, traffic, and the import draft over a folder with no backend block, which
+# the check refused from 2026-10-12 to 2026-10-29. Nothing here needs AWS,
 # Terraform or jq.
 #
 # Usage:
@@ -76,6 +78,39 @@ check "a folder with no .tf at all" "" \
 check "a block in a .tf that is not main.tf" "s3" \
   "$(names_in main.tf 'resource "aws_sns_topic" "t" {}\n' backend.tf 'terraform {\n  backend "s3" {\n  }\n}\n')"
 
+# ------------------------------------------------------------ who runs without one
+awk '/^runs_without_backend\(\) \{/{f=1} f{print} f && /^\}/{exit}' "$PIPELINE" | tr -d '\r' >> "$work/fn.sh"
+check "runs_without_backend is defined in pipeline.sh" "1" "$(grep -c '^runs_without_backend() {' "$work/fn.sh")"
+# shellcheck source=/dev/null
+source "$work/fn.sh"
+
+# Answers yes or no for an action run from a folder holding the given files.
+without_backend() {
+  local action="$1" dir="$work/case$RANDOM$RANDOM"
+  shift
+  mkdir -p "$dir"
+  while [ $# -gt 0 ]; do
+    printf '%b' "$2" > "$dir/$1"
+    shift 2
+  done
+  (cd "$dir" && set -eo pipefail && if runs_without_backend "$action"; then echo yes; else echo no; fi)
+}
+
+# The account scan's draft folder, `_import/<key>/`, as the app writes it.
+draft_tf='terraform {\n  required_providers {\n    aws = {\n      source = "hashicorp/aws"\n    }\n  }\n}\n\nprovider "aws" {\n  region = "us-west-2"\n}\n\nimport {\n  to = aws_s3_bucket.b\n  id = "b"\n}\n'
+state_tf='terraform {\n  backend "s3" {\n    bucket = "b"\n  }\n}\n'
+check "scan runs without a backend" "yes" "$(without_backend scan manifest.json '{}')"
+check "traffic runs without a backend" "yes" "$(without_backend traffic main.tf "$state_tf")"
+check "the account scan's read pass, over imports.tf with no backend block" "yes" \
+  "$(without_backend read imports.tf "$draft_tf")"
+check "the Import tab's pass, over a folder with no backend block" "yes" \
+  "$(without_backend import imports.tf "$draft_tf")"
+check "a read pass whose folder declares a backend keeps it" "no" \
+  "$(without_backend read import.tf "$state_tf" imports.tf "$draft_tf")"
+for action in plan drift apply destroy state_rm; do
+  check "$action needs a backend" "no" "$(without_backend "$action" main.tf 'resource "aws_sns_topic" "t" {}\n')"
+done
+
 # ------------------------------------------------------------ where it runs
 body="$work/run.sh"
 awk '/^run_terraform_process\(\) \{/{f=1} f{print} f && /^}$/{exit}' "$PIPELINE" | tr -d '\r' > "$body"
@@ -87,8 +122,11 @@ check "the check comes before the first terraform init" "yes" \
   "$([ -n "$guard_line" ] && [ -n "$init_line" ] && [ "$guard_line" -lt "$init_line" ] && echo yes || echo no)"
 
 guard_if=$(sed -n "${guard_line}p" "$body")
-check "scan is left out of the check" "yes" "$(grep -q '"\$action" != "scan"' <<< "$guard_if" && echo yes || echo no)"
-check "traffic is left out of the check" "yes" "$(grep -q '"\$action" != "traffic"' <<< "$guard_if" && echo yes || echo no)"
+check "the check leaves out the actions that run without a backend" "yes" \
+  "$(grep -q '! runs_without_backend "\$action"' <<< "$guard_if" && echo yes || echo no)"
+args_if=$(grep -n -B1 'backend_init_args >' "$body" | head -n1)
+check "init gets no backend arguments for those actions either" "yes" \
+  "$(grep -q '! runs_without_backend "\$action"' <<< "$args_if" && echo yes || echo no)"
 
 block=$(sed -n "${guard_line},/^        fi\$/p" "$body")
 check "the refusal fails the state" "yes" "$(grep -q '^[[:space:]]*exit 1$' <<< "$block" && echo yes || echo no)"

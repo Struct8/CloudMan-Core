@@ -117,25 +117,29 @@ jobs:
           # The input is the floor for callers whose manifest predates the field.
           ENGINE_REF_DEFAULT="${ENGINE_REF_INPUT:-main}"
 
-          # 1. Tenta achar o manifesto na pasta que teve o código alterado
-          MANIFEST_PATH=$(git diff --name-only HEAD^ HEAD 2>/dev/null | grep "manifest.json" | head -n 1 || true)
-
-          # 2. Se for trigger manual ou não achar diff, pega o primeiro que encontrar (fallback)
-          if [ -z "$MANIFEST_PATH" ] || [ ! -f "$MANIFEST_PATH" ]; then
-            MANIFEST_PATH=$(find . -name "manifest.json" -not -path "*/.*" -print -quit)
-          fi
+          # The manifest THIS commit added or changed -- and only that one.
+          #
+          # A deleted manifest asks for no run. The push filter still fires on it
+          # (removing a state folder touches `**/manifest.json`), and this used to
+          # fall back to `find`, i.e. to the FIRST manifest anywhere in the
+          # repository, and run whatever action it named. Measured on
+          # Struct8/structCICDTest, 2026-10-29 and 2026-10-31: a commit that only
+          # removed one state folder re-ran the destroy of ANOTHER state. With a
+          # live state there, that is an apply or a destroy nobody asked for.
+          #
+          # Nobody needs the fallback: every push the app makes writes the
+          # manifest as its last commit, so the run's HEAD always carries it. A
+          # run with no manifest of its own does nothing, and says why.
+          MANIFEST_PATH=$(git diff --name-only --diff-filter=d HEAD^ HEAD 2>/dev/null | grep -E '(^|/)manifest\.json$' | head -n 1 || true)
 
           echo "========================================================="
           echo "📂 [PATH] MANIFEST SELECTED DURING ANALYSIS:"
-          echo "Path: ${MANIFEST_PATH:-none found}"
+          echo "Path: ${MANIFEST_PATH:-none}"
           echo "========================================================="
 
           if [ -z "$MANIFEST_PATH" ]; then
-            echo "⚠️ No manifest found. Assuming the default flow (false)."
-            echo "needs_private_access=false" >> $GITHUB_OUTPUT
-            # Sem manifesto nao ha o que pular: 'apply' mantem TODOS os passos.
-            echo "action=apply" >> $GITHUB_OUTPUT
-            echo "engine_ref=$ENGINE_REF_DEFAULT" >> $GITHUB_OUTPUT
+            echo "ℹ️ This commit added or changed no manifest.json (a deleted one asks for no run). Nothing to do."
+            echo "skip=true" >> $GITHUB_OUTPUT
             exit 0
           fi
 
@@ -369,6 +373,10 @@ jobs:
           echo "token=$TOKEN" >> $GITHUB_OUTPUT
 
       - name: 📥 Checkout Struct8 Engine
+        # `skip` means the commit carried no manifest of its own (see the step
+        # above). From here on every step is about running one, so each of them
+        # stops on it.
+        if: steps.manifest_check.outputs.skip != 'true'
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # Canonical name. This named the PREVIOUS organization's repository
@@ -391,13 +399,14 @@ jobs:
 
       - name: 🛠️ Setup Terraform
         # Um run de traffic nao chama terraform nenhuma vez.
-        if: steps.manifest_check.outputs.action != 'traffic'
+        if: steps.manifest_check.outputs.skip != 'true' && steps.manifest_check.outputs.action != 'traffic'
         uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
         with:
           terraform_version: "1.5.7"  # Adicione esta linha
           terraform_wrapper: false    # Recomendado para scripts bash complexos como o seu
 
       - name: 🚀 Run Modular Pipeline
+        if: steps.manifest_check.outputs.skip != 'true'
         shell: bash
         env:
           # Mesma lógica de fallback aqui para o clone dentro do script
@@ -436,7 +445,7 @@ jobs:
       - name: 📤 Publish Engine Output
         # Nao ha plano nem resultado de apply para publicar: o que este run
         # produz e uma escrita na nuvem, e ela ja aparece no log.
-        if: always() && steps.manifest_check.outputs.action != 'traffic'
+        if: always() && steps.manifest_check.outputs.skip != 'true' && steps.manifest_check.outputs.action != 'traffic'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: engine-output
@@ -472,7 +481,7 @@ jobs:
       - name: 💾 Push / Cleanup GitOps State
         # Traffic nao gera state, nao toma lock e nao escreve arquivo nenhum no
         # repositorio -- nao ha o que devolver.
-        if: success() && steps.manifest_check.outputs.action != 'traffic'
+        if: success() && steps.manifest_check.outputs.skip != 'true' && steps.manifest_check.outputs.action != 'traffic'
         shell: bash
         run: |
           bash .struct8-engine/scripts/publish-gitops.sh

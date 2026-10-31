@@ -941,8 +941,10 @@ remove_from_state() {
 # DIVISÃO BLUE/GREEN
 #
 # O canvas move o percentual entre as duas versões, e quem guarda esse número é
-# um recurso da conta do CLIENTE: um parâmetro na AWS, um par chave/valor na
-# Cloudflare. A escrita acontece AQUI, e não numa chamada direta do navegador,
+# um recurso da conta do CLIENTE: um parâmetro do SSM ou uma chave de um
+# KeyValueStore do CloudFront na AWS, um par chave/valor na Cloudflare. Um
+# pipeline pode ter mais de uma loja ligada, e o manifesto traz uma entrada por
+# loja: cada uma passa por aqui sozinha. A escrita acontece AQUI, e não numa chamada direta do navegador,
 # por uma razão só: as credenciais do cliente já estão neste runner, resolvidas
 # para esta conta. Qualquer outro caminho precisaria de um segredo novo, por
 # provedor, guardado e rotacionado em algum lugar.
@@ -1001,6 +1003,71 @@ _traffic_write_aws() {
     fi
 }
 
+# Uma chave de um KeyValueStore do CloudFront. É o único dado que uma CloudFront
+# Function lê: ela não chama o SSM nem serviço nenhum, então um roteador na borda
+# só enxerga a divisão se ela estiver aqui.
+#
+# Toda escrita leva o ETag do store (`--if-match`), e o store recusa quando outra
+# escrita entrou no meio. Aí a leitura, a fusão e a escrita recomeçam inteiras,
+# porque a fusão tem de partir do valor de AGORA. O AWS CLI v2 assina essas
+# chamadas com SigV4A, que o serviço exige.
+_traffic_write_aws_kvs() {
+    local document=$1 stage=$2 split=$3 address=$4 label=$5
+
+    local kvs_arn
+    kvs_arn=$(echo "$address" | jq -r '.key_value_store_arn // empty')
+    if [ -z "$kvs_arn" ]; then
+        echo "❌ ${label} traffic: the manifest carries no key_value_store_arn for the KeyValueStore key."
+        return 1
+    fi
+
+    local attempt etag current merged size response
+    for attempt in 1 2 3; do
+        if ! etag=$(aws cloudfront-keyvaluestore describe-key-value-store --kvs-arn "$kvs_arn" \
+                        --query 'ETag' --output text 2>&1); then
+            echo "❌ ${label} traffic: could not read the KeyValueStore '$kvs_arn'."
+            echo "$etag"
+            return 1
+        fi
+
+        # Chave ausente é a primeira escrita depois do apply. Qualquer outra falha
+        # para aqui: tratá-la como documento novo gravaria só este estágio e
+        # apagaria a divisão dos outros.
+        if ! current=$(aws cloudfront-keyvaluestore get-key --kvs-arn "$kvs_arn" --key "$document" \
+                           --query 'Value' --output text 2>&1); then
+            case "$current" in
+                *ResourceNotFound*) current="" ;;
+                *)
+                    echo "❌ ${label} traffic: could not read the key '$document'."
+                    echo "$current"
+                    return 1
+                    ;;
+            esac
+        fi
+
+        merged=$(_traffic_merge "$current" "$stage" "$split") || return 1
+
+        # Um valor cabe em 1 KB. Recusar aqui diz o tamanho; a API só diria que
+        # o valor é inválido.
+        size=$(printf '%s' "$merged" | wc -c | tr -d '[:space:]')
+        if [ "$size" -gt 1024 ]; then
+            echo "❌ ${label} traffic: the document for '$document' has ${size} bytes, and a KeyValueStore value holds at most 1024."
+            return 1
+        fi
+
+        if response=$(aws cloudfront-keyvaluestore put-key --kvs-arn "$kvs_arn" --key "$document" \
+                          --value "$merged" --if-match "$etag" 2>&1); then
+            return 0
+        fi
+
+        echo "⚠️  ${label} traffic: the KeyValueStore refused write ${attempt} of 3."
+        echo "$response"
+    done
+
+    echo "❌ ${label} traffic: the KeyValueStore refused three writes in a row."
+    return 1
+}
+
 _traffic_write_cloudflare() {
     local document=$1 stage=$2 split=$3 address=$4 label=$5
 
@@ -1056,14 +1123,19 @@ _traffic_write_cloudflare() {
 # Roteia por provedor. Provedor sem escrita nomeada FALHA ALTO: seguir calado
 # devolveria sucesso para uma mudança de tráfego que não aconteceu, e o canvas
 # passaria a mostrar um percentual que a nuvem não tem.
+#
+# Na AWS há dois tipos de loja, e `store_type` diz qual. Manifesto sem o campo
+# vem de um canvas anterior ao KeyValueStore, e lá a loja só podia ser o
+# parâmetro do SSM.
 apply_traffic_split() {
     local traffic_json=$1 provider=$2 label=$3
 
-    local document stage split address
+    local document stage split address store_type
     document=$(echo "$traffic_json" | jq -r '.document // empty')
     stage=$(echo "$traffic_json" | jq -r '.stage // empty')
     split=$(echo "$traffic_json" | jq -c '.split // empty')
     address=$(echo "$traffic_json" | jq -c '.address // {}')
+    store_type=$(echo "$traffic_json" | jq -r '.store_type // empty')
 
     if [ -z "$document" ] || [ -z "$stage" ] || [ -z "$split" ]; then
         echo "❌ ${label} traffic: the manifest entry has no document, stage or split."
@@ -1073,7 +1145,13 @@ apply_traffic_split() {
     echo "🎛️  ${label} traffic: stage '${stage}' -> ${split}"
 
     case "$provider" in
-        aws)        _traffic_write_aws "$document" "$stage" "$split" "$address" "$label" ;;
+        aws)
+            if [ "$store_type" == "aws_cloudfrontkeyvaluestore_key" ]; then
+                _traffic_write_aws_kvs "$document" "$stage" "$split" "$address" "$label"
+            else
+                _traffic_write_aws "$document" "$stage" "$split" "$address" "$label"
+            fi
+            ;;
         cloudflare) _traffic_write_cloudflare "$document" "$stage" "$split" "$address" "$label" ;;
         *)
             echo "❌ ${label} traffic: provider '$provider' has no traffic store writer in this engine."

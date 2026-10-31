@@ -113,19 +113,14 @@ runs:
       run: |
         echo "🔍 Identifying which folder triggered the pipeline..."
         ENGINE_REF_DEFAULT="${ENGINE_REF_INPUT:-main}"
-        MANIFEST_PATH=$(git diff --name-only HEAD^ HEAD 2>/dev/null | grep "manifest.json" | head -n 1 || true)
-        if [ -z "$MANIFEST_PATH" ] || [ ! -f "$MANIFEST_PATH" ]; then
-          MANIFEST_PATH=$(find . -name "manifest.json" -not -path "*/.*" -print -quit)
-        fi
+        MANIFEST_PATH=$(git diff --name-only --diff-filter=d HEAD^ HEAD 2>/dev/null | grep -E '(^|/)manifest\.json$' | head -n 1 || true)
         echo "========================================================="
         echo "📂 [PATH] MANIFEST SELECTED DURING ANALYSIS:"
-        echo "Path: ${MANIFEST_PATH:-none found}"
+        echo "Path: ${MANIFEST_PATH:-none}"
         echo "========================================================="
         if [ -z "$MANIFEST_PATH" ]; then
-          echo "⚠️ No manifest found. Assuming the default flow (false)."
-          echo "needs_private_access=false" >> $GITHUB_OUTPUT
-          echo "action=apply" >> $GITHUB_OUTPUT
-          echo "engine_ref=$ENGINE_REF_DEFAULT" >> $GITHUB_OUTPUT
+          echo "ℹ️ This commit added or changed no manifest.json (a deleted one asks for no run). Nothing to do."
+          echo "skip=true" >> $GITHUB_OUTPUT
           exit 0
         fi
         if [ ! -s "$MANIFEST_PATH" ]; then
@@ -230,6 +225,7 @@ runs:
         echo "✅ Authenticated successfully against $STAGE!"
         echo "token=$TOKEN" >> $GITHUB_OUTPUT
     - name: 📥 Checkout Struct8 Engine
+      if: steps.manifest_check.outputs.skip != 'true'
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         repository: Struct8/CloudMan-Core
@@ -237,12 +233,13 @@ runs:
         ref: ${{ steps.manifest_check.outputs.engine_ref || inputs.engine_ref }}
         token: ${{ steps.gatekeeper.outputs.token || github.token }}
     - name: 🛠️ Setup Terraform
-      if: steps.manifest_check.outputs.action != 'traffic'
+      if: steps.manifest_check.outputs.skip != 'true' && steps.manifest_check.outputs.action != 'traffic'
       uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
       with:
         terraform_version: "1.5.7"  # Adicione esta linha
         terraform_wrapper: false    # Recomendado para scripts bash complexos como o seu
     - name: 🚀 Run Modular Pipeline
+      if: steps.manifest_check.outputs.skip != 'true'
       shell: bash
       env:
         GH_CLONE_TOKEN: ${{ steps.gatekeeper.outputs.token || github.token }}
@@ -252,7 +249,7 @@ runs:
         MANIFEST_PATH_INPUT: ${{ steps.manifest_check.outputs.manifest_path }}
       run: bash .struct8-engine/scripts/pipeline.sh
     - name: 📤 Publish Engine Output
-      if: always() && steps.manifest_check.outputs.action != 'traffic'
+      if: always() && steps.manifest_check.outputs.skip != 'true' && steps.manifest_check.outputs.action != 'traffic'
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
         name: engine-output
@@ -270,7 +267,7 @@ runs:
         [ -f .struct8-engine/scripts/release-locks.sh ] || exit 0
         MANIFEST_PATH="${{ steps.manifest_check.outputs.manifest_path }}" bash .struct8-engine/scripts/release-locks.sh
     - name: 💾 Push / Cleanup GitOps State
-      if: success() && steps.manifest_check.outputs.action != 'traffic'
+      if: success() && steps.manifest_check.outputs.skip != 'true' && steps.manifest_check.outputs.action != 'traffic'
       shell: bash
       run: |
         bash .struct8-engine/scripts/publish-gitops.sh

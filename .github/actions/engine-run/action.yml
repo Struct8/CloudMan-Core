@@ -247,7 +247,13 @@ runs:
         SECRETS_CONTEXT: ${{ inputs.secrets_json }}
         GH_TOKEN: ${{ github.token }}   # >>> NOVO — autentica o `gh run view` do backstop (camada 4)
         MANIFEST_PATH_INPUT: ${{ steps.manifest_check.outputs.manifest_path }}
-      run: bash .struct8-engine/scripts/pipeline.sh
+      run: |
+        # secrets_json is an input, not a secret: each value is masked here,
+        # before the pipeline runs, as engine.yml does for STRUCT8_SECRETS.
+        jq -r '.[] | strings' <<<"$SECRETS_CONTEXT" | while IFS= read -r line; do
+          if [ -n "$line" ]; then echo "::add-mask::$line"; fi
+        done
+        bash .struct8-engine/scripts/pipeline.sh
     - name: 📤 Publish Engine Output
       if: always() && steps.manifest_check.outputs.skip != 'true' && steps.manifest_check.outputs.action != 'traffic'
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

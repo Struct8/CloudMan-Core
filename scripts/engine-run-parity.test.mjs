@@ -33,6 +33,9 @@ const ENGINE_ACTION = resolve(ROOT, process.env.ENGINE_ACTION || '.github/action
 /** engine.yml spelling -> action spelling. The only differences allowed. */
 const SUBSTITUTIONS = [
 	['secrets.GITHUB_TOKEN', 'github.token'],
+	// A caller of another organization passes its secrets as STRUCT8_SECRETS; the
+	// action has them in secrets_json either way.
+	['secrets.STRUCT8_SECRETS || toJSON(secrets)', 'inputs.secrets_json'],
 	['toJSON(secrets)', 'inputs.secrets_json'],
 ];
 

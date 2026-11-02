@@ -36,6 +36,14 @@ on:
         required: false
         type: string
         default: "main"
+    secrets:
+      STRUCT8_SECRETS:
+        # The caller's secrets as one JSON object (`${{ toJSON(secrets) }}`).
+        # `secrets: inherit` passes nothing when the caller's repository is in
+        # another organization, and every customer's repository is, so the
+        # secrets the manifest names (a Cloudflare API token, for one) never
+        # reached the engine. A named secret crosses organizations.
+        required: false
   workflow_dispatch:
   push:
     paths:
@@ -412,12 +420,21 @@ jobs:
           # Mesma lógica de fallback aqui para o clone dentro do script
           GH_CLONE_TOKEN: ${{ steps.gatekeeper.outputs.token || secrets.GITHUB_TOKEN }}
           LOGIN_REGION: ${{ inputs.default_region || 'us-east-1' }}
-          SECRETS_CONTEXT: ${{ toJSON(secrets) }}
+          # STRUCT8_SECRETS when the caller passes it; otherwise the secrets a
+          # caller of this organization inherits, as before.
+          SECRETS_CONTEXT: ${{ secrets.STRUCT8_SECRETS || toJSON(secrets) }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # >>> NOVO — autentica o `gh run view` do backstop (camada 4)
           # >>> O manifest_path vem por env, nao inline, para nao interpolar valor
           # do GitHub direto no shell (evita injecao via conteudo do caminho).
           MANIFEST_PATH_INPUT: ${{ steps.manifest_check.outputs.manifest_path }}
-        run: bash .struct8-engine/scripts/pipeline.sh
+        run: |
+          # The runner masks STRUCT8_SECRETS line by line, and a line of that JSON
+          # holds a key with its value, so a value printed alone would show in
+          # the log. Each value is masked here, before the pipeline runs.
+          jq -r '.[] | strings' <<<"$SECRETS_CONTEXT" | while IFS= read -r line; do
+            if [ -n "$line" ]; then echo "::add-mask::$line"; fi
+          done
+          bash .struct8-engine/scripts/pipeline.sh
 
       # >>> Publica o que os SCRIPTS decidiram publicar. Nada aqui sabe o que é.
       #

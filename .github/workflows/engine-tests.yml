@@ -50,3 +50,6 @@ jobs:
 
       - name: Providers left in the state, and removing from the state
         run: bash scripts/state-rm.test.sh
+
+      - name: Writing the blue/green split to a CloudFront KeyValueStore
+        run: bash scripts/traffic-store.test.sh

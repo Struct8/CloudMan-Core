@@ -100,6 +100,27 @@ init_guard=$(awk '/PASSO 1: TERRAFORM INIT/{f=1} f && /PASSO 2: PREPARA/{exit} f
   | grep -c 'if \[ "$action" == "scan" \]; then')
 check "a scan skips terraform init, which has nothing to initialise" "1" "$init_guard"
 
+traffic_init=$(awk '/PASSO 1: TERRAFORM INIT/{f=1} f && /PASSO 2: PREPARA/{exit} f' "$PIPELINE" \
+  | grep -c 'elif \[ "\$action" == "traffic" \]; then')
+check "traffic skips it too -- the folder HAS Terraform, and the write does not use it" "1" "$traffic_init"
+
+# ---------------------------------------------- traffic leaves before the chain
+#
+# It is NOT one of the branches above: it runs between the credentials and PASSO
+# 3 and exits there, because writing a traffic split is not a Terraform
+# operation. Asserted so that removing that exit shows up HERE -- without it,
+# `traffic` falls through to the else and gets reported as an action the engine
+# does not know, which is the opposite of true.
+traffic_exit=$(awk '/PASSO 2: PREPARA/{f=1} f && /PASSO 3: EXECU/{exit} f' "$PIPELINE" \
+  | grep -cE 'if \[ "\$action" == "traffic" \]; then|^            exit 0$')
+check "traffic runs and exits before PASSO 3, so it never reaches the chain" "2" "$traffic_exit"
+
+# The list a client reads when their engine is older than the action the app
+# sent. Naming only what the chain serves would tell them the NAME is wrong,
+# when what is old is the engine.
+serves_traffic=$(grep -c "read, scan, traffic\." "$PIPELINE")
+check "the unknown-action message names traffic among what is served" "1" "$serves_traffic"
+
 echo
 if [ "$failures" -eq 0 ]; then
   echo "ALL CASES PASSED"

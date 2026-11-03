@@ -46,10 +46,17 @@ R2_EPHEMERAL_CF_TOKEN=""
 # O gatilho é o HCL GERADO, não um campo do manifesto: o gerador só emite
 # `var.r2_access_key_id` quando existe um aws_s3_object apontado para um bucket
 # R2. Ler daqui evita um campo novo no manifesto e, principalmente, evita os
-# dois lados discordarem -- a pergunta é respondida pelo próprio arquivo que
-# vai rodar.
+# dois lados discordarem -- a pergunta é respondida pelos próprios arquivos que
+# vão rodar.
+#
+# `*.tf`, E NÃO `main.tf`. O CloudMan passou a publicar um arquivo por domínio
+# (`network.tf`, `storage.tf`, ...) no lugar de um `main.tf` só, e a expressão
+# procurada cai no arquivo do domínio dela. Preso ao nome antigo este grep não
+# acharia nada, credencial nenhuma seria emitida, e o apply falharia no
+# PutObject -- três camadas adiante de onde está a causa. Pasta que ainda tenha
+# só o `main.tf` segue atendida: o glob a alcança igual.
 r2_state_needs_credentials() {
-    grep -q 'var\.r2_access_key_id' main.tf 2>/dev/null
+    grep -q 'var\.r2_access_key_id' *.tf 2>/dev/null
 }
 
 # Descobre o grupo de permissão de ESCRITA de objeto no R2.
@@ -165,9 +172,15 @@ r2_mint_ephemeral_credentials() {
 #
 # O HCL referencia o bucket por expressão (`cloudflare_r2_bucket.X.name`), então
 # são dois saltos: do objeto para o nome lógico, e do recurso para o `name`.
+#
+# Os dois saltos varrem `*.tf`, pelo mesmo motivo de `r2_state_needs_credentials`
+# -- e podem cair em arquivos DIFERENTES: o objeto vive no domínio dele e o
+# bucket no do R2. O `-h` no grep é o que isso exige: com mais de um arquivo o
+# grep prefixa cada linha com o nome do arquivo, e o `sed` seguinte devolveria
+# `storage.tf:MeuBucket` como nome lógico.
 r2_target_bucket() {
     local logico
-    logico=$(grep -oE 'bucket[[:space:]]+= cloudflare_r2_bucket\.[A-Za-z0-9_-]+' main.tf 2>/dev/null \
+    logico=$(grep -hoE 'bucket[[:space:]]+= cloudflare_r2_bucket\.[A-Za-z0-9_-]+' *.tf 2>/dev/null \
              | head -1 | sed 's/.*cloudflare_r2_bucket\.//')
     [ -z "$logico" ] && return 0
 
@@ -177,7 +190,7 @@ r2_target_bucket() {
             gsub(/.*=[[:space:]]*"|"[[:space:]]*$/, ""); print; exit
         }
         dentro && /^}/ { exit }
-    ' main.tf 2>/dev/null
+    ' *.tf 2>/dev/null
 }
 
 # Confere que a credencial ASSINA de verdade, contra o endpoint real.
@@ -203,7 +216,7 @@ r2_verify_credentials() {
     local bucket
     bucket=$(r2_target_bucket)
     if [ -z "$bucket" ]; then
-        echo "⚠️  Could not read the target bucket name from main.tf — skipping the R2 credential check."
+        echo "⚠️  Could not read the target bucket name from the generated Terraform — skipping the R2 credential check."
         return 0
     fi
     echo "   Checking the credential against bucket '${bucket}'..."

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
-# The two functions in `r2.sh` that read the generated Terraform from disk.
+# The two functions in `r2.sh` that read the generated Terraform from disk, and
+# the wait for a new credential in `r2_verify_credentials`.
 #
-# WHY THEY HAVE A TEST AT ALL: both used to read `main.tf` by name, and the
+# WHY THE FIRST TWO HAVE A TEST AT ALL: both used to read `main.tf` by name, and the
 # CloudMan publish stopped writing that file. It now writes one file per domain
 # -- `network.tf`, `storage.tf`, `versions.tf` -- so the expression each function
 # looks for lands in whichever file its domain owns.
@@ -17,6 +18,12 @@
 # The legacy shape is covered too. A folder that still holds a single `main.tf`
 # has to keep working, because the repositories out there hold both shapes until
 # every state is published again.
+#
+# WHY THE WAIT HAS A TEST: `r2_verify_credentials` stopped at the first
+# `Unauthorized`, which is what a new token gets, so it never waited. Terraform
+# then read the objects with a token the endpoint was still refusing. The test
+# puts a fake `aws` on the PATH that plays a list of answers, and a fake `sleep`
+# that only moves the clock, so it needs no network and takes no real time.
 #
 # Run: bash scripts/auth/r2.test.sh
 set -u
@@ -98,6 +105,134 @@ rm -rf "$dir"
 dir=$(mktemp -d)
 cenario "pasta vazia" nao ""
 rm -rf "$dir"
+
+echo
+echo "r2.sh -- espera pela credencial nova"
+echo
+
+# The numbers come from the file under test, so changing them does not need a
+# change here.
+eval "$(grep -E '^R2_VERIFY_[A-Z]+=' "$R2")"
+REQUIRED=${R2_VERIFY_REQUIRED:-1}
+TIMEOUT=${R2_VERIFY_TIMEOUT:-20}
+INTERVAL=${R2_VERIFY_INTERVAL:-5}
+
+fake=$(mktemp -d)
+mkdir "$fake/bin"
+cat > "$fake/bin/aws" <<'FAKE'
+#!/usr/bin/env bash
+# Plays one line of $R2_FAKE/answers per call, and repeats the last one.
+n=$(cat "$R2_FAKE/count" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > "$R2_FAKE/count"
+answer=$(sed -n "${n}p" "$R2_FAKE/answers")
+[ -n "$answer" ] || answer=$(tail -n 1 "$R2_FAKE/answers")
+case "$answer" in
+  ok) echo '{"KeyCount": 1}'; exit 0 ;;
+  NoSuchBucket) text='The specified bucket does not exist' ;;
+  InvalidAccessKeyId) text='The AWS Access Key Id you provided does not exist in our records.' ;;
+  *) text=$answer ;;
+esac
+echo "aws: [ERROR]: An error occurred ($answer) when calling the ListObjectsV2 operation: $text" >&2
+exit 254
+FAKE
+chmod +x "$fake/bin/aws"
+
+# `terraform` wrote these, so the function finds a bucket to probe.
+tf=$(mktemp -d)
+printf '%s\n\n%s\n' "$OBJETO_HCL" "$BUCKET_HCL" > "$tf/main.tf"
+
+# Runs the check under `set -eo pipefail`, the flags of pipeline.sh, in a subshell
+# that keeps the clock and the PATH to itself. `$1` is the list of answers, and
+# `$2`, when given, is how many seconds each fake sleep moves the clock.
+espera() {
+  local salto=${2:-}
+  printf '%s\n' $1 > "$fake/answers"
+  rm -f "$fake/count"
+  saida=$(
+    set -eo pipefail
+    # shellcheck source=/dev/null
+    source "$R2"
+    sleep() { SECONDS=$((SECONDS + ${salto:-$1})); }
+    export R2_FAKE="$fake" PATH="$fake/bin:$PATH"
+    export TF_VAR_r2_access_key_id=key TF_VAR_r2_secret_access_key=secret
+    cd "$tf"
+    r2_verify_credentials conta
+    echo "RETORNOU $?"
+  )
+  sondas=$(cat "$fake/count" 2>/dev/null || echo 0)
+}
+
+confere() {
+  local nome=$1 sondas_esperadas=$2 texto=$3
+  [ "$sondas" = "$sondas_esperadas" ] \
+    && ok "$nome: $sondas sondas" \
+    || falha "$nome: sondas" "esperava $sondas_esperadas, veio $sondas"
+  case "$saida" in
+    *"$texto"*) ok "$nome: disse '$texto'" ;;
+    *) falha "$nome: texto" "esperava '$texto' em: $saida" ;;
+  esac
+  case "$saida" in
+    *"RETORNOU 0"*) ok "$nome: nao barrou o pipeline" ;;
+    *) falha "$nome: retorno" "a conferencia nao terminou com 0: $saida" ;;
+  esac
+}
+
+seguidas() {
+  local i
+  for ((i = 0; i < REQUIRED; i++)); do printf 'ok '; done
+}
+
+# 5. The reported case: `Unauthorized` first, then the token starts to work.
+espera "Unauthorized Unauthorized $(seguidas)"
+confere "Unauthorized e depois sucesso" $((REQUIRED + 2)) "R2 credential verified"
+
+# 6. One good answer is not enough, and a refusal starts the count again. The
+#    failed apply had 15 reads accepted and 7 refused in the same two seconds.
+espera "ok Unauthorized $(seguidas)"
+confere "boa, recusa, boas" $((REQUIRED + 2)) "R2 credential verified"
+
+# 7. Nothing wrong at all: the good answers end it, with no wait announced.
+espera "ok"
+confere "tudo bom" "$REQUIRED" "R2 credential verified"
+case "$saida" in
+  *"has not accepted the new credential"*) falha "tudo bom: espera" "anunciou espera sem recusa" ;;
+  *) ok "tudo bom: nao anunciou espera" ;;
+esac
+
+# 8. The ceiling: it ends, tells what happened, and leaves the decision to
+#    Terraform. Commit 3bde70e took this block out of the deploy on purpose.
+#    Four jumps reach the ceiling, and the real time of each probe also counts on
+#    that clock, so five probes is the most it can take, and more than one proves
+#    that it waited.
+espera "Unauthorized" $((TIMEOUT / 4))
+confere "teto esgotado" "$sondas" "continuing anyway, Terraform decides"
+if [ "$sondas" -gt 1 ] && [ "$sondas" -le 5 ]; then
+  ok "teto esgotado: esperou e parou no teto"
+else
+  falha "teto esgotado: sondas" "esperava de 2 a 5, veio $sondas"
+fi
+case "$saida" in
+  *"has not accepted this token"*) ok "teto esgotado: explica Unauthorized" ;;
+  *) falha "teto esgotado: explicacao" "texto de Unauthorized desatualizado: $saida" ;;
+esac
+
+# 9. The other answer a token the endpoint does not know gets.
+espera "InvalidAccessKeyId $(seguidas)"
+confere "InvalidAccessKeyId e depois sucesso" $((REQUIRED + 1)) "R2 credential verified"
+
+# 10. Time does not fix these, so the check says so at once.
+espera "SignatureDoesNotMatch"
+confere "assinatura errada" 1 "continuing anyway, Terraform decides"
+espera "AccessDenied"
+confere "permissao negada" 1 "continuing anyway, Terraform decides"
+
+# 11. The first apply of a state runs before its bucket exists. Its text also
+#     says `does not exist`, which the wait must not read as a token not known yet.
+espera "NoSuchBucket"
+confere "bucket ainda nao existe" "$REQUIRED" "does not exist yet"
+
+rm -rf "$fake" "$tf"
 
 echo
 [ "$falhas" -eq 0 ] && echo "Tudo verde." || echo "$falhas falha(s)."

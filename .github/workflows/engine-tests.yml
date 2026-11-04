@@ -33,6 +33,9 @@ jobs:
       - name: Lambda source completion
         run: node scripts/complete-lambda-source.test.mjs
 
+      - name: R2 credential
+        run: bash scripts/auth/r2.test.sh
+
       - name: Generated configuration sanitizer
         run: node scripts/sanitize-generated-config.test.mjs
 

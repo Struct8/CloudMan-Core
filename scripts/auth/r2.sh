@@ -193,6 +193,54 @@ r2_target_bucket() {
     ' *.tf 2>/dev/null
 }
 
+# How long to wait for a new credential. Measured on 58 tokens of MainCDNStruct8,
+# from 2026-10-19 to 2026-11-04, in the runs of Struct8/CloudManV2CICD:
+#
+# - About 1 s after the token was created, 54 of them got `Unauthorized` and 4
+#   got a good answer. One good answer proves little: in the run below the same
+#   token was accepted and refused within two seconds.
+# - Terraform's first read came 17 to 64 s after the token, 26 s at the median.
+#   57 runs had no 401. One had 7 of 22 HeadObject refused at 37 s.
+#
+# Those logs have no sample between 3 and 17 s and only one past 40 s, so these
+# numbers are margins, not a measured propagation time. R2_VERIFY_TIMEOUT is about
+# three times the latest refusal seen. R2_VERIFY_REQUIRED comes from that 7-in-22
+# rate, at which six probes in a row would all pass about one time in ten. The
+# timeline this function prints is what will measure the real time.
+R2_VERIFY_TIMEOUT=120
+R2_VERIFY_INTERVAL=2
+R2_VERIFY_REQUIRED=6
+
+# `env -u`, e NÃO `AWS_PROFILE=`. Atribuir vazio não desliga a variável: ela
+# continua definida, e o aws-cli sai com
+# `The config profile () could not be found` sem nunca chegar ao R2.
+#
+# AWS_SESSION_TOKEN entra na mesma lista porque o job alcança a conta AWS do
+# backend por OIDC: com ele no ambiente, a CLI assina com o par que eu passo
+# E manda o session token junto, o que o R2 recusa como
+# SignatureDoesNotMatch -- credencial boa, assinatura inválida.
+#
+# The CLI timeouts keep one hung probe from outliving R2_VERIFY_TIMEOUT.
+r2_probe_bucket() {
+    local bucket=$1 endpoint=$2
+    env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE -u AWS_SESSION_TOKEN \
+        AWS_ACCESS_KEY_ID="$TF_VAR_r2_access_key_id" \
+        AWS_SECRET_ACCESS_KEY="$TF_VAR_r2_secret_access_key" \
+        AWS_REGION=auto AWS_DEFAULT_REGION=auto \
+        aws s3api list-objects-v2 --bucket "$bucket" --max-keys 1 \
+            --endpoint-url "$endpoint" \
+            --cli-connect-timeout 10 --cli-read-timeout 15 2>&1
+}
+
+# The error code in an answer of the CLI, such as `Unauthorized`.
+r2_answer_code() {
+    if [[ "$1" =~ An\ error\ occurred\ \(([A-Za-z]+)\) ]]; then
+        echo "${BASH_REMATCH[1]}"
+    else
+        echo "error"
+    fi
+}
+
 # Confere que a credencial ASSINA de verdade, contra o endpoint real.
 #
 # NÃO BARRA O PIPELINE, e essa foi uma correção aprendida: a primeira versão
@@ -221,42 +269,64 @@ r2_verify_credentials() {
     fi
     echo "   Checking the credential against bucket '${bucket}'..."
 
-    # `env -u`, e NÃO `AWS_PROFILE=`. Atribuir vazio não desliga a variável: ela
-    # continua definida, e o aws-cli sai com
-    # `The config profile () could not be found` sem nunca chegar ao R2.
-    #
-    # AWS_SESSION_TOKEN entra na mesma lista porque o job alcança a conta AWS do
-    # backend por OIDC: com ele no ambiente, a CLI assina com o par que eu passo
-    # E manda o session token junto, o que o R2 recusa como
-    # SignatureDoesNotMatch -- credencial boa, assinatura inválida.
-    local saida rc
-    local tentativa=1
-    while [ $tentativa -le 4 ]; do
+    local answer status code elapsed
+    local started=$SECONDS good_in_a_row=0 timeline="" last_refusal="" announced=""
+    while true; do
         set +e
-        saida=$(env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE -u AWS_SESSION_TOKEN \
-                AWS_ACCESS_KEY_ID="$TF_VAR_r2_access_key_id" \
-                AWS_SECRET_ACCESS_KEY="$TF_VAR_r2_secret_access_key" \
-                AWS_REGION=auto AWS_DEFAULT_REGION=auto \
-                aws s3api list-objects-v2 --bucket "$bucket" --max-keys 1 \
-                    --endpoint-url "$endpoint" 2>&1)
-        rc=$?
+        answer=$(r2_probe_bucket "$bucket" "$endpoint")
+        status=$?
         set -e
+        elapsed=$((SECONDS - started))
 
-        if [ $rc -eq 0 ]; then
-            echo "✅ R2 credential verified against ${endpoint}/${bucket}"
+        if [ $status -eq 0 ]; then
+            code="ok"
+        else
+            code=$(r2_answer_code "$answer")
+        fi
+        timeline="${timeline} ${elapsed}s:${code}"
+
+        # `Unauthorized` and `InvalidAccessKeyId` are the answers to a token the
+        # endpoint does not accept yet, so they are worth waiting for. A wrong
+        # signature or a denied permission does not improve with time.
+        #
+        # `NoSuchBucket` counts as good: the first apply of a state runs before
+        # its bucket exists, and that answer means the endpoint got past the
+        # credential. That reading is inferred, because none of the measured runs
+        # probed a missing bucket. Waiting on it would cost every first apply the
+        # whole R2_VERIFY_TIMEOUT.
+        case "$code" in
+            ok|NoSuchBucket)
+                good_in_a_row=$((good_in_a_row + 1))
+                ;;
+            Unauthorized|InvalidAccessKeyId)
+                good_in_a_row=0
+                last_refusal=$answer
+                if [ -z "$announced" ]; then
+                    announced=yes
+                    echo "⏳ The R2 endpoint has not accepted the new credential yet (${code}). Waiting up to ${R2_VERIFY_TIMEOUT}s..."
+                fi
+                ;;
+            *)
+                good_in_a_row=0
+                last_refusal=$answer
+                break
+                ;;
+        esac
+
+        if [ "$good_in_a_row" -ge "$R2_VERIFY_REQUIRED" ]; then
+            if [ "$code" = "NoSuchBucket" ]; then
+                echo "✅ R2 credential accepted by ${endpoint}; bucket '${bucket}' does not exist yet."
+            else
+                echo "✅ R2 credential verified against ${endpoint}/${bucket}"
+            fi
+            echo "   Answers by seconds since the first probe:${timeline}"
             return 0
         fi
 
-        # Token recém-criado não fica visível no endpoint S3 no mesmo instante.
-        # Só vale esperar por erro de credencial desconhecida -- assinatura
-        # errada ou permissão negada não melhoram com o tempo.
-        if echo "$saida" | grep -qi "InvalidAccessKeyId\|does not exist"; then
-            echo "⏳ Credential not visible at the S3 endpoint yet (attempt ${tentativa}/4)..."
-            sleep 5
-            tentativa=$((tentativa + 1))
-            continue
+        if [ "$elapsed" -ge "$R2_VERIFY_TIMEOUT" ]; then
+            break
         fi
-        break
+        sleep "$R2_VERIFY_INTERVAL"
     done
 
     # A mensagem da CLI é o diagnóstico, e engoli-la foi o erro da primeira
@@ -265,13 +335,18 @@ r2_verify_credentials() {
     echo "⚠️  The R2 credential check did not pass — continuing anyway, Terraform decides."
     echo "    Access Key ID used: ${TF_VAR_r2_access_key_id}"
     echo "    Bucket probed: ${bucket}"
-    echo "    What the S3 endpoint answered:"
-    echo "$saida" | sed 's/^/      /'
+    echo "    Answers by seconds since the first probe:${timeline}"
+    echo "    Good answers in a row at the end: ${good_in_a_row} of ${R2_VERIFY_REQUIRED}"
+    if [ -n "$last_refusal" ]; then
+        echo "    Last refusal from the S3 endpoint:"
+        echo "$last_refusal" | sed 's/^/      /'
+    fi
     echo "    InvalidAccessKeyId    -> the Access Key ID is not the token id"
     echo "    SignatureDoesNotMatch -> the Secret is not SHA-256 of the token value"
     echo "    AccessDenied          -> the token lacks the R2 permission for this bucket"
-    echo "    Unauthorized          -> the operation is out of the token's scope, which may"
-    echo "                             mean the check itself is wrong rather than the credential"
+    echo "    Unauthorized          -> the endpoint has not accepted this token. New tokens get this"
+    echo "                             answer at first, and some Terraform reads may get it too."
+    echo "                             If they do, run the state again."
     return 0
 }
 

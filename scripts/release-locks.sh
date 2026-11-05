@@ -20,10 +20,27 @@ set -eo pipefail
 MANIFEST_PATH="${MANIFEST_PATH:-}"
 [ -f "$MANIFEST_PATH" ] || exit 0
 
+# gcs_release_run_lock and the object names of the gcs backend.
+source "$(dirname "${BASH_SOURCE[0]}")/auth/google.sh"
+
 jq -c '.pipeline_stages[].states[]' "$MANIFEST_PATH" | while read -r state; do
     path=$(echo "$state" | jq -r '.path')
     cache_file="$path/.terraform/terraform.tfstate"
     [ -f "$cache_file" ] || continue   # esse path nem chegou a dar init
+
+    # A state kept in Cloud Storage: the lock is an object beside the state,
+    # read and deleted with the credential file init used, which is still in
+    # RUNNER_TEMP in this later step. A failure on one state leaves the others
+    # to be checked.
+    if [ "$(jq -r '.backend.type // empty' "$cache_file")" == "gcs" ]; then
+        gcs_bucket=$(jq -r '.backend.config.bucket // empty' "$cache_file")
+        gcs_prefix=$(jq -r '.backend.config.prefix // empty' "$cache_file")
+        gcs_credentials=$(jq -r '.backend.config.credentials // empty' "$cache_file")
+        [ -n "$gcs_bucket" ] && [ -n "$gcs_credentials" ] || continue
+        gcs_release_run_lock "$gcs_credentials" "$gcs_bucket" \
+            "$(gcs_object_name "$gcs_prefix" tflock)" "${RUN_TAG:-}" || true
+        continue
+    fi
 
     bucket=$(jq -r '.backend.config.bucket // empty' "$cache_file")
     key=$(jq -r '.backend.config.key // empty' "$cache_file")
@@ -38,7 +55,12 @@ jq -c '.pipeline_stages[].states[]' "$MANIFEST_PATH" | while read -r state; do
 
     who=$(echo "$item" | jq -r '.Item.Info.S // empty' | jq -r '.Who // empty' 2>/dev/null)
 
-    if [ "$who" == "runner@${RUN_TAG}" ]; then
+    # Any user name in front of the tag: GitHub's hosted runner takes locks as
+    # `runner@<tag>`, a runner the customer's repository names (CodeBuild, see
+    # `.github/actions/engine-run`) as `root@<tag>`. The tag is what names this
+    # run, and the match is anchored at the end, so `gh-12-1` never takes
+    # `gh-12-10`.
+    if [[ "$who" == *"@${RUN_TAG}" ]]; then
         echo "🔓 Lock on ${bucket}/${key} belongs to this run (${RUN_TAG}). Releasing..."
         aws dynamodb delete-item --table-name "$table" \
             --key "{\"LockID\": {\"S\": \"${bucket}/${key}\"}}" \

@@ -29,8 +29,10 @@
 // to the catalog changes nothing in this file.
 //
 // CREDENTIALS. Whatever the caller already set up. `pipeline.sh` runs this after
-// PASSO 2, with `AWS_PROFILE=target` exported, so the AWS CLI reaches the
-// account being scanned and this script needs no credential handling of its own.
+// PASSO 2, with `AWS_PROFILE=target` exported, so the AWS CLI reaches the account
+// being scanned. The Cloud Control calls no longer go through the CLI, so they
+// read that same profile themselves (`lib/cloud-control.mjs`) -- the static keys
+// `auth_aws` wrote there, not a role assumed per call.
 //
 // SCOPE. Read from `scan_scope.json` in the working directory, which Struct8
 // pushes next to the manifest. Command-line flags override it, which is what
@@ -42,6 +44,7 @@
 //                         [--type AWS::Lambda::Function ...] [--request-id abc]
 
 import { execFileSync, execFile } from 'node:child_process';
+import { cloudControl, resolveCredentials } from './lib/cloud-control.mjs';
 import fs from 'node:fs';
 
 const args = process.argv.slice(2);
@@ -65,6 +68,11 @@ const region = argOf('region') || scope.region || process.env.AWS_REGION || null
 const outPath = argOf('out', 'scan_inventory.json');
 const vpcIds = allOf('vpc').length ? allOf('vpc') : (scope.vpcIds ?? []);
 const tagFilters = allOf('tag').length ? allOf('tag') : (scope.tagFilters ?? []);
+// The services whose resources have no region. Struct8 sends them for the same
+// reason it sends the types: that is catalog knowledge, and this script holds
+// none. Absent -- an older Struct8 -- everything below is skipped and the sweep
+// behaves exactly as it did.
+const globalServices = scope.globalServices ?? [];
 // The types to sweep. Struct8 sends them because Struct8 is what owns the
 // catalog -- this script deliberately knows no CloudMan type names, so that a
 // resource added to the catalog costs nothing here.
@@ -73,6 +81,15 @@ const cfnTypes = allOf('type').length ? allOf('type') : (scope.cfnTypes ?? []);
 // sends it because only the catalog knows which types can become a node -- asking
 // every swept row would be one call per resource in the account.
 const cfnDetailTypes = allOf('detail').length ? allOf('detail') : (scope.cfnDetailTypes ?? []);
+// The types Cloud Control lists only from a parent -- `{ type, parent, model }`,
+// in the order the children depend on each other. Struct8 declares them next
+// to the types it sweeps, for the same reason: it holds the catalog.
+const cfnChildTypes = Array.isArray(scope.cfnChildTypes) ? scope.cfnChildTypes : [];
+// And the types it lists only within a slice of a service -- `{ type, model,
+// values }`, where the slice is a constant and not another resource. Same reason
+// it arrives declared rather than known here: only the catalog can enumerate a
+// service's namespaces.
+const cfnValueTypes = Array.isArray(scope.cfnValueTypes) ? scope.cfnValueTypes : [];
 // Echoed into the answer, and that is its whole job.
 //
 // `scan_inventory.json` sits at a fixed path, so the file the PREVIOUS scan wrote
@@ -101,11 +118,11 @@ const errors = [];
  * actually act on under three hundred that mean "this type never lists, for
  * anyone" -- and would make a complete scan read as a broken one.
  */
-function aws(service, operation, extra = [], expected = null) {
+function aws(service, operation, extra = [], expected = null, inRegion = region) {
 	try {
 		const out = execFileSync(
 			'aws',
-			[service, operation, '--region', region, '--output', 'json', ...extra],
+			[service, operation, '--region', inRegion, '--output', 'json', ...extra],
 			{ encoding: 'utf-8', maxBuffer: 64 * 1024 * 1024 }
 		);
 		return JSON.parse(out);
@@ -121,10 +138,72 @@ function aws(service, operation, extra = [], expected = null) {
 }
 
 /**
- * The same call, off the main thread, so many can be in flight at once.
+ * Rate limiting, from the message the answer carried.
  *
- * Only the type sweep uses it. Everything else here is a handful of calls where
- * the synchronous version reads better and costs nothing.
+ * Module scope because BOTH wide passes need it: the type sweep and the detail
+ * read. It lived inside the sweep until 2026-08-26, which is part of why the
+ * detail read had no retry -- the ladder was not reachable from there.
+ */
+const isThrottle = (message) => /Throttl|Rate exceeded|TooManyRequests/i.test(message);
+
+/**
+ * Credentials for the in-process Cloud Control client, read once.
+ *
+ * Resolved lazily and remembered, including the failure: without credentials
+ * every one of the several hundred calls would record the same error, and a scan
+ * that reports one problem three hundred times is harder to act on than one that
+ * reports it once. The scan still finishes and still writes its file -- a partial
+ * answer is reported as partial, never as empty.
+ */
+let credentialsOnce;
+function credentialsOrNull() {
+	if (credentialsOnce === undefined) {
+		try {
+			credentialsOnce = resolveCredentials();
+		} catch (error) {
+			credentialsOnce = null;
+			errors.push({ source: 'cloudcontrol', message: String(error?.message ?? error) });
+		}
+	}
+	return credentialsOnce;
+}
+
+/**
+ * One Cloud Control call, in this process rather than through the AWS CLI.
+ *
+ * WHY NOT `aws cloudcontrol`. A scan makes roughly 870 of these, and each `aws`
+ * invocation spent 478 ms starting Python before it sent anything -- measured
+ * 2026-09-06 with `aws --version`, which touches no network, against a complete
+ * call at 1341 ms. The same call through this path takes 847 ms.
+ *
+ * The proof it was local cost and not the network: time PER CALL used to rise
+ * with the pool width (1341 ms alone, 2101 at width 10, 3499 at width 30). It no
+ * longer does, which is what lets the two passes below overlap.
+ *
+ * `expected` and the `errors` shape are unchanged, and so is the text a failure
+ * carries -- `cloud-control.mjs` reproduces the CLI's `<Exception>: <message>`
+ * exactly so that every regex reading it keeps working.
+ */
+async function cloudControlAsync(operation, payload, expected = null) {
+	const credentials = credentialsOrNull();
+	const source = `cloudcontrol ${operation === 'ListResources' ? 'list-resources' : 'get-resource'}`;
+	if (!credentials) return null;
+
+	const answer = await cloudControl(operation, payload, { region, credentials });
+	if (answer.ok) return answer.value;
+	if (expected && expected(answer.message)) return null;
+	errors.push({ source, message: answer.message.slice(0, 400) });
+	return null;
+}
+
+/**
+ * The same CLI call, off the main thread, so many can be in flight at once.
+ *
+ * Cloud Control does not come through here any more, and what is left would not
+ * justify this on its own except for one loop: the bucket location. S3 lists
+ * every bucket in the account whatever region is asked, and each one has to be
+ * asked where it lives -- 50 in this account, and asking them one at a time was
+ * about a minute of the scan spent on a question with a one-word answer.
  */
 function awsAsync(service, operation, extra = [], expected = null) {
 	return new Promise((resolve) => {
@@ -153,9 +232,9 @@ function awsAsync(service, operation, extra = [], expected = null) {
 /**
  * Runs `worker` over `list`, `width` at a time.
  *
- * A fixed pool rather than `Promise.all` over everything: 478 AWS CLI processes
- * at once is 478 processes, and the rate limiter would refuse most of them
- * anyway.
+ * A fixed pool rather than `Promise.all` over everything: asking Cloud Control
+ * four hundred questions at once only converts into throttling, which costs a
+ * backoff wait per call and buys no throughput.
  */
 async function inParallel(list, width, worker) {
 	const queue = [...list];
@@ -166,9 +245,369 @@ async function inParallel(list, width, worker) {
 }
 
 const items = [];
-const push = (arn, extra = {}) => items.push({ arn, ...extra });
+// Returns the row it added: the sweep hands its own rows to the detail read as
+// soon as that type finishes listing, and needs to know which ones are its.
+const push = (arn, extra = {}) => {
+	const item = { arn, ...extra };
+	items.push(item);
+	return item;
+};
 const tagsOf = (list) =>
 	Object.fromEntries((list ?? []).map((t) => [t.Key ?? t.key, t.Value ?? t.value]));
+
+/**
+ * The ARN a Cloud Control listing carries inside its properties, when it does.
+ *
+ * The identifier and the ARN are not the same string for every type, and when
+ * they differ the reference that points at the resource uses the ARN while the
+ * row is keyed by the identifier -- so they never meet. Measured on
+ * 952133486861 (2026-09-10): `AWS::CloudFront::KeyValueStore` lists as
+ * `Identifier: "kvs-validacao"` with `Properties` holding
+ * `{"Id":"17f7e222-...","Arn":"arn:aws:cloudfront::...:key-value-store/17f7e222-...","Name":"kvs-validacao"}`,
+ * and the function that reads that store names it BY ARN. Neither the ARN nor
+ * its tail is the name, so the store was never marked and never offered.
+ *
+ * KEPT OUT OF `arn`, deliberately. That field feeds the frontend's drop rules and
+ * its type resolution, and filling it for hundreds of rows that never had one
+ * would change what the selection screen shows for reasons that have nothing to
+ * do with this. Only the matching below reads it.
+ */
+const listedArn = (properties) => {
+	if (typeof properties !== 'string') return null;
+	try {
+		const parsed = JSON.parse(properties);
+		const arn = parsed?.Arn ?? parsed?.ARN ?? parsed?.arn;
+		return typeof arn === 'string' && arn.startsWith('arn:') ? arn : null;
+	} catch {
+		// Properties that will not parse simply carry no ARN for this purpose.
+		return null;
+	}
+};
+
+// ------------------------------- the detail read, running DURING the sweep
+//
+// WHY IT STARTS HERE instead of after the sweep, where it reads. The two passes
+// ask different Cloud Control operations, and those have separate rate capacity
+// -- measured 2026-09-06 on 60 types and 60 roles: 12.3 s for the listings alone,
+// 14.7 s for the reads alone, and 16.0 s for both at once, against 27.1 s one
+// after the other. Waiting for the whole sweep to end before reading anything
+// spent that difference for nothing.
+//
+// Nothing else moves. A type's rows are handed over the moment THAT type finishes
+// listing, so the read never sees a half-listed type, and the counting, the
+// narrowing ladder and the reference matching all still happen below, after every
+// read is in.
+const wantedDetail = new Set(cfnDetailTypes);
+
+/**
+ * The one type held back from the overlap.
+ *
+ * S3 answers the whole account whatever region is asked, and which buckets belong
+ * to this scan is decided by `get-bucket-location` further down. Handing them over
+ * as they list would spend a read on every bucket in the account and then drop
+ * most of the answers -- so these are queued after that filter instead, which is
+ * the same set the pass read before it overlapped anything.
+ */
+const DETAIL_AFTER_REGION = new Set(['AWS::S3::Bucket']);
+
+/**
+ * How many unread candidates are named one by one.
+ *
+ * A COUNT WITH NO NAMES CANNOT BE CHECKED. `no longer there: 1` came back
+ * identical from two scans half an hour apart, which is not what a resource
+ * disappearing mid-scan looks like -- something answers LIST and then refuses to
+ * be read, every time, and there was no way to find out what. The names are
+ * capped because an account with a permissions problem can produce hundreds of
+ * these, and this file is read by a browser.
+ */
+const UNREAD_NAMED = 20;
+
+/** Why a read failed, in the words of whoever has to act on it. */
+const reasonFor = (message) => {
+	if (isThrottle(message)) return 'rate limited';
+	if (/AccessDenied|not authorized|UnauthorizedOperation/i.test(message)) return 'not allowed';
+	if (/NotFound|does not exist/i.test(message)) return 'no longer there';
+	return 'refused';
+};
+
+const unreadBy = new Map();
+const unreadWho = [];
+/** Every ARN a candidate's own configuration names, and who named it. */
+const namedBy = new Map();
+const throttledRows = [];
+let unread = 0;
+let detailAsked = 0;
+
+/**
+ * Reads one candidate and records what its configuration names.
+ *
+ * RATE LIMITING IS THE COMMON FAILURE HERE, not a resource that cannot be read.
+ * Measured on 2026-08-26: 55 of 78 reads came back empty on a real account, and
+ * because every failure counted as expected, the run reported one error and
+ * looked healthy. What was lost was this pass's whole purpose -- the function in
+ * the test account never named its role, so the role stayed indistinguishable
+ * from the account's other 248 and nobody selected it.
+ *
+ * So a throttled read comes back for a narrower pass, the same ladder the sweep
+ * uses, and whatever is still unread afterwards is counted BY REASON and
+ * reported. Silence was the actual defect; a number nobody can see is the same
+ * defect with extra steps.
+ */
+const readOne = async (row, onThrottle) => {
+	const answer = await cloudControlAsync(
+		'GetResource',
+		{ TypeName: row.cfnType, Identifier: String(row.importId) },
+		(message) => {
+			if (onThrottle && isThrottle(message)) {
+				onThrottle(row);
+				return true;
+			}
+			// A resource that cannot be read individually costs its references and
+			// nothing else -- the row itself already came from the listing and stays.
+			unread++;
+			const reason = reasonFor(message);
+			unreadBy.set(reason, (unreadBy.get(reason) ?? 0) + 1);
+			if (unreadWho.length < UNREAD_NAMED) {
+				unreadWho.push({ cfnType: row.cfnType, importId: String(row.importId), reason });
+			}
+			return true;
+		}
+	);
+	// Properties arrive as a JSON STRING inside the answer, not as an object.
+	const properties = answer?.ResourceDescription?.Properties;
+	if (typeof properties !== 'string') return;
+	const names = new Set(properties.match(/arn:aws[a-z-]*:[^"\\\s,\]]+/g) ?? []);
+
+	// Not every reference is an ARN. A KMS alias names its key by a bare id
+	// (`TargetKeyId`), and the same holds wherever AWS uses a plain identifier.
+	// So every string VALUE in the answer is offered too, matched whole against
+	// what the sweep found -- values, not a search through the text, because a
+	// substring hit would tie together resources that merely share a prefix.
+	let parsed = null;
+	try {
+		const walk = (value) => {
+			if (typeof value === 'string') {
+				if (value.length >= 8) names.add(value);
+			} else if (Array.isArray(value)) {
+				value.forEach(walk);
+			} else if (value && typeof value === 'object') {
+				Object.values(value).forEach(walk);
+			}
+		};
+		parsed = JSON.parse(properties);
+		walk(parsed);
+	} catch {
+		// Properties that will not parse still gave up their ARNs above.
+	}
+
+	// WHAT THE ROW IS CALLED, AND WHO LAUNCHED IT. Both live in this read and
+	// nowhere else for a row the sweep answered: the sweep gives an identifier and
+	// nothing more, and the tagging API runs only on ask. Left out, Struct8 named
+	// the balancer after its ARN and the instance after its id while the account
+	// had `Name` on both.
+	//
+	// `Tags` is the one property every taggable type spells the same way. The
+	// name property follows CloudFormation's own convention, `<Type>Name`
+	// (`LaunchTemplateName`, `FunctionName`), and is read only when there is no
+	// `Name` tag to prefer -- the convention is also what keeps an instance's
+	// `KeyName`, which names its key pair, out of it.
+	//
+	// `aws:autoscaling:groupName` is the tag AWS stamps on what an auto scaling
+	// group launched, and it is visible here and here only. Marked the way the
+	// NAT gateway's address is (`ownedBy`), so Struct8 drops the row knowingly:
+	// adopting the instance would hand Terraform a resource the group replaces
+	// at will. Measured 2026-09-10 on 952133486861/us-west-2, three instances of
+	// `web-server-asg` offered as resources of their own.
+	if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+		const tags = Array.isArray(parsed.Tags) ? tagsOf(parsed.Tags) : {};
+		if (Object.keys(tags).length) row.tags = { ...tags, ...(row.tags ?? {}) };
+		const owner = tags['aws:autoscaling:groupName'];
+		if (typeof owner === 'string' && owner && row.ownedBy == null) row.ownedBy = owner;
+		const named = parsed[`${String(row.cfnType ?? '').split('::').pop()}Name`];
+		if (!tags.Name && typeof named === 'string' && named.trim() && row.nameHint == null) {
+			row.nameHint = named.trim();
+		}
+		// WHAT A TARGET GROUP HOLDS, which this read is the only place to learn.
+		//
+		// Terraform models membership as a resource of its own,
+		// `aws_lb_target_group_attachment`, and gives `aws_lb_target_group` no
+		// field for it -- so the configuration `terraform plan
+		// -generate-config-out` writes comes back with no targets on it, and
+		// nothing downstream has anything to put back. CloudFormation keeps them
+		// inline, so the answer already parsed above holds what the rest of the
+		// scan cannot say.
+		//
+		// Measured on 952133486861/us-west-2 (2026-09-13): `tg-k6-dashboard`
+		// answers `"Targets":[{"Port":5665,"Id":"i-0a5ff1e001ff4ea7a"}]`, and
+		// without this the group reached the diagram with no connection to the
+		// instance it fronts, while that instance reached it with no connection at
+		// all. The group in front of an auto scaling group was spared only because
+		// the GROUP names the target group back, which is a different reading.
+		//
+		// GATED ON THE TYPE, not on the property being there. `Targets` is also
+		// what an `AWS::Events::Rule` calls the destinations of a rule, and those
+		// are a different thing entirely -- writing them here would hand Struct8 a
+		// list of Lambdas and queues as if they were registered behind a load
+		// balancer.
+		//
+		// It costs no call: this is the same answer the tags and the reference
+		// matching above already read.
+		if (row.cfnType === 'AWS::ElasticLoadBalancingV2::TargetGroup' && Array.isArray(parsed.Targets)) {
+			const registered = parsed.Targets.filter(
+				(target) => target && typeof target.Id === 'string' && target.Id.trim()
+			).map((target) =>
+				target.Port == null ? { id: target.Id.trim() } : { id: target.Id.trim(), port: target.Port }
+			);
+			if (registered.length) row.registeredTargets = registered;
+		}
+
+		// WHICH SCALING POLICIES OWN THEIR ALARMS, which decides whether those
+		// alarms may be imported at all.
+		//
+		// A target tracking policy does not use an alarm somebody wrote: EC2 Auto
+		// Scaling CREATES the pair (`AlarmHigh`/`AlarmLow`), keeps them, and
+		// replaces or deletes them when it needs to -- the service documents that
+		// nobody else should create, edit or delete them. Imported, they become
+		// Terraform's: a `destroy` deletes what AWS asks nobody to delete, and the
+		// day the service replaces one, the state points at a name that is gone.
+		//
+		// A STEP SCALING POLICY IS THE OPPOSITE, and is why the type of the alarm
+		// cannot answer this on its own. There the person writes the alarm and
+		// points it at the policy, so it is theirs and belongs in the import. From
+		// the outside the two are the same thing -- an alarm whose action is a
+		// scaling policy -- and only `PolicyType` separates them.
+		//
+		// Measured on 952133486861/us-west-2 (2026-09-13): `cpu-scale` on `hub-asg`
+		// answers `TargetTrackingScaling`, and the two `TargetTracking-hub-asg-Alarm*`
+		// alarms it owns were arriving as resources of the diagram, each carrying an
+		// AWS-generated UUID in the name that is its import id.
+		//
+		// It costs no call: this is the same answer the block above already parsed.
+		// OS DOIS SERVICOS DE ESCALA. O Application Auto Scaling escala servico ECS,
+		// tabela DynamoDB, replica Aurora, e cria o mesmo par AlarmHigh/AlarmLow com o
+		// mesmo UUID no nome. `GetResource` responde `PolicyType` para ele igual --
+		// medido em 952133486861/us-west-2: `hub-scale-cpu` volta
+		// `"PolicyType":"TargetTrackingScaling"`.
+		if (
+			row.cfnType === 'AWS::AutoScaling::ScalingPolicy' ||
+			row.cfnType === 'AWS::ApplicationAutoScaling::ScalingPolicy'
+		) {
+			const policyType = typeof parsed.PolicyType === 'string' ? parsed.PolicyType.trim() : '';
+			if (policyType) row.scalingPolicyType = policyType;
+		}
+
+		// WHAT A LAUNCH TEMPLATE RUNS UNDER, which Cloud Control does not answer.
+		//
+		// `GetResource` for `AWS::EC2::LaunchTemplate` comes back with four
+		// properties -- `LaunchTemplateId`, `LaunchTemplateName`,
+		// `DefaultVersionNumber`, `LatestVersionNumber` -- and nothing of
+		// `LaunchTemplateData`. The instance profile the template names is simply
+		// not in the answer the harvest above walks, so no better harvesting
+		// reaches it. Measured on 952133486861/us-west-2, 2026-09-13.
+		//
+		// WHY THE EDGE MATTERS. The reference graph is what keeps a global resource
+		// in an import: an instance profile enters because something being imported
+		// names it. `hub-asg_profile` was named by `i-003e7f4a6f67ff3f9` and by
+		// nothing else -- the instance the auto scaling group launched, which the
+		// block above marks `ownedBy` and Struct8 drops on purpose, because the
+		// group replaces it at will. So the profile arrived referenced by nothing
+		// and stayed out, its role went with it, the satellite inside the scaling
+		// group came up blank, and the launch template compiled with no
+		// `iam_instance_profile`. `terraform plan` then offered to REMOVE the
+		// profile from the template -- every instance the group launches would lose
+		// its role -- and the adoption refused the whole state over that one field.
+		//
+		// The template IS in the import and it DOES name the profile. Recording
+		// that is all the graph was missing.
+		//
+		// BOTH VERSIONS, in one call: a scaling group may launch `$Default` or
+		// `$Latest`, and which one it pins is not known here. Reading the two costs
+		// the same request and leaves no version out.
+		//
+		// THIS ONE COSTS A CALL, unlike the two blocks above, which read an answer
+		// already parsed. It is one call per launch template -- a type an account
+		// has few of -- and there is no other way to see the data.
+		if (row.cfnType === 'AWS::EC2::LaunchTemplate') {
+			const templateId = parsed.LaunchTemplateId ?? row.importId;
+			const versions = await awsAsync('ec2', 'describe-launch-template-versions', [
+				'--launch-template-id',
+				String(templateId),
+				'--versions',
+				'$Default',
+				'$Latest'
+			]);
+			for (const version of versions?.LaunchTemplateVersions ?? []) {
+				const profile = version?.LaunchTemplateData?.IamInstanceProfile;
+				// Either spelling. The template may name the profile by ARN or by
+				// name, and the matching downstream accepts both: a row is keyed by
+				// its `importId` AND by the ARN the listing carried.
+				for (const value of [profile?.Arn, profile?.Name]) {
+					if (typeof value === 'string' && value.trim()) names.add(value.trim());
+				}
+			}
+		}
+	}
+
+	for (const name of names) {
+		if (!namedBy.has(name)) namedBy.set(name, new Set());
+		namedBy.get(name).add(String(row.importId));
+	}
+};
+
+/**
+ * A pool that reads whatever has been handed to it, and stops when the sweep says
+ * there will be no more.
+ *
+ * `inParallel` cannot do this: it takes a finished list, and the whole point here
+ * is that the list is still being written. Width 8 is what the pass used before
+ * overlapping, kept because the constraint is Cloud Control's rate and not this
+ * machine -- measured the same day, widening the sweep from 8 to 20 made it
+ * SLOWER, because the extra calls came back throttled and each one then waited
+ * out a backoff.
+ */
+const detailQueue = [];
+const detailWaiters = [];
+let detailInputOpen = cfnDetailTypes.length > 0;
+
+function handToDetail(rows) {
+	for (const row of rows) {
+		if (row.cfnType && wantedDetail.has(row.cfnType)) {
+			detailQueue.push(row);
+			detailAsked++;
+		}
+	}
+	while (detailWaiters.length) detailWaiters.pop()();
+}
+
+function closeDetailInput() {
+	detailInputOpen = false;
+	while (detailWaiters.length) detailWaiters.pop()();
+}
+
+const detailPool = Promise.all(
+	Array.from({ length: detailInputOpen ? 8 : 0 }, async () => {
+		for (;;) {
+			if (!detailQueue.length) {
+				if (!detailInputOpen) return;
+				await new Promise((resolve) => detailWaiters.push(resolve));
+				continue;
+			}
+			const row = detailQueue.shift();
+			try {
+				await readOne(row, (r) => throttledRows.push(r));
+			} catch (error) {
+				// One row that blows up must not take the pool down with it: this
+				// promise is awaited much later, so a rejection here would surface as
+				// an unhandled one long after the row that caused it, and the reads
+				// still queued would never happen. Recorded like any other failure.
+				errors.push({
+					source: `cloudcontrol get-resource ${row?.cfnType ?? '?'}`,
+					message: String(error?.message ?? error).slice(0, 400)
+				});
+			}
+		}
+	})
+);
 
 // -------------------------------------------- layer 1a: every type, by its LIST
 //
@@ -222,27 +661,114 @@ const tagsOf = (list) =>
 		return false;
 	};
 
+	// ------------------- the two types AWS fills with its own catalogue
+	//
+	// Cloud Control answers "what exists", and for these two most of what exists
+	// belongs to AWS rather than to the account. Measured 2026-09-06 in
+	// 952133486861/us-west-2: of 1667 managed policies, 1574 were
+	// `arn:aws:iam::aws:policy/...`, and all 826 SSM documents were AWS's. Together
+	// they were 2493 of the 3232 rows a scan carried -- paged in over 38 calls and
+	// then discarded downstream by the rule that drops the literal `aws` account.
+	//
+	// Cloud Control has no owner filter, so the question is asked of the service
+	// that does. `iam list-policies --scope Local` answers the 93 that are really
+	// this account's, in one call; `ssm list-documents` with `Owner=Self` answers
+	// the customer's, in one call.
+	//
+	// THIS IS A DELIBERATE EXCEPTION, and a narrow one. The rule of this script is
+	// that a type costs a line in a list and never code
+	// (`docs/importacao-varredura-da-conta.md`), which is why this is a table with
+	// two rows and not two handlers: what varies is an operation and two field
+	// names, and a third type would be a third row. A type NOT in this table keeps
+	// the uniform path, and a row whose call fails falls back to it -- the
+	// optimisation degrades to the old behaviour instead of losing resources.
+	const CUSTOMER_ONLY_LIST = {
+		'AWS::IAM::ManagedPolicy': {
+			service: 'iam',
+			operation: 'list-policies',
+			args: ['--scope', 'Local'],
+			rows: 'Policies',
+			identifier: 'Arn'
+		},
+		'AWS::SSM::Document': {
+			service: 'ssm',
+			operation: 'list-documents',
+			args: ['--filters', 'Key=Owner,Values=Self'],
+			rows: 'DocumentIdentifiers',
+			identifier: 'Name'
+		}
+	};
+
+	const answeredByOwnerFilter = new Set();
+	for (const [type, how] of Object.entries(CUSTOMER_ONLY_LIST)) {
+		if (!cfnTypes.includes(type)) continue;
+		const answer = aws(how.service, how.operation, how.args);
+		// Left to the sweep on failure: fewer resources than the account holds is
+		// the one outcome worth avoiding, and a slower complete answer beats a fast
+		// incomplete one.
+		if (!answer) continue;
+		const mine = [];
+		for (const row of answer[how.rows] ?? []) {
+			const id = row[how.identifier];
+			if (id) mine.push(push(null, { cfnType: type, importId: String(id) }));
+		}
+		answeredByOwnerFilter.add(type);
+		handToDetail(mine);
+	}
+	const sweepTypes = cfnTypes.filter((type) => !answeredByOwnerFilter.has(type));
+
 	// CONCURRENT, and it is not an optimisation. Measured on 2026-08-25: 478 types
 	// asked one after another did not finish inside ten minutes, and the panel
-	// waiting on this run gives up at twenty. Each call is almost entirely time
-	// spent waiting on AWS, so width costs nothing locally and is the difference
-	// between a scan someone waits through and one they abandon.
+	// waiting on this run gives up at twenty.
 	//
-	// Rate limiting is the expected cost of that width, not a failure, and it is
-	// why throttled types come back for a second, narrower pass rather than being
-	// reported as missing. A type that is still throttled after that IS reported --
-	// silently returning fewer resources than the account holds is the one outcome
-	// worth failing over, because half a diagram looks exactly like a whole one.
+	// WIDTH 10 IS NOT A CEILING TO RAISE. It used to be limited by this machine --
+	// each call was an `aws` child process, and the time per call rose with the
+	// width. With the calls made in this process that is gone, and what is left is
+	// Cloud Control's own rate: measured 2026-09-06 over the same 80 types, width 8
+	// took 17.6 s, width 12 took 18.9 s and width 20 took 26.6 s. Past the limit the
+	// extra calls come back throttled and each one waits out a backoff, so asking
+	// harder makes the scan slower and never finds more.
+	//
+	// Rate limiting is expected, not a failure. A throttled call now backs off and
+	// retries in place (`cloud-control.mjs`); the narrowing ladder below is what
+	// catches whatever survives that. A type still throttled after both IS reported
+	// -- silently returning fewer resources than the account holds is the one
+	// outcome worth failing over, because half a diagram looks exactly like a whole
+	// one.
 	const throttled = [];
-	const isThrottle = (message) => /Throttl|Rate exceeded|TooManyRequests/i.test(message);
 
-	async function sweep(type, onThrottle) {
+	/**
+	 * What each type contributed, so a retry can take it back.
+	 *
+	 * A throttle breaks out of the pagination loop with the earlier pages already
+	 * in `items`, and the ladder then restarts that type from its first page.
+	 * Without this the type appears twice, and with the detail read now consuming
+	 * these rows it would also be read twice.
+	 */
+	const sweptByType = new Map();
+
+	async function sweep(type, onThrottle, model = null) {
+		// One listing per parent when a model is given: one balancer's listeners are
+		// not another's, and a retry takes back only its own rows.
+		const sweptKey = model ? `${type}\u0000${model}` : type;
+		const earlier = sweptByType.get(sweptKey);
+		if (earlier?.length) {
+			const drop = new Set(earlier);
+			for (let i = items.length - 1; i >= 0; i--) if (drop.has(items[i])) items.splice(i, 1);
+		}
+		const mine = [];
+		sweptByType.set(sweptKey, mine);
+
 		let token = null;
+		let complete = false;
 		do {
-			const page = await awsAsync(
-				'cloudcontrol',
-				'list-resources',
-				token ? ['--type-name', type, '--next-token', token] : ['--type-name', type],
+			const page = await cloudControlAsync(
+				'ListResources',
+				{
+					TypeName: type,
+					...(model ? { ResourceModel: model } : {}),
+					...(token ? { NextToken: token } : {})
+				},
 				(message) => {
 					if (onThrottle && isThrottle(message)) {
 						onThrottle(type);
@@ -253,15 +779,32 @@ const tagsOf = (list) =>
 			);
 			if (!page) break;
 			for (const row of page.ResourceDescriptions ?? []) {
-				// No ARN: Cloud Control does not answer one. The type and the import id
-				// are what the frontend needs, and they are both here.
-				if (row.Identifier) push(null, { cfnType: type, importId: row.Identifier });
+				// `arn` stays null: the frontend's drop rules and type resolution read
+				// that field, and Cloud Control does not answer an ARN for most types.
+				// What the properties DO carry, when they carry it, goes in `listedArn`
+				// and is read by the matching at the end of the detail pass -- see the
+				// note there.
+				if (row.Identifier) {
+					mine.push(
+						push(null, {
+							cfnType: type,
+							importId: row.Identifier,
+							...(listedArn(row.Properties) ? { listedArn: listedArn(row.Properties) } : {})
+						})
+					);
+				}
 			}
 			token = page.NextToken || null;
+			complete = !token;
 		} while (token);
+
+		// Handed to the read only once the LISTING of this type is finished. A type
+		// that stopped halfway is a type whose rows are not all here, and the ladder
+		// is about to ask it again from the first page.
+		if (complete && !DETAIL_AFTER_REGION.has(type)) handToDetail(mine);
 	}
 
-	await inParallel(cfnTypes, 10, (type) => sweep(type, (t) => throttled.push(t)));
+	await inParallel(sweepTypes, 10, (type) => sweep(type, (t) => throttled.push(t)));
 
 	// NARROWING, not one retry. A single second pass still left nine types unread
 	// on a real sweep, and each unread type is a set of resources the person is
@@ -273,111 +816,78 @@ const tagsOf = (list) =>
 		await inParallel(again, width, (type) => sweep(type, width > 1 ? (t) => throttled.push(t) : null));
 	}
 
+	// ---------------------------------------- the types listed from a parent
+	//
+	// A listener lists from its load balancer and a rule from its listener: the
+	// LIST handler refuses a plain call and names the property it wants in the
+	// resource model. The sweep above counts those refusals among the types with
+	// no usable LIST, which is true of the call and false of the account -- and a
+	// balancer imported without its listener is refused by the compile, since a
+	// balancer that listens on nothing forwards nothing. Measured 2026-09-10 on
+	// 952133486861/us-west-2: the listener of `application-load-balancer` absent
+	// from every scan of the account.
+	//
+	// Struct8 says which child comes from which parent and under which property
+	// (`cfnChildTypes`), in the order they depend on each other, so a child of a
+	// child is asked after its parent has been listed. One listing per parent the
+	// sweep found, with the same ladder underneath as the sweep itself.
+	for (const child of cfnChildTypes) {
+		if (!child?.type || !child?.parent || !child?.model) continue;
+		const asks = items
+			.filter((i) => i.cfnType === child.parent && i.importId)
+			.map((i) => ({ type: child.type, model: JSON.stringify({ [child.model]: String(i.importId) }) }));
+		if (!asks.length) continue;
+		const throttledAsks = [];
+		await inParallel(asks, 8, (ask) => sweep(ask.type, () => throttledAsks.push(ask), ask.model));
+		for (let width = 4; width >= 1 && throttledAsks.length; width = Math.floor(width / 2)) {
+			const again = throttledAsks.splice(0, throttledAsks.length);
+			console.error(
+				`scan-account: ${again.length} listing(s) of ${child.type} rate limited -- asking again, ${width} at a time.`
+			);
+			await inParallel(again, width, (ask) =>
+				sweep(ask.type, width > 1 ? () => throttledAsks.push(ask) : null, ask.model)
+			);
+		}
+	}
+
+	// ------------------------------- layer 1a-ter: the types listed by a VALUE
+	//
+	// Same refusal as the children above -- `Missing or invalid ResourceModel` --
+	// and a different answer to it. There the missing property is a parent's id,
+	// which the sweep already found; here it is one of a service's own namespaces,
+	// which no resource carries. Struct8 enumerates them (`cfnValueTypes`) because
+	// it is the side that holds the catalog, and one listing goes out per value.
+	//
+	// Measured on 952133486861/us-west-2, 13/09/2026: without the namespace,
+	// `AWS::ApplicationAutoScaling::ScalableTarget` answers `Value null at
+	// 'serviceNamespace'` and the policy answers `Required property:
+	// [ServiceNamespace]`; with `{"ServiceNamespace":"ecs"}` the two answer the
+	// scalable target and the policy that were scaling that account's `hub`
+	// service. Fifteen listings per type per scan, of which fourteen usually
+	// answer nothing -- the same cost shape as any other type in the sweep.
+	for (const scoped of cfnValueTypes) {
+		if (!scoped?.type || !scoped?.model || !Array.isArray(scoped.values)) continue;
+		const asks = scoped.values.map((value) => ({
+			type: scoped.type,
+			model: JSON.stringify({ [scoped.model]: String(value) })
+		}));
+		if (!asks.length) continue;
+		const throttledAsks = [];
+		await inParallel(asks, 8, (ask) => sweep(ask.type, () => throttledAsks.push(ask), ask.model));
+		for (let width = 4; width >= 1 && throttledAsks.length; width = Math.floor(width / 2)) {
+			const again = throttledAsks.splice(0, throttledAsks.length);
+			console.error(
+				`scan-account: ${again.length} listing(s) of ${scoped.type} rate limited -- asking again, ${width} at a time.`
+			);
+			await inParallel(again, width, (ask) =>
+				sweep(ask.type, width > 1 ? () => throttledAsks.push(ask) : null, ask.model)
+			);
+		}
+	}
+
 	if (skipped) {
 		console.error(`scan-account: ${skipped} type(s) have no usable LIST -- expected, not an error.`);
 	}
-}
-
-// ------------------------------ layer 1a-ter: which global resources belong here
-//
-// IAM, CloudFront and Route 53 have no region. A sweep of one region answers for
-// the WHOLE ACCOUNT on those, and on a real account that is nearly the entire
-// answer: measured in mx-central-1 on 2026-08-26, of 409 rows that could become
-// nodes, 391 were global and 18 were actually in the region. The 18 included
-// everything the person was looking for, and they were unfindable in the list.
-//
-// DROPPING THE GLOBALS IS WRONG. The role a function runs as has no region, and
-// importing the function without it leaves the role unmanaged. So instead of
-// guessing, each candidate is asked WHAT IT USES, and the globals it names are
-// marked. A function answers `Role`; that role answers `Policies` and
-// `ManagedPolicyArns`. The chain is the account's own answer, not a match on
-// names -- which would be the same mistake the type mapping already refused.
-//
-// ONLY THE TYPES STRUCT8 ASKS FOR. One call per swept row would be thousands.
-// `cfnDetailTypes` is the subset that can become a node at all, and only the
-// catalog knows which those are, so it travels with the request like the sweep
-// list does.
-if (cfnDetailTypes.length) {
-	const wanted = new Set(cfnDetailTypes);
-	const candidates = items.filter((i) => i.cfnType && wanted.has(i.cfnType));
-
-	/** Every ARN a candidate's own configuration names, and who named it. */
-	const namedBy = new Map();
-	let unread = 0;
-
-	await inParallel(candidates, 8, async (row) => {
-		const answer = await awsAsync(
-			'cloudcontrol',
-			'get-resource',
-			['--type-name', row.cfnType, '--identifier', String(row.importId)],
-			() => {
-				// A resource that cannot be read individually costs its references and
-				// nothing else -- the row itself already came from the listing and stays.
-				unread++;
-				return true;
-			}
-		);
-		// Properties arrive as a JSON STRING inside the answer, not as an object.
-		const properties = answer?.ResourceDescription?.Properties;
-		if (typeof properties !== 'string') return;
-		const names = new Set(properties.match(/arn:aws[a-z-]*:[^"\\\s,\]]+/g) ?? []);
-
-		// Not every reference is an ARN. A KMS alias names its key by a bare id
-		// (`TargetKeyId`), and the same holds wherever AWS uses a plain identifier.
-		// So every string VALUE in the answer is offered too, matched whole against
-		// what the sweep found -- values, not a search through the text, because a
-		// substring hit would tie together resources that merely share a prefix.
-		try {
-			const walk = (value) => {
-				if (typeof value === "string") {
-					if (value.length >= 8) names.add(value);
-				} else if (Array.isArray(value)) {
-					value.forEach(walk);
-				} else if (value && typeof value === "object") {
-					Object.values(value).forEach(walk);
-				}
-			};
-			walk(JSON.parse(properties));
-		} catch {
-			// Properties that will not parse still gave up their ARNs above.
-		}
-
-		for (const name of names) {
-			if (!namedBy.has(name)) namedBy.set(name, new Set());
-			namedBy.get(name).add(String(row.importId));
-		}
-	});
-
-	// Cloud Control identifies a role by its NAME and a distribution by its id,
-	// while the reference that points at them is a full ARN. So a row is matched
-	// on its identifier, on that identifier being the ARN's tail, or on the two
-	// being equal outright -- whichever the type happens to use.
-	const tail = (value) => String(value).split(/[/:]/).pop();
-	const byIdentifier = new Map();
-	for (const row of items) {
-		if (!row.importId) continue;
-		const id = String(row.importId);
-		if (!byIdentifier.has(id)) byIdentifier.set(id, []);
-		byIdentifier.get(id).push(row);
-	}
-
-	let marked = 0;
-	for (const [arn, users] of namedBy) {
-		const hits = byIdentifier.get(arn) ?? byIdentifier.get(tail(arn)) ?? [];
-		for (const row of hits) {
-			// Itself does not count: a resource whose own ARN appears in its own
-			// configuration would otherwise look like something else needs it.
-			const others = [...users].filter((u) => u !== String(row.importId));
-			if (!others.length) continue;
-			row.referencedBy = [...new Set([...(row.referencedBy ?? []), ...others])].sort();
-			marked++;
-		}
-	}
-
-	console.error(
-		`scan-account: read ${candidates.length - unread} of ${candidates.length} candidate(s) in detail; ` +
-			`${marked} resource(s) are used by one of them.`
-	);
 }
 
 // --------------------------------------- layer 1a-bis: the tagging API, on ask
@@ -386,6 +896,34 @@ if (cfnDetailTypes.length) {
 // resources carry this tag", and `tagFilters` is a scope input. It is no longer
 // the default path, so its two defects -- silent about the untagged, still
 // answering for the destroyed -- only reach someone who asked for a tag filter.
+
+/** Every row the tagging API answers in `inRegion`, following its pages. */
+const taggedRows = (inRegion, extra) => {
+	const rows = [];
+	let token = null;
+	do {
+		const page = aws(
+			'resourcegroupstaggingapi',
+			'get-resources',
+			token ? [...extra, '--pagination-token', token] : extra,
+			null,
+			inRegion
+		);
+		if (!page) break;
+		rows.push(...(page.ResourceTagMappingList ?? []));
+		token = page.PaginationToken || null;
+	} while (token);
+	return rows;
+};
+
+// A resource with no region is tagged in us-east-1 and NOWHERE else. Measured on
+// 952133486861 (2026-09-10): asked in us-west-2 the tagging API answers 0 rows
+// for `iam`, `route53` and `cloudfront`; asked in us-east-1, 72, 1 and 15.
+const GLOBAL_TAG_REGION = 'us-east-1';
+
+/** The same query, narrowed to the services that have no region. */
+const globalOnly = (extra) => [...extra, '--resource-type-filters', ...globalServices];
+
 if (tagFilters.length) {
 	const extra = ['--resources-per-page', '100'];
 	for (const filter of tagFilters) {
@@ -393,19 +931,51 @@ if (tagFilters.length) {
 		extra.push('--tag-filters', value ? `Key=${key},Values=${value}` : `Key=${key}`);
 	}
 
-	let token = null;
-	do {
-		const page = aws(
-			'resourcegroupstaggingapi',
-			'get-resources',
-			token ? [...extra, '--pagination-token', token] : extra
-		);
-		if (!page) break;
-		for (const row of page.ResourceTagMappingList ?? []) {
+	for (const row of taggedRows(region, extra)) push(row.ResourceARN, { tags: tagsOf(row.Tags) });
+
+	// THE SAME QUESTION AGAIN IN US-EAST-1, and narrowed, which is the half that
+	// keeps it honest: unnarrowed it would drag every tagged resource of us-east-1
+	// into a sweep of somewhere else. Without it, a tag-scoped sweep of any other
+	// region loses the account-wide rows outright -- not only the CloudFront
+	// distribution in front of a bucket, the roles with it.
+	if (region !== GLOBAL_TAG_REGION && globalServices.length) {
+		for (const row of taggedRows(GLOBAL_TAG_REGION, globalOnly(extra))) {
 			push(row.ResourceARN, { tags: tagsOf(row.Tags) });
 		}
-		token = page.PaginationToken || null;
-	} while (token);
+	}
+}
+
+// ---------------------------- layer 1a-bis-2: a name for the rows with no region
+//
+// Nothing else gives them one. Tags reach a row from the tagging API -- asked
+// only on a tag filter, above -- or from the EC2 network listings; a Cloud
+// Control listing answers an identifier and nothing more. So a sweep of Oregon
+// offers the account's distributions as `E3RF0AX60CH06U`, and the person doing
+// the import has to find theirs among fifteen by id.
+//
+// IT ENRICHES, IT NEVER PUSHES. This API still answers for resources destroyed
+// hours earlier, which is why it stopped being the sweep's source. A tagged ARN
+// with no row already in `items` is dropped here, so that defect cannot come back
+// in through this door.
+if (globalServices.length) {
+	// Cloud Control identifies a distribution by its id and a role by its name,
+	// while the tagging API answers a full ARN. Same match as the detail read.
+	const tail = (value) => String(value).split(/[/:]/).pop();
+	const byId = new Map();
+	for (const item of items) {
+		if (item.importId) byId.set(String(item.importId), item);
+	}
+
+	let named = 0;
+	for (const row of taggedRows(GLOBAL_TAG_REGION, globalOnly(['--resources-per-page', '100']))) {
+		const hit = byId.get(String(row.ResourceARN)) ?? byId.get(tail(row.ResourceARN));
+		if (!hit || hit.tags) continue;
+		hit.tags = tagsOf(row.Tags);
+		named++;
+	}
+	if (named) {
+		console.error(`scan-account: ${named} row(s) with no region arrived with their tags.`);
+	}
 }
 
 // ------------------------------------------- layer 1a-ter: S3 answers globally
@@ -424,16 +994,151 @@ if (tagFilters.length) {
 // IAM is global too and is deliberately NOT filtered: a role has no region at all,
 // and dropping it would break the very function being imported alongside it.
 {
+	// CONCURRENT because the count is the account's, not this scan's: every bucket
+	// gets asked, and only then is it known which ones belong here. This account
+	// has 50 and keeps 1.
 	const buckets = items.filter((i) => i.cfnType === 'AWS::S3::Bucket');
-	for (const bucket of buckets) {
-		const answer = aws('s3api', 'get-bucket-location', ['--bucket', String(bucket.importId)]);
-		if (!answer) continue;
+	await inParallel(buckets, 8, async (bucket) => {
+		const answer = await awsAsync('s3api', 'get-bucket-location', [
+			'--bucket',
+			String(bucket.importId)
+		]);
+		if (!answer) return;
 		const home = answer.LocationConstraint || 'us-east-1';
 		if (home !== region) bucket.dropForRegion = home;
-	}
+	});
 	for (let i = items.length - 1; i >= 0; i--) {
 		if (items[i].dropForRegion) items.splice(i, 1);
 	}
+
+	// The buckets that survived the filter are the ones worth reading, and this is
+	// the earliest point at which that is known. Everything else was handed over
+	// during the sweep; with this the read has seen every candidate there will be.
+	handToDetail(items.filter((i) => DETAIL_AFTER_REGION.has(i.cfnType)));
+	closeDetailInput();
+}
+
+// ------------------------- layer 1a-quater: which global resources belong here
+//
+// IAM, CloudFront and Route 53 have no region. A sweep of one region answers for
+// the WHOLE ACCOUNT on those, and on a real account that is nearly the entire
+// answer: measured in mx-central-1 on 2026-08-26, of 409 rows that could become
+// nodes, 391 were global and 18 were actually in the region. The 18 included
+// everything the person was looking for, and they were unfindable in the list.
+//
+// DROPPING THE GLOBALS IS WRONG. The role a function runs as has no region, and
+// importing the function without it leaves the role unmanaged. So instead of
+// guessing, each candidate is asked WHAT IT USES, and the globals it names are
+// marked. A function answers `Role`; that role answers `Policies` and
+// `ManagedPolicyArns`. The chain is the account's own answer, not a match on
+// names -- which would be the same mistake the type mapping already refused.
+//
+// ONLY THE TYPES STRUCT8 ASKS FOR. One call per swept row would be thousands.
+// `cfnDetailTypes` is the subset that can become a node at all, and only the
+// catalog knows which those are, so it travels with the request like the sweep
+// list does.
+/**
+ * How many candidates could not be read in detail, and why.
+ *
+ * Travels to the panel because the person choosing resources is the one who pays
+ * for it: an unread candidate is a resource whose references were never followed,
+ * so whatever it uses is offered as an anonymous row among hundreds.
+ */
+let detailUnread = null;
+
+if (cfnDetailTypes.length) {
+	// The reads have been running since the sweep started handing types over. This
+	// is where they finish: the pool stops on its own once the input is closed and
+	// its queue has drained.
+	await detailPool;
+
+	// NARROWING, the net under the per-call backoff. A read throttled hard enough
+	// to exhaust its retries comes back here, and each round halves the width so
+	// the last one is nearly serial. Whatever is still unread after this is counted
+	// by reason and reported, never dropped.
+	for (let width = 4; width >= 1 && throttledRows.length; width = Math.floor(width / 2)) {
+		const again = throttledRows.splice(0, throttledRows.length);
+		console.error(
+			`scan-account: ${again.length} read(s) rate limited -- asking again, ${width} at a time.`
+		);
+		await inParallel(again, width, (r) =>
+			readOne(r, width > 1 ? (x) => throttledRows.push(x) : null)
+		);
+	}
+
+	detailUnread = unread
+		? {
+				count: unread,
+				of: detailAsked,
+				by: Object.fromEntries(unreadBy),
+				who: unreadWho,
+				named: Math.min(unread, UNREAD_NAMED)
+			}
+		: null;
+
+	// Cloud Control identifies a role by its NAME and a distribution by its id,
+	// while the reference that points at them is a full ARN. So a row is matched
+	// on its identifier, on that identifier being the ARN's tail, or on the two
+	// being equal outright -- whichever the type happens to use.
+	const tail = (value) => String(value).split(/[/:]/).pop();
+	const byIdentifier = new Map();
+	const key = (value, row) => {
+		const k = String(value);
+		if (!byIdentifier.has(k)) byIdentifier.set(k, []);
+		if (!byIdentifier.get(k).includes(row)) byIdentifier.get(k).push(row);
+	};
+	for (const row of items) {
+		if (row.importId) key(row.importId, row);
+		// AND BY THE ARN THE LISTING CARRIED, when the two are different strings.
+		// A key value store lists as `kvs-validacao` and the function that reads it
+		// names `arn:...:key-value-store/17f7e222-...`; the identifier is the name,
+		// the ARN's tail is a UUID, and neither lookup below could ever meet the
+		// other (952133486861, 2026-09-10 -- the store was never offered).
+		if (row.listedArn) key(row.listedArn, row);
+	}
+
+	// AND BY THE ARN WITHOUT THE SUFFIX THE REFERENCE ITSELF ADDS.
+	//
+	// An alarm that an Application Auto Scaling target tracking policy created names
+	// that policy in `AlarmActions` -- with `:createdBy/<uuid>` on the end, which the
+	// policy's own ARN does not carry. Neither lookup below could reach it: the full
+	// string is longer than the policy's ARN, and the tail is that UUID.
+	//
+	// Measured on 952133486861/us-west-2, 13/09/2026:
+	//
+	//   alarme    ...:policyName/hub-scale-cpu:createdBy/491d63a3-acba-4810-814f-5ec16c3fb792
+	//   politica  ...:policyName/hub-scale-cpu
+	//
+	// EC2 Auto Scaling adds no such suffix, which is why the same rule always worked
+	// there and never here: the two alarms of `hub-scale-cpu` were reaching the
+	// diagram as resources, each with an AWS-owned UUID inside its Terraform address.
+	const semSufixoDeCriacao = (value) => {
+		const texto = String(value);
+		const corte = texto.indexOf(':createdBy/');
+		return corte < 0 ? texto : texto.slice(0, corte);
+	};
+
+	let marked = 0;
+	for (const [arn, users] of namedBy) {
+		const hits =
+			byIdentifier.get(arn) ??
+			byIdentifier.get(semSufixoDeCriacao(arn)) ??
+			byIdentifier.get(tail(arn)) ??
+			[];
+		for (const row of hits) {
+			// Itself does not count: a resource whose own ARN appears in its own
+			// configuration would otherwise look like something else needs it.
+			const others = [...users].filter((u) => u !== String(row.importId));
+			if (!others.length) continue;
+			row.referencedBy = [...new Set([...(row.referencedBy ?? []), ...others])].sort();
+			marked++;
+		}
+	}
+
+	console.error(
+		`scan-account: read ${detailAsked - unread} of ${detailAsked} candidate(s) in detail; ` +
+			`${marked} resource(s) are used by one of them.`
+	);
 }
 
 // ------------------------------------- layer 1b: the network family, by vpc-id
@@ -563,6 +1268,90 @@ for (const group of aws('ec2', 'describe-security-groups', vpcFilter)?.SecurityG
 	});
 }
 
+// ------------------------------- layer 2, off the VPC: the targets of a rule
+//
+// An EventBridge target is what connects a rule to the Lambda, queue or topic it
+// invokes, and AWS publishes no object for it: it is a row inside the rule,
+// reachable only through `list-targets-by-rule`. The sweep cannot find it --
+// there is no ARN to list -- so without this block the rule arrives on the
+// diagram with nothing attached to it, which is how it looked after the scan of
+// mx-central-1 on 2026-08-28: correct in the account, alone on the canvas.
+//
+// THE ID CARRIES THE BUS EXACTLY WHEN THE ARN DOES. A rule's own ARN is
+// `rule/<name>` on the default bus and `rule/<bus>/<name>` on any other, and the
+// provider splits a target's id the same way -- two segments mean the default
+// bus, three name one. Composing it by the same rule keeps this answer identical
+// to the one Struct8 composes from the configuration when it adopts (see
+// `COMPOSERS` in core/configImports.ts), so the two paths never disagree about
+// the same target.
+//
+// ASKED ONLY WHEN THE RULE ITSELF WAS ASKED FOR. The target follows its parent's
+// scope: with `AWS::Events::Rule` absent from the sweep no rule reaches the
+// diagram, so a target would name a rule that is not there -- and the calls
+// below would be spent to produce it.
+//
+// A RULE AWS CREATED FOR ONE OF ITS OWN SERVICES IS MARKED, NOT DROPPED HERE.
+// `list-rules` answers `ManagedBy` -- `ecs.amazonaws.com` on the rule ECS creates
+// for a capacity provider -- and AWS refuses `PutRule` and `DeleteRule` on one, so
+// importing it produces a resource the account cannot change and Terraform cannot
+// destroy. Marking rather than dropping is the same division the rest of this file
+// keeps: the engine reports what the account holds, Struct8 decides what it
+// accepts, and `ownedBy` is the field it already reads to drop a row knowingly --
+// the NAT's address above arrives the same way.
+//
+// IT HAS TO BE MARKED HERE because nothing else can see it: Cloud Control's
+// `GetResource` for `AWS::Events::Rule` answers `EventBusName, EventPattern,
+// Description, State, Targets, Id, Arn, RuleName, Tags, Name` and no `ManagedBy`
+// (measured 2026-09-06 against the ECS rule in 952133486861). `list-rules`, which
+// this block already calls, is the only place in the scan where the fact appears.
+if (cfnTypes.includes('AWS::Events::Rule')) {
+	/** The sweep's own row for a rule, so the mark lands on what Struct8 reads. */
+	const sweptRule = (bus, name) => {
+		const tail = bus === 'default' ? `rule/${name}` : `rule/${bus}/${name}`;
+		return items.find(
+			(i) => i.cfnType === 'AWS::Events::Rule' && String(i.importId ?? '').endsWith(tail)
+		);
+	};
+
+	for (const bus of aws('events', 'list-event-buses')?.EventBuses ?? []) {
+		if (!bus.Name) continue;
+		const rules = aws('events', 'list-rules', ['--event-bus-name', bus.Name])?.Rules ?? [];
+		for (const rule of rules) {
+			if (!rule.Name) continue;
+			const scopedRule = bus.Name === 'default' ? rule.Name : `${bus.Name}/${rule.Name}`;
+
+			if (rule.ManagedBy) {
+				const row = sweptRule(bus.Name, rule.Name);
+				if (row) row.ownedBy = String(rule.ManagedBy);
+				// Its targets are not asked for. They belong to the same rule, so they
+				// carry the same answer, and reading them would spend a call per
+				// managed rule to produce rows that are dropped on arrival.
+				continue;
+			}
+
+			const targets =
+				aws('events', 'list-targets-by-rule', [
+					'--rule',
+					rule.Name,
+					'--event-bus-name',
+					bus.Name
+				])?.Targets ?? [];
+			for (const target of targets) {
+				// The id is what Terraform imports by, and AWS composes one when the
+				// caller does not supply it. A target without one cannot be named, so
+				// it is left out rather than given an id that points at nothing.
+				if (!target.Id) continue;
+				items.push({
+					arn: '',
+					terraformTypeHint: 'aws_cloudwatch_event_target',
+					importId: `${scopedRule}/${target.Id}`,
+					nameHint: `${rule.Name}_${target.Id}`
+				});
+			}
+		}
+	}
+}
+
 const caller = aws('sts', 'get-caller-identity');
 
 fs.writeFileSync(
@@ -578,8 +1367,16 @@ fs.writeFileSync(
 			// The type list is echoed as a count, not in full: it is hundreds of
 			// entries, Struct8 already has it, and the number is what tells someone
 			// reading this file whether the sweep was as wide as they meant.
-			scope: { vpcIds, tagFilters, cfnTypeCount: cfnTypes.length, cfnDetailTypeCount: cfnDetailTypes.length },
+			scope: {
+				vpcIds,
+				tagFilters,
+				cfnTypeCount: cfnTypes.length,
+				cfnDetailTypeCount: cfnDetailTypes.length,
+				cfnChildTypeCount: cfnChildTypes.length,
+				cfnValueTypeCount: cfnValueTypes.length
+			},
 			items,
+			detailUnread,
 			errors
 		},
 		null,

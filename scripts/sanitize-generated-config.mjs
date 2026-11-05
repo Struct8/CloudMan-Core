@@ -248,7 +248,28 @@ function attributesBlamedBy(log) {
 		// generation fills one side with the account's value and the other with
 		// the type's zero, and pass 1 removes the zero before this ever runs. A
 		// draft with both sides really filled has not been seen.
-		for (const m of body.matchAll(/"([a-z0-9_]+)"\s*:/g)) attrs.add(m[1]);
+		// `"filename": one of `filename,image_uri,s3_bucket` must be specified` is
+		// the SDK saying one of a set is MISSING -- `AtLeastOneOf`, and
+		// `ExactlyOneOf` when none of them was given. What it quotes is not wrong,
+		// it is absent, so dropping that name is the opposite of the repair.
+		//
+		// Which is what happened, on 2026-08-26: an imported Lambda arrived with
+		// all three of `filename`, `image_uri` and `s3_bucket` empty, because AWS
+		// does not answer where a function's code came from. Pass 1 cleared all
+		// three as empty strings, and this pass then announced dropping names the
+		// file no longer held, round after round, until the series gave up.
+		//
+		// The comment on `ExactlyOneOf` below said this case does not arise from a
+		// generated draft. It does, whenever the account cannot answer for any side
+		// of the set.
+		//
+		// `all of `a,b` must be specified` is the opposite case and still drops:
+		// there the quoted attribute IS present, and it is what pulls in the
+		// requirement. One word apart, opposite repairs.
+		const missing = /:\s*one of\s+`[^`]+`\s+must be specified/.test(body);
+		if (!missing) {
+			for (const m of body.matchAll(/"([a-z0-9_]+)"\s*:/g)) attrs.add(m[1]);
+		}
 
 		// `Error: enable_lni_at_device_index must not be zero, got 0` -- a
 		// validator on the attribute, which the SDK reports without quoting it.
@@ -309,18 +330,46 @@ if (!logPath) {
 		process.exit(1);
 	}
 
-	for (const [address, attrs] of doomed) {
-		console.log(`sanitize: ${address} -> dropping ${[...attrs].join(', ')}`);
-	}
+	/** What actually came out, so the report is of the file and not of the log. */
+	const removed = new Map();
 
 	result = walk((line, ctx) => {
-		if (ctx.container !== 'resource') return line;
+		// A NESTED BLOCK COUNTS. `point_in_time_recovery { recovery_period_in_days
+		// = 0 }` is where the provider put the value it then refuses, and this pass
+		// used to reach only what sits directly under the resource -- so it
+		// announced the drop and left the line, every round, until the loop ran out
+		// of passes. Seen on a real import on 2026-08-26.
+		//
+		// An object-typed value and a tag map are still left alone, for the reasons
+		// pass 1 gives: that object type declares every key, and a map's keys are
+		// the account's own.
+		if (ctx.container !== 'resource' && ctx.container !== 'block') return line;
 		// Dropping the line that OPENS a container would orphan its body.
 		if (containerFor(line)) return line;
 		const named = /^\s*([A-Za-z_][A-Za-z0-9_-]*)\s*=/.exec(line);
 		if (!named) return line;
-		return doomed.get(ctx.address)?.has(named[1]) ? null : line;
+		if (!doomed.get(ctx.address)?.has(named[1])) return line;
+		const seen = removed.get(ctx.address) ?? new Set();
+		seen.add(named[1]);
+		removed.set(ctx.address, seen);
+		return null;
 	});
+
+	// REPORTED AFTER THE FACT, and that is the point. Announcing the intention
+	// read as the outcome: the log said `dropping recovery_period_in_days` three
+	// times while the line stayed where it was, which is how a repair that never
+	// happened looked exactly like one that did.
+	for (const [address, attrs] of doomed) {
+		const gone = removed.get(address) ?? new Set();
+		const took = [...attrs].filter((a) => gone.has(a));
+		const left = [...attrs].filter((a) => !gone.has(a));
+		if (took.length) console.log(`sanitize: ${address} -> dropped ${took.join(', ')}`);
+		if (left.length) {
+			console.log(
+				`sanitize: ${address} -> ${left.join(', ')} named by the provider, not in the draft`
+			);
+		}
+	}
 }
 
 if (result.changed === 0) {

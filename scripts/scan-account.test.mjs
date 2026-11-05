@@ -74,7 +74,13 @@ const ANSWERS = {
 		}
 	],
 	// One candidate read in detail: this is where the function names the role it uses.
+	//
+	// RATE LIMITED THE FIRST TIME, on purpose. This read is the one that carries the
+	// reference, so without a retry the role below goes unmarked -- which is exactly
+	// what happened on a real account on 2026-08-26. The assertion that the role is
+	// marked is therefore also the assertion that the retry happened.
 	'cloudcontrol get-resource AWS::Lambda::Function cost-report': [
+		{ THROWS: 'ThrottlingException: Rate exceeded' },
 		{
 			ResourceDescription: {
 				Identifier: 'cost-report',
@@ -90,9 +96,10 @@ const ANSWERS = {
 			}
 		}
 	],
-	'cloudcontrol get-resource AWS::DynamoDB::Table import-lab-items': [
-		{ ResourceDescription: { Identifier: 'import-lab-items', Properties: '{"TableName":"import-lab-items"}' } }
-	],
+	// Refused outright, every time: what the count has to report. The row itself
+	// still came from the listing and stays -- an unread candidate costs its
+	// references, not its own existence.
+	'cloudcontrol get-resource AWS::DynamoDB::Table import-lab-items': 'THROWS',
 	'cloudcontrol list-resources AWS::DynamoDB::Table': [
 		{ ResourceDescriptions: [{ Identifier: 'import-lab-items', Properties: '{}' }] }
 	],
@@ -109,6 +116,35 @@ const ANSWERS = {
 	],
 	// null LocationConstraint means us-east-1. Reading it as "no region" is what
 	// would silently drop every bucket in the busiest region AWS has.
+	'cloudcontrol get-resource AWS::S3::Bucket bucket-aqui': [
+		{ ResourceDescription: { Identifier: 'bucket-aqui', Properties: '{"BucketName":"bucket-aqui"}' } }
+	],
+	// Answered so a regression does not crash the stub -- the assertion is that this
+	// is never asked for, not that asking it fails.
+	'cloudcontrol get-resource AWS::S3::Bucket bucket-noutra-regiao': [
+		{ ResourceDescription: { Identifier: 'bucket-noutra-regiao', Properties: '{}' } }
+	],
+	// A type AWS fills with its own catalogue. Asked of IAM, which can filter by
+	// owner, instead of Cloud Control, which cannot: in a real account this is 93
+	// rows in one call rather than 1667 over seventeen pages, and the 1574 left
+	// behind are AWS's own policies that get discarded further along anyway.
+	'iam list-policies': [
+		{
+			Policies: [
+				{ Arn: 'arn:aws:iam::262578989263:policy/deploy-can-write', PolicyName: 'deploy-can-write' }
+			]
+		}
+	],
+	// Answered so a regression does not crash the stub. The assertion is that the
+	// sweep never asks this, because IAM already answered it.
+	'cloudcontrol list-resources AWS::IAM::ManagedPolicy': [
+		{
+			ResourceDescriptions: [
+				{ Identifier: 'arn:aws:iam::262578989263:policy/deploy-can-write', Properties: '{}' },
+				{ Identifier: 'arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess', Properties: '{}' }
+			]
+		}
+	],
 	's3api get-bucket-location bucket-aqui': [{ LocationConstraint: null }],
 	's3api get-bucket-location bucket-noutra-regiao': [{ LocationConstraint: 'sa-east-1' }],
 	// A type with no LIST handler at all. Normal across a sweep this wide, and a
@@ -189,6 +225,59 @@ const ANSWERS = {
 	],
 	// The one the credentials cannot read.
 	'ec2 describe-security-groups': 'THROWS',
+
+	// ------------------------------ layer 2, off the VPC: EventBridge targets
+	//
+	// Two buses, because the id carries the bus only when the bus is not the
+	// default one and one bus alone cannot show that. The rules themselves come
+	// from the sweep above; what is expanded here is only what lives inside them.
+	// Three rules from the sweep, and one of them is AWS's own -- the shape a real
+	// account has: ECS creates `ecs-managed-capacity-provider-rule` for a capacity
+	// provider and AWS refuses PutRule/DeleteRule on it.
+	'cloudcontrol list-resources AWS::Events::Rule': [
+		{
+			ResourceDescriptions: [
+				{ Identifier: `arn:aws:events:${R}:${A}:rule/import-lab3-daily`, Properties: '{}' },
+				{
+					Identifier: `arn:aws:events:${R}:${A}:rule/ecs-managed-capacity-provider-rule`,
+					Properties: '{}'
+				}
+			]
+		}
+	],
+	'events list-event-buses': [
+		{ EventBuses: [{ Name: 'default' }, { Name: 'barramento-de-pedidos' }] }
+	],
+	// `ManagedBy` is answered HERE and nowhere else in the scan: Cloud Control's
+	// GetResource for a rule does not carry it.
+	'events list-rules default': [
+		{
+			Rules: [
+				{ Name: 'import-lab3-daily' },
+				{ Name: 'ecs-managed-capacity-provider-rule', ManagedBy: 'ecs.amazonaws.com' }
+			]
+		}
+	],
+	// Answered so a regression does not crash the stub. The assertion is that a
+	// managed rule's targets are never asked for.
+	'events list-targets-by-rule default ecs-managed-capacity-provider-rule': [
+		{ Targets: [{ Id: 'ecs-managed-capacity-provider-target', Arn: `arn:aws:ecs:${R}:${A}:cluster/c` }] }
+	],
+	'events list-rules barramento-de-pedidos': [{ Rules: [{ Name: 'pedido-criado' }] }],
+	'events list-targets-by-rule default import-lab3-daily': [
+		{
+			Targets: [
+				{ Id: 'ingest-lambda', Arn: `arn:aws:lambda:${R}:${A}:function:import-lab3-ingest` },
+				// No `Id`: nothing can name it, so it must be left out rather than
+				// given an id that points at nothing.
+				{ Arn: `arn:aws:sqs:${R}:${A}:orders` }
+			]
+		}
+	],
+	'events list-targets-by-rule barramento-de-pedidos pedido-criado': [
+		{ Targets: [{ Id: 'notifica', Arn: `arn:aws:sns:${R}:${A}:pedidos` }] }
+	],
+
 	'sts get-caller-identity': [{ Account: A }]
 };
 
@@ -197,10 +286,22 @@ const ANSWERS = {
 // over the whole file: if it ever changes, this fails loudly instead of
 // silently testing nothing.
 const original = fs.readFileSync(SOURCE, 'utf-8');
+// TWO markers now, because the script reaches outside in two ways: the AWS CLI
+// for the handful of `ec2`/`s3api` calls, and the in-process Cloud Control client
+// for the several hundred that used to be child processes. Both are matched
+// exactly rather than by regex, so that a change to either fails loudly here
+// instead of silently testing nothing -- or, worse, reaching a real account.
 const IMPORT_LINE = "import { execFileSync, execFile } from 'node:child_process';";
-if (!original.includes(IMPORT_LINE)) {
-	console.log(`FAIL - scan-account.mjs no longer imports execFileSync the way this test stubs it`);
-	process.exit(1);
+const CLOUD_CONTROL_LINE =
+	"import { cloudControl, resolveCredentials } from './lib/cloud-control.mjs';";
+for (const [what, line] of [
+	['the AWS CLI', IMPORT_LINE],
+	['the Cloud Control client', CLOUD_CONTROL_LINE]
+]) {
+	if (!original.includes(line)) {
+		console.log(`FAIL - scan-account.mjs no longer imports ${what} the way this test stubs it`);
+		process.exit(1);
+	}
 }
 
 const stub = `
@@ -215,7 +316,16 @@ function __keyOf(argv) {
 	const at = (flag) => { const i = argv.indexOf(flag); return i === -1 ? null : argv[i + 1]; };
 	const type = at('--type-name');
 	const ident = at('--identifier') ?? at('--bucket');
-	return base + (type ? ' ' + type : '') + (ident ? ' ' + ident : '');
+	// The rule and the bus for the same reason: EventBridge is asked once per bus
+	// and once per rule, and a key that ignored them would answer the second rule
+	// with the first one's targets.
+	const bus = at('--event-bus-name');
+	const rule = at('--rule');
+	// And the parent a child type is listed from, so one balancer's listeners are
+	// answered apart from another's.
+	const model = at('--resource-model');
+	return base + (type ? ' ' + type : '') + (ident ? ' ' + ident : '') +
+		(bus ? ' ' + bus : '') + (rule ? ' ' + rule : '') + (model ? ' ' + model : '');
 }
 function execFileSync(_bin, argv) {
 	const key = __keyOf(argv);
@@ -226,22 +336,70 @@ function execFileSync(_bin, argv) {
 	if (answer && answer.THROWS) { const e = new Error(answer.THROWS); e.stderr = answer.THROWS; throw e; }
 	const i = __PAGE[key] ?? 0;
 	__PAGE[key] = i + 1;
-	return JSON.stringify(answer[Math.min(i, answer.length - 1)]);
+	const page = answer[Math.min(i, answer.length - 1)];
+	// Per-page, so an answer can refuse the first time and work the second -- which
+	// is the only way to tell a retry that happened from one that did not.
+	if (page && page.THROWS) { const e = new Error(page.THROWS); e.stderr = page.THROWS; throw e; }
+	return JSON.stringify(page);
 }
-// The sweep runs many calls at once and so takes the callback form. Same table,
-// same keys -- only the shape of the answer differs, which keeps the concurrent
-// path and the sequential one honest about testing the same thing.
+// Cloud Control, answered from the SAME table and under the same keys the CLI
+// used. The keys are still written \`cloudcontrol list-resources <Type>\` on
+// purpose: what changed is how the question travels, not which question is asked,
+// and keeping the table identical is what makes that claim testable.
+function resolveCredentials() {
+	return { accessKeyId: 'AKIAFAKE', secretAccessKey: 'fake', sessionToken: null };
+}
+// The bucket location loop asks S3 once per bucket and does it concurrently, so
+// it takes the callback form. Same table, same keys -- only the shape of the
+// answer differs, which keeps the concurrent path and the sequential one honest
+// about testing the same thing.
 function execFile(bin, argv, _opts, cb) {
 	try { cb(null, execFileSync(bin, argv), ''); }
 	catch (e) { cb(e, '', e.stderr ?? e.message); }
 }
+// One type answers SLOWLY, and that is what makes the overlap observable. With
+// every answer instant, all seven types finish inside one batch of microtasks and
+// the reads -- which are woken by a listing finishing -- never get a turn before
+// the last one. That would leave the ordering assertion below passing or failing
+// on the event loop rather than on the design.
+const __SLOW = { 'AWS::IAM::Role': 40 };
+function cloudControl(operation, payload) {
+	const argv =
+		operation === 'ListResources'
+			? ['cloudcontrol', 'list-resources', '--type-name', payload.TypeName, ...(payload.ResourceModel ? ['--resource-model', payload.ResourceModel] : [])]
+			: ['cloudcontrol', 'get-resource', '--type-name', payload.TypeName, '--identifier', payload.Identifier];
+	const answer = () => {
+		try {
+			return { ok: true, value: JSON.parse(execFileSync('aws', argv)) };
+		} catch (e) {
+			// The real client turns a refusal into \`{ok:false, message}\` carrying the
+			// CLI's own \`<Exception>: <text>\` wording, which is what the caller's
+			// regexes read. The stub has to hand back the same shape or every failure
+			// would be classified as a success with no answer.
+			return { ok: false, message: String(e.stderr ?? e.message) };
+		}
+	};
+	const wait = operation === 'ListResources' ? (__SLOW[payload.TypeName] ?? 0) : 0;
+	// The call is recorded when it is answered, so a slow listing lands late in
+	// \`calls.json\` -- which is the order the assertion reads.
+	return wait ? new Promise((r) => setTimeout(() => r(answer()), wait)) : Promise.resolve(answer());
+}
 process.on('exit', () => { try { fs.writeFileSync('calls.json', JSON.stringify(__CALLS, null, 1)); } catch {} });
 `;
+
+/**
+ * The script with both outside calls swapped for the table.
+ *
+ * The Cloud Control import is deleted rather than rewritten: the copy runs from a
+ * temp directory, so a relative import would not resolve there even if the stub
+ * did not already define both names.
+ */
+const patched = (body) => original.replace(IMPORT_LINE, body).replace(CLOUD_CONTROL_LINE, '');
 
 let callsFromMainRun = [];
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'struct8-scan-'));
 try {
-	fs.writeFileSync(path.join(dir, 'scan-account.mjs'), original.replace(IMPORT_LINE, stub));
+	fs.writeFileSync(path.join(dir, 'scan-account.mjs'), patched(stub));
 	fs.writeFileSync(
 		path.join(dir, 'scan_scope.json'),
 		JSON.stringify({
@@ -249,7 +407,10 @@ try {
 			vpcIds: ['vpc-0703'],
 			tagFilters: [],
 			// Six types: three that answer, two that refuse for reasons that are
-			// normal, one that refuses for a reason that is not.
+			// normal, one that refuses for a reason that is not. `AWS::Events::Rule`
+			// is the seventh, and it is here for a different job: it is what opens
+			// the target expansion below, which is asked only when the rule itself
+			// was asked for.
 			cfnTypes: [
 				'AWS::Lambda::Function',
 				'AWS::DynamoDB::Table',
@@ -257,11 +418,15 @@ try {
 				'AWS::IAM::Role',
 				'AWS::IAM::Policy',
 				'AWS::ApiGateway::Resource',
-				'AWS::Batch::JobQueue'
+				'AWS::Events::Rule',
+				'AWS::Batch::JobQueue',
+				// Swept like any other type as far as Struct8 is concerned. What the
+				// scanner does with it is the subject of the assertions below.
+				'AWS::IAM::ManagedPolicy'
 			],
 			// IAM is deliberately NOT here: it is the global type whose members we want
 			// to discover BY REFERENCE, not a candidate to ask what it uses.
-			cfnDetailTypes: ['AWS::Lambda::Function', 'AWS::DynamoDB::Table'],
+			cfnDetailTypes: ['AWS::Lambda::Function', 'AWS::DynamoDB::Table', 'AWS::S3::Bucket'],
 			requestId: 'pedido-42'
 		})
 	);
@@ -368,6 +533,52 @@ try {
 		!roleIdle?.referencedBy,
 		JSON.stringify(roleIdle)
 	);
+	// ------------------------------------------- what could NOT be read, and why
+	//
+	// This used to be invisible. On a real account 55 of 78 reads came back empty and
+	// the run reported one error, because every failure counted as expected. The
+	// person choosing resources pays for that: an unread candidate is one whose
+	// references were never followed, so whatever it uses is offered as an anonymous
+	// row among hundreds.
+	check(
+		'the candidate that could not be read is counted',
+		out.detailUnread?.count === 1,
+		JSON.stringify(out.detailUnread)
+	);
+	check(
+		'and the count says why, in a word someone can act on',
+		out.detailUnread?.by?.['not allowed'] === 1,
+		JSON.stringify(out.detailUnread)
+	);
+	// A COUNT WITH NO NAMES CANNOT BE CHECKED. `no longer there: 1` came back
+	// identical from two scans half an hour apart -- which is not a resource
+	// disappearing mid-scan, but something that answers LIST and refuses to be
+	// read, every time. There was no way to find out what.
+	check(
+		'and it names the candidate, so someone can go look',
+		out.detailUnread?.who?.[0]?.importId === 'import-lab-items',
+		JSON.stringify(out.detailUnread?.who)
+	);
+	check(
+		'with its type and the same reason the tally counted',
+		out.detailUnread?.who?.[0]?.cfnType === 'AWS::DynamoDB::Table' &&
+			out.detailUnread?.who?.[0]?.reason === 'not allowed',
+		JSON.stringify(out.detailUnread?.who)
+	);
+	// THE CONTROL: only the unread one is named. Listing every candidate would
+	// satisfy the two checks above just as well.
+	check(
+		'and nothing that WAS read is named',
+		out.detailUnread?.who?.length === 1,
+		JSON.stringify(out.detailUnread?.who)
+	);
+	// THE CONTROL: a retry that never fired would leave the throttled read here too.
+	check(
+		'and the read that was merely rate limited is NOT among them',
+		!out.detailUnread?.by?.['rate limited'],
+		JSON.stringify(out.detailUnread)
+	);
+
 	check(
 		'a candidate that names nothing marks nothing',
 		!out.items.find((i) => i.importId === 'import-lab-processor')?.referencedBy,
@@ -411,6 +622,66 @@ try {
 		hints.filter((i) => i.terraformTypeHint === 'aws_network_acl_rule').length === 1
 	);
 
+	// ------------------------------------------- the targets of an EventBridge rule
+	const alvos = hints.filter((i) => i.terraformTypeHint === 'aws_cloudwatch_event_target');
+	check(
+		'the targets were expanded out of the rules, one per bus',
+		alvos.length === 2,
+		JSON.stringify(alvos)
+	);
+	// Two segments on the default bus, three on any other -- the same shape the
+	// rule's own ARN has, and the same one Struct8 composes when it adopts.
+	check(
+		'a target on the default bus is <rule>/<target id>',
+		alvos.find((a) => a.importId === 'import-lab3-daily/ingest-lambda') !== undefined,
+		JSON.stringify(alvos.map((a) => a.importId))
+	);
+	check(
+		'and on any other bus the bus comes first',
+		alvos.find((a) => a.importId === 'barramento-de-pedidos/pedido-criado/notifica') !== undefined,
+		JSON.stringify(alvos.map((a) => a.importId))
+	);
+	check(
+		'a target with no id of its own was left out, not given one',
+		!alvos.some((a) => a.importId.endsWith('/undefined') || a.importId.endsWith('/')),
+		JSON.stringify(alvos.map((a) => a.importId))
+	);
+
+	// ------------------------------------- a rule AWS created for its own service
+	//
+	// `ManagedBy` is answered by `list-rules` and by nothing else the scan calls --
+	// Cloud Control's GetResource for a rule does not carry it. AWS refuses PutRule
+	// and DeleteRule on one, so importing it is a resource the account cannot
+	// change and Terraform cannot destroy.
+	const regraDaAws = out.items.find((i) =>
+		String(i.importId ?? '').endsWith('rule/ecs-managed-capacity-provider-rule')
+	);
+	check(
+		'a rule AWS manages is marked with who owns it, so Struct8 drops it knowingly',
+		regraDaAws?.ownedBy === 'ecs.amazonaws.com',
+		JSON.stringify(regraDaAws)
+	);
+	// THE CONTROL: marking every rule would satisfy that too, and lose the
+	// account's own.
+	const regraDoCliente = out.items.find((i) =>
+		String(i.importId ?? '').endsWith('rule/import-lab3-daily')
+	);
+	check(
+		"and the account's own rule is left unmarked",
+		regraDoCliente !== undefined && regraDoCliente.ownedBy === undefined,
+		JSON.stringify(regraDoCliente)
+	);
+	check(
+		'and no target of it reached the inventory',
+		!alvos.some((a) => String(a.importId).includes('ecs-managed-capacity-provider')),
+		JSON.stringify(alvos.map((a) => a.importId))
+	);
+	check(
+		'the name hint names the rule and the target, not the bus',
+		alvos.find((a) => a.nameHint === 'import-lab3-daily_ingest-lambda') !== undefined,
+		JSON.stringify(alvos.map((a) => a.nameHint))
+	);
+
 	// ----------------------------------------------------------- the failure
 	check(
 		'the service that refused is reported, not swallowed',
@@ -432,6 +703,41 @@ try {
 
 	// ------------------------------------------------- the flags actually sent
 	const calls = JSON.parse(fs.readFileSync(path.join(dir, 'calls.json'), 'utf-8'));
+
+	// The saving that comes with the mark: a managed rule's targets belong to the
+	// same rule and carry the same answer, so asking for them spends a call per
+	// managed rule to produce rows that are dropped on arrival.
+	check(
+		'the targets of a managed rule are never asked for',
+		!calls.some(
+			(c) => c.includes('list-targets-by-rule') && c.includes('ecs-managed-capacity-provider-rule')
+		),
+		JSON.stringify(calls.filter((c) => c.includes('list-targets-by-rule')))
+	);
+
+	// ------------------------------------------------ detail runs AFTER the region
+	//
+	// S3 lists the whole account whatever region is asked, so every bucket is a
+	// candidate until its location says otherwise. Reading them first spends one
+	// Cloud Control call per foreign bucket -- and Cloud Control is the same quota
+	// the reads that matter are queueing for.
+	const detalhe = calls.filter((c) => c.startsWith('cloudcontrol get-resource'));
+	check(
+		'a bucket in another region is never read in detail',
+		!detalhe.some((c) => c.includes('bucket-noutra-regiao')),
+		JSON.stringify(detalhe)
+	);
+	// THE CONTROL: skipping the detail pass entirely would satisfy that too.
+	check(
+		'and the bucket that IS in the region still is',
+		detalhe.some((c) => c.includes('bucket-aqui')),
+		JSON.stringify(detalhe)
+	);
+	check(
+		'the rate limited read was asked a second time',
+		detalhe.filter((c) => c.includes('AWS::Lambda::Function cost-report') || (c.includes('AWS::Lambda::Function') && c.includes('cost-report'))).length === 2,
+		JSON.stringify(detalhe)
+	);
 	// Only the types Struct8 named are read one by one. Reading every swept row
 	// would be one call per resource in the account -- thousands.
 	check(
@@ -440,6 +746,46 @@ try {
 			!calls.some((c) => c.startsWith('cloudcontrol get-resource') && c.includes('AWS::IAM::Role')),
 		JSON.stringify(calls.filter((c) => c.startsWith('cloudcontrol get-resource')))
 	);
+	// The owner filter, which is the whole reason it is asked of IAM: Cloud Control
+	// would answer the account's 93 policies alongside AWS's 1574, over seventeen
+	// pages, and everything AWS owns would be dropped further along regardless.
+	check(
+		'a type AWS fills with its own catalogue is asked of the service that can filter by owner',
+		calls.some((c) => c.startsWith('iam list-policies') && c.includes('--scope Local')),
+		JSON.stringify(calls.filter((c) => c.startsWith('iam ')))
+	);
+	check(
+		'and the sweep does not ask Cloud Control for it as well',
+		!calls.some(
+			(c) => c.startsWith('cloudcontrol list-resources') && c.includes('AWS::IAM::ManagedPolicy')
+		),
+		JSON.stringify(calls.filter((c) => c.includes('ManagedPolicy')))
+	);
+	// THE CONTROL: dropping the type entirely would satisfy both checks above and
+	// lose every policy the account actually wrote.
+	check(
+		"and the account's own policy is in the inventory",
+		out.items.some((i) => i.importId === 'arn:aws:iam::262578989263:policy/deploy-can-write'),
+		JSON.stringify(out.items.filter((i) => i.cfnType === 'AWS::IAM::ManagedPolicy'))
+	);
+
+	// The two passes overlap. `calls.json` keeps the order they went out in, so the
+	// question "did a read start before the listing finished" is answerable here:
+	// a detail read must appear before the LAST listing, which cannot happen if the
+	// read waits for the sweep to end.
+	//
+	// It is worth asserting because the passes ask different Cloud Control
+	// operations, and those have separate rate capacity -- measured 2026-09-06 on
+	// 60 types and 60 roles, 12.3 s of listings and 14.7 s of reads took 16.0 s
+	// together against 27.1 s one after the other.
+	const lastList = calls.findLastIndex((c) => c.startsWith('cloudcontrol list-resources'));
+	const firstRead = calls.findIndex((c) => c.startsWith('cloudcontrol get-resource'));
+	check(
+		'a detail read goes out before the sweep has finished listing',
+		firstRead !== -1 && lastList !== -1 && firstRead < lastList,
+		`primeira leitura em ${firstRead}, ultima listagem em ${lastList}`
+	);
+
 	// Kept for the second run below, which asserts something about THIS one: the
 	// directory is gone by then.
 	callsFromMainRun = calls;
@@ -493,7 +839,7 @@ try {
 		check('the tag-run stub was built from the same shape as the main one', false);
 	}
 
-	fs.writeFileSync(path.join(dir2, 'scan-account.mjs'), original.replace(IMPORT_LINE, stubTag));
+	fs.writeFileSync(path.join(dir2, 'scan-account.mjs'), patched(stubTag));
 	// No vpcIds and no cfnTypes: this run is ONLY the tag path, so anything that
 	// shows up came from it.
 	fs.writeFileSync(
@@ -528,8 +874,410 @@ try {
 		out2.errors.some((e) => /No type list to sweep/.test(e.message)),
 		JSON.stringify(out2.errors)
 	);
+	// THE TARGET FOLLOWS ITS PARENT'S SCOPE. This run asks for no type at all, so
+	// no rule reaches the diagram -- and a target expanded here would name a rule
+	// that is not there. The calls must not happen either: `ANSWERS_TAG` holds no
+	// answer for them, so an ungated block would show up as recorded errors rather
+	// than as a crash, which is the quiet way this would rot.
+	check(
+		'with no rule in the sweep, EventBridge is never asked',
+		!calls2.some((c) => c.startsWith('events ')),
+		JSON.stringify(calls2.filter((c) => c.startsWith('events ')))
+	);
 } finally {
 	fs.rmSync(dir2, { recursive: true, force: true });
+}
+
+// ------------------------------------ a third scan: the children, and the names
+//
+// A listener lists only FROM its balancer: Cloud Control refuses the plain LIST
+// and names the property it wants in the resource model. Struct8 declares which
+// child comes from which parent (`cfnChildTypes`), and the scanner asks once per
+// parent the sweep found. The same run covers what the detail read now records
+// for a swept row: its tags, the name CloudFormation spells after the type, and
+// the auto scaling group that launched an instance.
+const dir3 = fs.mkdtempSync(path.join(os.tmpdir(), 'struct8-scan-child-'));
+try {
+	const LB = `arn:aws:elasticloadbalancing:${R}:${A}:loadbalancer/app/application-load-balancer/2b0ab14600dda1c1`;
+	const LISTENER = `arn:aws:elasticloadbalancing:${R}:${A}:listener/app/application-load-balancer/2b0ab14600dda1c1/720b7f319126eff1`;
+	const TG = `arn:aws:elasticloadbalancing:${R}:${A}:targetgroup/web-target-group/fa33c1c324570f6f`;
+	const ANSWERS_CHILD = {
+		'cloudcontrol list-resources AWS::ElasticLoadBalancingV2::LoadBalancer': [
+			{ ResourceDescriptions: [{ Identifier: LB, Properties: '{}' }] }
+		],
+		// Answered ONLY under the balancer's model: a plain ask has no entry, which
+		// the stub reports as an unexpected call.
+		[`cloudcontrol list-resources AWS::ElasticLoadBalancingV2::Listener {"LoadBalancerArn":"${LB}"}`]: [
+			{ ResourceDescriptions: [{ Identifier: LISTENER, Properties: '{}' }] }
+		],
+		[`cloudcontrol get-resource AWS::ElasticLoadBalancingV2::LoadBalancer ${LB}`]: [
+			{
+				ResourceDescription: {
+					Identifier: LB,
+					Properties: JSON.stringify({
+						LoadBalancerArn: LB,
+						LoadBalancerName: 'application-load-balancer',
+						Tags: [{ Key: 'Name', Value: 'application-load-balancer' }, { Key: 'State', Value: 'alb-web-servers' }]
+					})
+				}
+			}
+		],
+		[`cloudcontrol get-resource AWS::ElasticLoadBalancingV2::Listener ${LISTENER}`]: [
+			{
+				ResourceDescription: {
+					Identifier: LISTENER,
+					Properties: JSON.stringify({
+						ListenerArn: LISTENER,
+						LoadBalancerArn: LB,
+						Port: 80,
+						Protocol: 'HTTP',
+						DefaultActions: [{ Type: 'forward', TargetGroupArn: TG }]
+					})
+				}
+			}
+		],
+		'cloudcontrol list-resources AWS::EC2::Instance': [
+			{
+				ResourceDescriptions: [
+					{ Identifier: 'i-0492eb0a111f90cb4', Properties: '{}' },
+					{ Identifier: 'i-0fefd2d2339113deb', Properties: '{}' }
+				]
+			}
+		],
+		// Launched by the group: AWS stamps the group's name on it. `KeyName` is the
+		// key pair, and must not become the instance's name.
+		'cloudcontrol get-resource AWS::EC2::Instance i-0492eb0a111f90cb4': [
+			{
+				ResourceDescription: {
+					Identifier: 'i-0492eb0a111f90cb4',
+					Properties: JSON.stringify({
+						InstanceId: 'i-0492eb0a111f90cb4',
+						KeyName: 'oregon-keypair',
+						Tags: [
+							{ Key: 'aws:autoscaling:groupName', Value: 'web-server-asg' },
+							{ Key: 'Name', Value: 'web-server-asg' }
+						]
+					})
+				}
+			}
+		],
+		'cloudcontrol get-resource AWS::EC2::Instance i-0fefd2d2339113deb': [
+			{
+				ResourceDescription: {
+					Identifier: 'i-0fefd2d2339113deb',
+					Properties: JSON.stringify({
+						InstanceId: 'i-0fefd2d2339113deb',
+						KeyName: 'oregon-keypair',
+						Tags: [{ Key: 'Name', Value: 'nat-instance' }]
+					})
+				}
+			}
+		],
+		// No `Tags` at all in this read: the name comes from the property
+		// CloudFormation spells after the type.
+		'cloudcontrol list-resources AWS::EC2::LaunchTemplate': [
+			{ ResourceDescriptions: [{ Identifier: 'lt-0d6e73a1434f8d838', Properties: '{}' }] }
+		],
+		'cloudcontrol get-resource AWS::EC2::LaunchTemplate lt-0d6e73a1434f8d838': [
+			{
+				ResourceDescription: {
+					Identifier: 'lt-0d6e73a1434f8d838',
+					Properties: JSON.stringify({
+						LaunchTemplateName: 'web-server-launch-template',
+						LaunchTemplateId: 'lt-0d6e73a1434f8d838',
+						LatestVersionNumber: 1
+					})
+				}
+			}
+		],
+		'sts get-caller-identity': [{ Account: A }]
+	};
+	const stubChild = stub.replace(
+		`const __ANSWERS = ${JSON.stringify(ANSWERS)};`,
+		`const __ANSWERS = ${JSON.stringify(ANSWERS_CHILD)};`
+	);
+	if (stubChild === stub) {
+		check('the child-run stub was built from the same shape as the main one', false);
+	}
+	fs.writeFileSync(path.join(dir3, 'scan-account.mjs'), patched(stubChild));
+	fs.writeFileSync(
+		path.join(dir3, 'scan_scope.json'),
+		JSON.stringify({
+			region: R,
+			vpcIds: [],
+			tagFilters: [],
+			cfnTypes: [
+				'AWS::ElasticLoadBalancingV2::LoadBalancer',
+				'AWS::EC2::Instance',
+				'AWS::EC2::LaunchTemplate'
+			],
+			cfnDetailTypes: [
+				'AWS::ElasticLoadBalancingV2::LoadBalancer',
+				'AWS::ElasticLoadBalancingV2::Listener',
+				'AWS::EC2::Instance',
+				'AWS::EC2::LaunchTemplate'
+			],
+			cfnChildTypes: [
+				{
+					type: 'AWS::ElasticLoadBalancingV2::Listener',
+					parent: 'AWS::ElasticLoadBalancingV2::LoadBalancer',
+					model: 'LoadBalancerArn'
+				}
+			]
+		})
+	);
+	execFileSync('node', ['scan-account.mjs'], { cwd: dir3, encoding: 'utf-8', stdio: 'pipe' });
+
+	const out3 = JSON.parse(fs.readFileSync(path.join(dir3, 'scan_inventory.json'), 'utf-8'));
+	const calls3 = JSON.parse(fs.readFileSync(path.join(dir3, 'calls.json'), 'utf-8'));
+	const row = (id) => out3.items.find((i) => i.importId === id);
+
+	check(
+		'the listener came, listed from its balancer',
+		row(LISTENER)?.cfnType === 'AWS::ElasticLoadBalancingV2::Listener',
+		JSON.stringify(out3.items.map((i) => i.importId))
+	);
+	const listenerAsks = calls3.filter((c) =>
+		c.startsWith('cloudcontrol list-resources --type-name AWS::ElasticLoadBalancingV2::Listener')
+	);
+	check(
+		'and it was asked WITH the resource model, never plainly',
+		listenerAsks.length === 1 && listenerAsks[0].includes('--resource-model {"LoadBalancerArn":'),
+		JSON.stringify(listenerAsks)
+	);
+	check(
+		'after its parent was listed',
+		calls3.findIndex((c) => c.startsWith('cloudcontrol list-resources --type-name AWS::ElasticLoadBalancingV2::LoadBalancer')) <
+			calls3.findIndex((c) => c.startsWith('cloudcontrol list-resources --type-name AWS::ElasticLoadBalancingV2::Listener'))
+	);
+	check(
+		'the listener was read in detail and names its balancer',
+		row(LB)?.referencedBy?.includes(LISTENER),
+		JSON.stringify(row(LB))
+	);
+	check('the scope echo counts the children', out3.scope.cfnChildTypeCount === 1, JSON.stringify(out3.scope));
+
+	// ---- what the detail read records on a swept row
+	check(
+		'a swept row now carries the tags its detail read answered',
+		row(LB)?.tags?.Name === 'application-load-balancer' && row(LB)?.tags?.State === 'alb-web-servers',
+		JSON.stringify(row(LB)?.tags)
+	);
+	check(
+		'the instance the group launched comes marked as owned by it',
+		row('i-0492eb0a111f90cb4')?.ownedBy === 'web-server-asg',
+		JSON.stringify(row('i-0492eb0a111f90cb4'))
+	);
+	check(
+		'and the one nobody launched comes with its Name and no owner',
+		row('i-0fefd2d2339113deb')?.tags?.Name === 'nat-instance' && row('i-0fefd2d2339113deb')?.ownedBy == null,
+		JSON.stringify(row('i-0fefd2d2339113deb'))
+	);
+	check(
+		"a read with no Tags names the row by CloudFormation's <Type>Name property",
+		row('lt-0d6e73a1434f8d838')?.nameHint === 'web-server-launch-template',
+		JSON.stringify(row('lt-0d6e73a1434f8d838'))
+	);
+	// THE CONTROL: `KeyName` on an instance is its key pair, not its name. The
+	// convention reads `InstanceName`, which does not exist, so nothing is written.
+	check(
+		'and a Name tag is never displaced by another *Name property',
+		row('i-0fefd2d2339113deb')?.nameHint == null && row('i-0492eb0a111f90cb4')?.nameHint == null,
+		JSON.stringify([row('i-0fefd2d2339113deb')?.nameHint, row('i-0492eb0a111f90cb4')?.nameHint])
+	);
+} finally {
+	fs.rmSync(dir3, { recursive: true, force: true });
+}
+
+// ------------------------- a fourth scan: the resources that have no region
+//
+// CloudFront, IAM and Route 53 answer the tagging API in us-east-1 and NOWHERE
+// else. Measured on 952133486861 (2026-09-10): asked in us-west-2 it returns 0
+// rows for the three; asked in us-east-1, 72, 1 and 15.
+//
+// So a sweep of any other region was losing them twice over. With a tag filter as
+// the scope they never arrived at all -- the roles included, not just the
+// CloudFront distribution that surfaced this. Without one they arrived from Cloud
+// Control carrying an identifier and nothing else, which put that account's
+// fifteen distributions on the selection screen as bare ids for the person to
+// tell apart.
+const OESTE = 'us-west-2';
+const CDN = 'E3RF0AX60CH06U';
+const dir4 = fs.mkdtempSync(path.join(os.tmpdir(), 'struct8-scan-global-'));
+try {
+	const ANSWERS_GLOBAL = {
+		'cloudcontrol list-resources AWS::CloudFront::Distribution': [
+			{ ResourceDescriptions: [{ Identifier: CDN }] }
+		],
+		// One key serves every call, so the pages ARE the sequence: the sweep's own
+		// region answers nothing -- as us-west-2 does on the real account -- and
+		// us-east-1 answers, for the tag pass and again for the naming pass.
+		'resourcegroupstaggingapi get-resources': [
+			{ ResourceTagMappingList: [], PaginationToken: '' },
+			{
+				ResourceTagMappingList: [
+					{
+						ResourceARN: `arn:aws:cloudfront::${A}:distribution/${CDN}`,
+						Tags: [{ Key: 'Name', Value: 'cdn-aberta' }]
+					}
+				],
+				PaginationToken: ''
+			}
+		],
+		'sts get-caller-identity': [{ Account: A }]
+	};
+	const stubGlobal = stub.replace(
+		`const __ANSWERS = ${JSON.stringify(ANSWERS)};`,
+		`const __ANSWERS = ${JSON.stringify(ANSWERS_GLOBAL)};`
+	);
+	if (stubGlobal === stub) {
+		check('the global-run stub was built from the same shape as the main one', false);
+	}
+
+	fs.writeFileSync(path.join(dir4, 'scan-account.mjs'), patched(stubGlobal));
+	fs.writeFileSync(
+		path.join(dir4, 'scan_scope.json'),
+		JSON.stringify({
+			region: OESTE,
+			vpcIds: [],
+			tagFilters: ['State=Site'],
+			cfnTypes: ['AWS::CloudFront::Distribution'],
+			cfnDetailTypes: [],
+			globalServices: ['cloudfront', 'iam', 'route53']
+		})
+	);
+	execFileSync('node', ['scan-account.mjs'], { cwd: dir4, encoding: 'utf-8', stdio: 'pipe' });
+
+	const out4 = JSON.parse(fs.readFileSync(path.join(dir4, 'scan_inventory.json'), 'utf-8'));
+	const calls4 = JSON.parse(fs.readFileSync(path.join(dir4, 'calls.json'), 'utf-8'));
+	const tagging = calls4.filter((c) => c.startsWith('resourcegroupstaggingapi get-resources'));
+
+	check(
+		'the sweep still asks its own region for tags',
+		tagging.some((c) => c.includes(`--region ${OESTE}`)),
+		JSON.stringify(tagging)
+	);
+	check(
+		'and asks us-east-1 too, which is the only region that answers for them',
+		tagging.some((c) => c.includes('--region us-east-1')),
+		JSON.stringify(tagging)
+	);
+	// NARROWED, and that is the half that keeps it honest: unnarrowed, the second
+	// call would drag every tagged resource of us-east-1 into a sweep of Oregon.
+	check(
+		'narrowed to the services with no region, never the whole of us-east-1',
+		tagging
+			.filter((c) => c.includes('--region us-east-1'))
+			.every((c) => c.includes('--resource-type-filters cloudfront iam route53')),
+		JSON.stringify(tagging.filter((c) => c.includes('--region us-east-1')))
+	);
+	// And the tag filter travels on it -- a scope is a scope in both regions.
+	check(
+		'carrying the same tag filter the person asked for',
+		tagging.some((c) => c.includes('--region us-east-1') && c.includes('Key=State,Values=Site')),
+		JSON.stringify(tagging.filter((c) => c.includes('--region us-east-1')))
+	);
+
+	const swept4 = out4.items.find((i) => i.importId === CDN);
+	check('the distribution is in the inventory', !!swept4, JSON.stringify(out4.items));
+	// THE POINT OF THE NAMING PASS: without it this row is `E3RF0AX60CH06U` and
+	// nothing else, and the person picks theirs out of fifteen by id.
+	check(
+		'and it arrives with the name its tag gives it',
+		swept4?.tags?.Name === 'cdn-aberta',
+		JSON.stringify(swept4)
+	);
+} finally {
+	fs.rmSync(dir4, { recursive: true, force: true });
+}
+
+// THE CONTROL, and the one that would rot quietly: an older Struct8 sends no
+// `globalServices`, and then none of the above may happen. The main run at the top
+// of this file is exactly that scan -- no tag filter, no list of global services
+// -- and it must not reach the tagging API in any region.
+check(
+	'with no global services declared, us-east-1 is never asked',
+	!callsFromMainRun.some((c) => c.startsWith('resourcegroupstaggingapi')),
+	JSON.stringify(callsFromMainRun.filter((c) => c.startsWith('resourcegroupstaggingapi')))
+);
+
+// ----------- a fifth scan: when the identifier and the ARN are different strings
+//
+// A key value store lists as `Identifier: "kvs-validacao"` -- its NAME -- while
+// its properties carry `Arn: arn:...:key-value-store/<uuid>`. The function that
+// reads the store names it BY ARN, whose tail is that uuid. So the identifier is
+// a name, the reference is a uuid, and the two lookups in the detail pass could
+// never meet: measured on 952133486861 (2026-09-10), the store was never marked
+// and never reached the selection screen, while the function that reads it did.
+const FN = 'arn:aws:cloudfront::262578989263:function/viewer-request-kvs1';
+const KVS_UUID = '17f7e222-474c-4b49-a69e-ecccfb4e6297';
+const KVS_ARN = `arn:aws:cloudfront::262578989263:key-value-store/${KVS_UUID}`;
+const dir5 = fs.mkdtempSync(path.join(os.tmpdir(), 'struct8-scan-arn-'));
+try {
+	const ANSWERS_ARN = {
+		'cloudcontrol list-resources AWS::CloudFront::Function': [
+			{ ResourceDescriptions: [{ Identifier: FN, Properties: JSON.stringify({ FunctionARN: FN }) }] }
+		],
+		'cloudcontrol list-resources AWS::CloudFront::KeyValueStore': [
+			{
+				ResourceDescriptions: [
+					{
+						Identifier: 'kvs-validacao',
+						Properties: JSON.stringify({ Id: KVS_UUID, Arn: KVS_ARN, Name: 'kvs-validacao' })
+					}
+				]
+			}
+		],
+		[`cloudcontrol get-resource AWS::CloudFront::Function ${FN}`]: [
+			{
+				ResourceDescription: {
+					Identifier: FN,
+					Properties: JSON.stringify({
+						FunctionARN: FN,
+						FunctionConfig: { KeyValueStoreAssociations: [{ KeyValueStoreARN: KVS_ARN }] }
+					})
+				}
+			}
+		],
+		'sts get-caller-identity': [{ Account: A }]
+	};
+	const stubArn = stub.replace(
+		`const __ANSWERS = ${JSON.stringify(ANSWERS)};`,
+		`const __ANSWERS = ${JSON.stringify(ANSWERS_ARN)};`
+	);
+	if (stubArn === stub) {
+		check('the arn-run stub was built from the same shape as the main one', false);
+	}
+
+	fs.writeFileSync(path.join(dir5, 'scan-account.mjs'), patched(stubArn));
+	fs.writeFileSync(
+		path.join(dir5, 'scan_scope.json'),
+		JSON.stringify({
+			region: R,
+			vpcIds: [],
+			tagFilters: [],
+			cfnTypes: ['AWS::CloudFront::Function', 'AWS::CloudFront::KeyValueStore'],
+			cfnDetailTypes: ['AWS::CloudFront::Function']
+		})
+	);
+	execFileSync('node', ['scan-account.mjs'], { cwd: dir5, encoding: 'utf-8', stdio: 'pipe' });
+
+	const out5 = JSON.parse(fs.readFileSync(path.join(dir5, 'scan_inventory.json'), 'utf-8'));
+	const store = out5.items.find((i) => i.importId === 'kvs-validacao');
+
+	check('the store is in the inventory', !!store, JSON.stringify(out5.items));
+	// THE POINT: the function named it by ARN and the row is keyed by its name.
+	check(
+		'and it says the function names it, matched on the ARN the listing carried',
+		(store?.referencedBy ?? []).includes(FN),
+		JSON.stringify(store)
+	);
+	// THE CONTROL: `arn` stays empty. That field feeds the frontend's drop rules
+	// and its type resolution, and filling it for every swept row would change the
+	// selection screen for reasons that have nothing to do with this matching.
+	check('while the row itself still carries no arn', store?.arn == null, JSON.stringify(store));
+} finally {
+	fs.rmSync(dir5, { recursive: true, force: true });
 }
 
 console.log(failures === 0 ? '\nALL CASES PASSED' : `\n${failures} CASE(S) FAILED`);

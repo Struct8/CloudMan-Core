@@ -290,6 +290,165 @@ const diagnostic = (summary, address, detail, { colour = false, box = true } = {
 	check('and not the resource name that has an attribute shape', /content = "oi"/.test(r.config), r.config);
 }
 
+// ───────────────────────────────────────── what a real import brought back
+//
+// Both cases below come from one read of a five-resource account on
+// 2026-08-26. It closed reporting success and delivered three: the log
+// announced repairs it had not made, and the two resources it could not fix
+// reached the front end carrying HCL the provider refuses.
+
+const TABELA = `resource "aws_dynamodb_table" "import-lab-items" {
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "id"
+  name         = "import-lab-items"
+  point_in_time_recovery {
+    enabled                 = false
+    recovery_period_in_days = 0
+  }
+  tags = {}
+}
+`;
+
+const LOG_TABELA = `
+╷
+│ Error: expected point_in_time_recovery.0.recovery_period_in_days to be in the range (1 - 35), got 0
+│
+│   with aws_dynamodb_table.import-lab-items,
+│   on generated_resources.tf line 77, in resource "aws_dynamodb_table" "import-lab-items":
+│   77:     recovery_period_in_days = 0
+│
+╵
+`;
+
+{
+	const r = run(TABELA, LOG_TABELA);
+	// The value the provider refuses sits INSIDE `point_in_time_recovery`, and
+	// pass 2 used to reach only what is directly under the resource. It said
+	// `dropping recovery_period_in_days` on every round and left the line where
+	// it was, so the loop spent its passes and the draft stayed broken.
+	check('drops an attribute inside a nested block', !/recovery_period_in_days/.test(r.config), r.config);
+	check('and exits 0, so the repair loop goes round again', r.code === 0, r.out);
+	// THE CONTROL: the block itself has to survive its attribute.
+	check('the block that held it is still there', /point_in_time_recovery \{/.test(r.config), r.config);
+	check('and the attribute beside it is untouched', /enabled\s+= false/.test(r.config), r.config);
+	// Reported from the file, not from the log.
+	check('and the report says dropped, having dropped it', /-> dropped recovery_period_in_days/.test(r.out), r.out);
+}
+
+// After pass 1 the three code attributes are gone: AWS does not answer where a
+// function's code came from, so config generation wrote all three empty.
+const FUNCAO = `resource "aws_lambda_function" "import-lab-processor" {
+  architectures = ["x86_64"]
+  function_name = "import-lab-processor"
+  handler       = "index.handler"
+  role          = "arn:aws:iam::952133486861:role/import-lab-processor-role-7kq2m1x8"
+  runtime       = "python3.12"
+}
+`;
+
+const LOG_FUNCAO = `
+╷
+│ Error: Invalid combination of arguments
+│
+│   with aws_lambda_function.import-lab-processor,
+│   on generated_resources.tf line 15, in resource "aws_lambda_function" "import-lab-processor":
+│   15: resource "aws_lambda_function" "import-lab-processor" {
+│
+│ "filename": one of \`filename,image_uri,s3_bucket\` must be specified
+╵
+╷
+│ Error: Invalid combination of arguments
+│
+│   with aws_lambda_function.import-lab-processor,
+│   on generated_resources.tf line 15, in resource "aws_lambda_function" "import-lab-processor":
+│   15: resource "aws_lambda_function" "import-lab-processor" {
+│
+│ "image_uri": one of \`filename,image_uri,s3_bucket\` must be specified
+╵
+`;
+
+{
+	const r = run(FUNCAO, LOG_FUNCAO);
+	// `one of \`a,b,c\` must be specified` says one of the set is MISSING. What it
+	// quotes is not wrong, it is absent -- so dropping that name is the opposite
+	// of the repair, and it used to be what happened.
+	check(
+		'does not act on a name the provider says is missing',
+		!/dropped|dropping/.test(r.out),
+		r.out
+	);
+	check('and leaves the rest of the resource alone', /function_name = "import-lab-processor"/.test(r.config), r.config);
+	check('exiting 1, which is how the loop stops instead of spinning', r.code === 1, r.out);
+}
+
+// THE CONTROL, and it is the whole distinction: `all of` is one word away from
+// `one of` and takes the OPPOSITE repair. There the quoted attribute IS in the
+// draft, and it is what pulls in the requirement, so it still goes.
+const SUBNET_REQUIRED_WITH = `resource "aws_subnet" "public" {
+  cidr_block                       = "10.43.1.0/24"
+  map_customer_owned_ip_on_launch  = true
+  vpc_id                           = "vpc-1"
+}
+`;
+
+const LOG_REQUIRED_WITH = `
+╷
+│ Error: Invalid combination of arguments
+│
+│   with aws_subnet.public,
+│   on generated_resources.tf line 3:
+│
+│ "map_customer_owned_ip_on_launch": all of \`customer_owned_ipv4_pool,map_customer_owned_ip_on_launch,outpost_arn\` must be specified
+╵
+`;
+
+{
+	const r = run(SUBNET_REQUIRED_WITH, LOG_REQUIRED_WITH);
+	check(
+		'"all of ... must be specified" still drops what it quotes',
+		!/map_customer_owned_ip_on_launch/.test(r.config),
+		r.config
+	);
+	check('and the rest of the resource stays', /cidr_block\s+= "10.43.1.0\/24"/.test(r.config), r.config);
+}
+
+// And `only one of ... can be specified` -- both present, one too many -- also
+// still drops. Three phrasings, one word apart, two of them droppable.
+const CONFLITO = `resource "aws_instance" "web" {
+  availability_zone    = "mx-central-1a"
+  availability_zone_id = "mxc1-az1"
+}
+`;
+
+const LOG_CONFLITO = `
+╷
+│ Error: Invalid combination of arguments
+│
+│   with aws_instance.web,
+│   on generated_resources.tf line 2:
+│
+│ "availability_zone_id": only one of \`availability_zone,availability_zone_id\` can be specified
+╵
+`;
+
+{
+	const r = run(CONFLITO, LOG_CONFLITO);
+	check('"only one of ... can be specified" still drops', !/availability_zone_id/.test(r.config), r.config);
+	check('and keeps the side it did not name', /availability_zone\s+= "mx-central-1a"/.test(r.config), r.config);
+}
+
+// A name the provider blames that is not in the draft is now said out loud
+// instead of being reported as a drop that happened.
+{
+	const r = run(SUBNET_REQUIRED_WITH, LOG_REQUIRED_WITH.replace('map_customer_owned_ip_on_launch"', 'nao_existe"'));
+	check(
+		'a blamed attribute that is not in the draft is named as such',
+		/not in the draft/.test(r.out),
+		r.out
+	);
+}
+
 fs.rmSync(TMP, { recursive: true, force: true });
+
 console.log(failures === 0 ? '\n✅ ALL CASES PASSED' : `\n❌ ${failures} CASE(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

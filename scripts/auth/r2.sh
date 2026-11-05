@@ -66,23 +66,116 @@ r2_state_needs_credentials() {
 # escreve nada -- falha três camadas adiante, no PutObject.
 # Filtro dos grupos de permissão que servem para escrever OBJETO no R2.
 #
-# `R2 Storage`, e não só `R2`: a conta expõe também `Workers R2 Data Catalog
-# Write`, que é o catálogo de dados (Iceberg/SQL) e não o armazenamento. Um
-# filtro por "R2" + "write" pega esse primeiro -- foi o que aconteceu, e o
-# token saiu com permissão para a coisa errada.
+# The object groups by their exact names, and not every group with `R2 Storage`
+# in the name. That filter also took `Workers R2 Storage Write`, which can create
+# and delete any bucket of the account, while a state only reads, writes and
+# lists objects. Five groups went into every token, as the run logs show.
 #
 # Leitura JUNTO da escrita, e não só escrita: o `aws_s3_object` faz HeadObject
 # em todo refresh para comparar o etag. Sem leitura, o primeiro `plan` sobre um
 # objeto já existente para em AccessDenied.
 R2_PG_FILTER='.result[]
-  | select(.name | test("R2 Storage"; "i"))
-  | select(.name | test("catalog"; "i") | not)
-  | select(.name | test("write|edit|read"; "i"))'
+  | select(.name == "Workers R2 Storage Bucket Item Read"
+        or .name == "Workers R2 Storage Bucket Item Write")'
 
 r2_storage_permission_groups() {
     local account_id=$1
     curl -sf -X GET "$CF_API/accounts/${account_id}/tokens/permission_groups" \
         -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}"
+}
+
+# The bucket with this logical name, read from the generated Terraform.
+r2_bucket_name() {
+    local logico=$1
+    awk -v alvo="\"cloudflare_r2_bucket\" \"$logico\"" '
+        index($0, alvo) { dentro = 1 }
+        dentro && /^[[:space:]]*name[[:space:]]*=/ {
+            gsub(/.*=[[:space:]]*"|"[[:space:]]*$/, ""); print; exit
+        }
+        dentro && /^}/ { exit }
+    ' *.tf 2>/dev/null
+}
+
+# Every bucket this state reaches through the R2 credential, one name per line.
+# It prints nothing when the list cannot be told for certain, because the token is
+# limited to this list and a bucket left out is one the state cannot write to.
+#
+# It reads the blocks that use `aws.r2` and not every `bucket =` of the folder: the
+# Terraform backend has a `bucket =` too, and that one is an S3 bucket.
+#
+# A bucket in a jurisdiction has another resource key, and the endpoint the
+# generator writes does not reach it, so that case stays with the wider scope.
+r2_state_buckets() {
+    if grep -q 'jurisdiction' *.tf 2>/dev/null; then
+        return 0
+    fi
+
+    local expressions
+    expressions=$(awk '
+        /^(resource|data|module) / { dentro = 1; alias_r2 = 0; bucket = "?" }
+        dentro && /^[[:space:]]*provider[[:space:]]*=[[:space:]]*aws\.r2[[:space:]]*$/ { alias_r2 = 1 }
+        dentro && /^[[:space:]]*bucket[[:space:]]*=/ {
+            bucket = $0
+            sub(/^[^=]*=[[:space:]]*/, "", bucket)
+            sub(/[[:space:]]*$/, "", bucket)
+        }
+        dentro && /^}/ {
+            if (alias_r2) print bucket
+            dentro = 0
+        }
+    ' *.tf 2>/dev/null | sort -u)
+    [ -n "$expressions" ] || return 0
+
+    local expression name names=""
+    while IFS= read -r expression; do
+        if ! [[ "$expression" =~ ^cloudflare_r2_bucket\.([A-Za-z0-9_-]+)(\.name)?$ ]]; then
+            return 0
+        fi
+        name=$(r2_bucket_name "${BASH_REMATCH[1]}")
+        if ! [[ "$name" =~ ^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$ ]]; then
+            return 0
+        fi
+        names="${names}${name}"$'\n'
+    done <<<"$expressions"
+
+    printf '%s' "$names"
+}
+
+# The HTTP status of a bucket in the Cloudflare API.
+r2_bucket_status() {
+    local account_id=$1 bucket=$2
+    curl -s -o /dev/null -w '%{http_code}' \
+        "$CF_API/accounts/${account_id}/r2/buckets/${bucket}" \
+        -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}"
+}
+
+# The `resources` of the token, as JSON: the buckets of this state, when all of
+# them are known and exist. The other case is every bucket of the account, still
+# with object permissions only. The first apply of a state lands there, because
+# its bucket does not exist when the token is created, and the Cloudflare
+# documentation does not say a token can name a bucket that does not exist yet.
+#
+# Built with printf and not jq: r2_state_buckets only lets through valid bucket
+# names, and this way the tests of this function need no jq.
+r2_token_resources() {
+    local account_id=$1 buckets bucket json=""
+    buckets=$(r2_state_buckets)
+
+    if [ -n "$buckets" ]; then
+        while IFS= read -r bucket; do
+            if [ "$(r2_bucket_status "$account_id" "$bucket")" != "200" ]; then
+                json=""
+                break
+            fi
+            json="${json:+${json},}\"com.cloudflare.edge.r2.bucket.${account_id}_default_${bucket}\":\"*\""
+        done <<<"$buckets"
+    fi
+
+    if [ -n "$json" ]; then
+        echo "{${json}}"
+    else
+        echo "{\"com.cloudflare.api.account.${account_id}\":{\"com.cloudflare.edge.r2.bucket.*\":\"*\"}}"
+    fi
 }
 
 # Cunha o par e exporta. Falha alto: seguir sem credencial faria o apply parar
@@ -113,11 +206,15 @@ r2_mint_ephemeral_credentials() {
     local expires_on
     expires_on=$(date -u -d '+1 hour' '+%Y-%m-%dT%H:%M:%SZ')
 
+    local resources
+    resources=$(r2_token_resources "$account_id")
+    echo "   Token scope: ${resources}"
+
     local payload
     payload=$(jq -n \
         --arg name "struct8-r2-${RUN_TAG:-manual}" \
         --argjson pg "$pg_json" \
-        --arg acc "com.cloudflare.api.account.${account_id}" \
+        --argjson resources "$resources" \
         --arg exp "$expires_on" \
         '{
             name: $name,
@@ -125,7 +222,7 @@ r2_mint_ephemeral_credentials() {
             policies: [{
                 effect: "allow",
                 permission_groups: $pg,
-                resources: { ($acc): "*" }
+                resources: $resources
             }]
         }')
 
@@ -184,13 +281,7 @@ r2_target_bucket() {
              | head -1 | sed 's/.*cloudflare_r2_bucket\.//')
     [ -z "$logico" ] && return 0
 
-    awk -v alvo="\"cloudflare_r2_bucket\" \"$logico\"" '
-        index($0, alvo) { dentro = 1 }
-        dentro && /^[[:space:]]*name[[:space:]]*=/ {
-            gsub(/.*=[[:space:]]*"|"[[:space:]]*$/, ""); print; exit
-        }
-        dentro && /^}/ { exit }
-    ' *.tf 2>/dev/null
+    r2_bucket_name "$logico"
 }
 
 # How long to wait for a new credential. Measured on 58 tokens of MainCDNStruct8,

@@ -36,9 +36,10 @@ if [ ! -f "$R2" ]; then
   exit 1
 fi
 
-# Só as duas funções, sem executar o resto do arquivo.
+# Só as funções, sem executar o resto do arquivo.
 eval "$(sed -n '/^r2_state_needs_credentials()/,/^}/p' "$R2")"
 eval "$(sed -n '/^r2_target_bucket()/,/^}/p' "$R2")"
+eval "$(sed -n '/^r2_bucket_name()/,/^}/p' "$R2")"
 
 falhas=0
 ok() { echo "  ok    $1"; }
@@ -231,6 +232,168 @@ confere "permissao negada" 1 "continuing anyway, Terraform decides"
 #     says `does not exist`, which the wait must not read as a token not known yet.
 espera "NoSuchBucket"
 confere "bucket ainda nao existe" "$REQUIRED" "does not exist yet"
+
+echo
+echo "r2.sh -- alcance do token"
+echo
+
+cat > "$fake/bin/curl" <<'FAKE'
+#!/usr/bin/env bash
+# Answers the three calls of r2.sh to the Cloudflare API. $R2_FAKE/missing lists
+# the buckets that answer 404, and $R2_FAKE/down makes every bucket answer 000.
+url="" data=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    http*) url=$1 ;;
+    --data) data=$2; shift ;;
+  esac
+  shift
+done
+case "$url" in
+  */r2/buckets/*)
+    bucket=${url##*/}
+    if [ -f "$R2_FAKE/down" ]; then echo -n 000
+    elif grep -qx "$bucket" "$R2_FAKE/missing" 2>/dev/null; then echo -n 404
+    else echo -n 200; fi
+    ;;
+  */tokens/permission_groups)
+    cat "$R2_FAKE/groups"
+    ;;
+  */tokens)
+    echo "$data" > "$R2_FAKE/payload"
+    echo '{"success": true, "result": {"id": "token-id", "value": "token-value"}}'
+    ;;
+esac
+FAKE
+chmod +x "$fake/bin/curl"
+
+# The names the account exposed in run 41929200221, and the catalog group the
+# first version of the filter took by mistake.
+cat > "$fake/groups" <<'GROUPS'
+{"result": [
+  {"id": "item-read", "name": "Workers R2 Storage Bucket Item Read"},
+  {"id": "item-write", "name": "Workers R2 Storage Bucket Item Write"},
+  {"id": "metadata", "name": "Workers R2 Storage Metadata Read"},
+  {"id": "admin-read", "name": "Workers R2 Storage Read"},
+  {"id": "admin-write", "name": "Workers R2 Storage Write"},
+  {"id": "catalog", "name": "Workers R2 Data Catalog Write"}
+]}
+GROUPS
+
+objeto_r2() {
+  printf 'resource "aws_s3_object" "%s" {\n  provider = aws.r2\n  bucket   = %s\n  key      = "a"\n}\n\n' "$1" "$2"
+}
+bucket_r2() {
+  printf 'resource "cloudflare_r2_bucket" "%s" {\n  name = %s\n}\n\n' "$1" "$2"
+}
+
+novo_state() {
+  rm -rf "$tf"
+  tf=$(mktemp -d)
+  rm -f "$fake/missing" "$fake/down" "$fake/payload"
+}
+
+# Prints what `r2_token_resources conta` answers in the state folder.
+alcance() {
+  (
+    source "$R2"
+    export R2_FAKE="$fake" PATH="$fake/bin:$PATH" CLOUDFLARE_API_TOKEN=base
+    cd "$tf"
+    r2_token_resources conta
+  )
+}
+
+CONTA_TODA='{"com.cloudflare.api.account.conta":{"com.cloudflare.edge.r2.bucket.*":"*"}}'
+tem_alcance() {
+  local nome=$1 esperado=$2 veio
+  veio=$(alcance)
+  [ "$veio" = "$esperado" ] \
+    && ok "$nome" \
+    || falha "$nome" "esperava $esperado, veio $veio"
+}
+
+# 12. The shape of MainCDNStruct8. The backend's `bucket =` is an S3 bucket and
+#     stays out, and the bucket no object uses stays out too.
+novo_state
+{
+  printf 'terraform {\n  backend "s3" {\n    bucket = "cloudan-v2-cicd"\n  }\n}\n\n'
+  objeto_r2 assets 'cloudflare_r2_bucket.auth-app.name'
+  bucket_r2 auth-app '"struct8-auth-app"'
+  bucket_r2 templates '"struct8-templates-files"'
+} > "$tf/misc.tf"
+tem_alcance "um bucket, sem o do backend" \
+  '{"com.cloudflare.edge.r2.bucket.conta_default_struct8-auth-app":"*"}'
+
+# 13. `r2_target_bucket` answers only the first bucket, which is enough for a
+#     probe. Objects in two buckets need both in the token.
+novo_state
+{
+  objeto_r2 a 'cloudflare_r2_bucket.um.name'
+  objeto_r2 b 'cloudflare_r2_bucket.dois.name'
+  bucket_r2 um '"bucket-um"'
+  bucket_r2 dois '"bucket-dois"'
+} > "$tf/misc.tf"
+tem_alcance "dois buckets" \
+  '{"com.cloudflare.edge.r2.bucket.conta_default_bucket-dois":"*","com.cloudflare.edge.r2.bucket.conta_default_bucket-um":"*"}'
+
+# 14. The bucket does not exist yet: the first apply of a state. The object
+#     permissions stay, over every bucket of the account.
+echo bucket-dois > "$fake/missing"
+tem_alcance "bucket que ainda nao existe" "$CONTA_TODA"
+
+# 15. The API could not answer. Same thing, and not a broken token.
+rm -f "$fake/missing"
+touch "$fake/down"
+tem_alcance "API de buckets fora do ar" "$CONTA_TODA"
+
+# 16. Anything that does not give a certain list takes the wider scope, because a
+#     bucket left out of the token is a bucket the state cannot write to.
+novo_state
+{ objeto_r2 a '"bucket-literal"'; bucket_r2 um '"bucket-um"'; } > "$tf/misc.tf"
+tem_alcance "objeto com o nome do bucket escrito direto" "$CONTA_TODA"
+
+novo_state
+{
+  objeto_r2 a 'cloudflare_r2_bucket.um.name'
+  bucket_r2 um '"bucket-um"'
+  printf 'resource "aws_s3_bucket_cors_configuration" "c" {\n  provider = aws.r2\n}\n'
+} > "$tf/misc.tf"
+tem_alcance "outro recurso pelo mesmo provider, sem bucket" "$CONTA_TODA"
+
+novo_state
+{ objeto_r2 a 'cloudflare_r2_bucket.um.name'; bucket_r2 um 'var.nome'; } > "$tf/misc.tf"
+tem_alcance "nome de bucket que nao e texto" "$CONTA_TODA"
+
+novo_state
+{
+  objeto_r2 a 'cloudflare_r2_bucket.um.name'
+  printf 'resource "cloudflare_r2_bucket" "um" {\n  name         = "bucket-um"\n  jurisdiction = "eu"\n}\n'
+} > "$tf/misc.tf"
+tem_alcance "bucket em jurisdicao" "$CONTA_TODA"
+
+# 17. The whole request, which needs jq. The hosted runner has it, and a machine
+#     without it says so here instead of passing in silence.
+if command -v jq >/dev/null 2>&1; then
+  novo_state
+  { objeto_r2 a 'cloudflare_r2_bucket.um.name'; bucket_r2 um '"bucket-um"'; } > "$tf/misc.tf"
+  (
+    set -eo pipefail
+    source "$R2"
+    export R2_FAKE="$fake" PATH="$fake/bin:$PATH" CLOUDFLARE_API_TOKEN=base
+    cd "$tf"
+    r2_mint_ephemeral_credentials conta "[teste]"
+  ) >/dev/null
+  grupos=$(jq -c '[.policies[0].permission_groups[].id] | sort' "$fake/payload")
+  [ "$grupos" = '["item-read","item-write"]' ] \
+    && ok "o token leva so os grupos de objeto" \
+    || falha "grupos do token" "veio $grupos"
+  chaves=$(jq -c '.policies[0].resources' "$fake/payload")
+  [ "$chaves" = '{"com.cloudflare.edge.r2.bucket.conta_default_bucket-um":"*"}' ] \
+    && ok "o token leva so o bucket do state" \
+    || falha "alcance do token" "veio $chaves"
+else
+  echo "  PULADO o pedido inteiro ao Cloudflare, sem jq nesta maquina"
+fi
 
 rm -rf "$fake" "$tf"
 

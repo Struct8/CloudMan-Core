@@ -200,6 +200,7 @@ function stripDecoration(text) {
  */
 function attributesBlamedBy(log) {
 	const doomed = new Map();
+	const exclusive = new Map();
 
 	// Grouped on the `Error:` lines themselves, not on the box Terraform draws
 	// around a diagnostic: that frame is for a terminal and is absent from a
@@ -240,14 +241,16 @@ function attributesBlamedBy(log) {
 		// Only the quoted one, never the other side: each side arrives as its own
 		// diagnostic, so a pair is never dropped on one message.
 		//
-		// LIMIT, on `ExactlyOneOf`. Both sides do then get dropped, one per
-		// diagnostic, and exactly one of them was required. The next round says
-		// `one of ...` must be specified, nothing is left to drop, and the series
-		// ends without a draft -- visibly, in the log, which is the failure this
-		// is willing to have. It does not arise from a generated draft: config
-		// generation fills one side with the account's value and the other with
-		// the type's zero, and pass 1 removes the zero before this ever runs. A
-		// draft with both sides really filled has not been seen.
+		// `ExactlyOneOf` ("only one of ... can be specified") is decided after
+		// this loop, against the draft: see `resolveExactlyOne`. Config generation
+		// fills one side with the account's value and the other with the type's
+		// zero, and pass 1 removes only an empty string, list or map, so a numeric
+		// zero reaches this pass. Dropping what each diagnostic quoted then took
+		// both sides, one per diagnostic, and the next round said `one of ...`
+		// must be specified with nothing left to drop. Measured on 2026-11-07, an
+		// EKS node group read on the AWS provider 6.72.0:
+		// `update_config { max_unavailable = 1, max_unavailable_percentage = 0 }`
+		// lost both, and the draft never planned.
 		// `"filename": one of `filename,image_uri,s3_bucket` must be specified` is
 		// the SDK saying one of a set is MISSING -- `AtLeastOneOf`, and
 		// `ExactlyOneOf` when none of them was given. What it quotes is not wrong,
@@ -291,13 +294,82 @@ function attributesBlamedBy(log) {
 			if (echoed) attrs.add(echoed[1]);
 		}
 
+		const onlyOne = /:\s*only one of\s+`([^`]+)`\s+can be specified/.exec(body);
+		if (onlyOne) {
+			// The set comes back as paths (`update_config.0.max_unavailable`), and
+			// a line of the draft carries the last segment.
+			const members = onlyOne[1]
+				.split(',')
+				.map((name) => name.trim().split('.').pop())
+				.filter(Boolean);
+			const sets = exclusive.get(at[1]) ?? [];
+			sets.push({ members, blamed: attrs });
+			exclusive.set(at[1], sets);
+			continue;
+		}
+
 		if (attrs.size === 0) continue;
 		const already = doomed.get(at[1]) ?? new Set();
 		for (const a of attrs) already.add(a);
 		doomed.set(at[1], already);
 	}
 
-	return doomed;
+	return { doomed, exclusive };
+}
+
+/** The zero of a number, a boolean or a string, as config generation writes it. */
+function isZeroLiteral(text) {
+	return /^(-?0+(\.0+)?|false|""|null)$/.test(text.trim());
+}
+
+/**
+ * Every `name = value` the draft holds, per resource address, nested blocks
+ * included, as written.
+ *
+ * @returns Map<"aws_eks_node_group.ng", Map<"max_unavailable", ["1"]>>
+ */
+function valuesInDraft() {
+	const values = new Map();
+	walk((line, ctx) => {
+		if (ctx.container !== 'resource' && ctx.container !== 'block') return line;
+		if (containerFor(line)) return line;
+		const assigned = /^\s*([A-Za-z_][A-Za-z0-9_-]*)\s*=\s*(.*?)\s*,?\s*$/.exec(line);
+		if (!assigned) return line;
+		const held = values.get(ctx.address) ?? new Map();
+		held.set(assigned[1], [...(held.get(assigned[1]) ?? []), assigned[2]]);
+		values.set(ctx.address, held);
+		return line;
+	});
+	return values;
+}
+
+/**
+ * What an "only one of" diagnostic drops, decided against the draft.
+ *
+ * When some sides of the set hold the type's zero and the others a value, the
+ * zeros go and the values stay: the zero is what config generation writes for
+ * an attribute the account left unset, and the value is the account's answer.
+ * Otherwise (every side filled, or every side zero) what the diagnostics
+ * quoted goes, as before: nothing here tells which side the account meant.
+ *
+ * @param doomed Map<address, Set<attribute>>, added to in place
+ * @param exclusive Map<address, [{ members, blamed }]>
+ */
+function resolveExactlyOne(doomed, exclusive) {
+	if (exclusive.size === 0) return;
+	const values = valuesInDraft();
+	for (const [address, sets] of exclusive) {
+		const held = values.get(address) ?? new Map();
+		const drop = doomed.get(address) ?? new Set();
+		for (const { members, blamed } of sets) {
+			const present = members.filter((name) => held.has(name));
+			const zeros = present.filter((name) => held.get(name).every(isZeroLiteral));
+			const filled = present.filter((name) => !zeros.includes(name));
+			const pick = zeros.length > 0 && filled.length > 0 ? zeros : [...blamed];
+			for (const name of pick) drop.add(name);
+		}
+		if (drop.size > 0) doomed.set(address, drop);
+	}
 }
 
 let result;
@@ -324,7 +396,8 @@ if (!logPath) {
 		console.error(`sanitize: no such log file: ${logPath}`);
 		process.exit(1);
 	}
-	const doomed = attributesBlamedBy(fs.readFileSync(logPath, 'utf-8'));
+	const { doomed, exclusive } = attributesBlamedBy(fs.readFileSync(logPath, 'utf-8'));
+	resolveExactlyOne(doomed, exclusive);
 	if (doomed.size === 0) {
 		console.error('sanitize: the plan errors name no attribute this can drop');
 		process.exit(1);

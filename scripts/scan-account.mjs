@@ -413,8 +413,8 @@ const readOne = async (row, onThrottle) => {
 	// `KeyName`, which names its key pair, out of it.
 	//
 	// `aws:autoscaling:groupName` is the tag AWS stamps on what an auto scaling
-	// group launched, and it is visible here and here only. Marked the way the
-	// NAT gateway's address is (`ownedBy`), so Struct8 drops the row knowingly:
+	// group launched, and it is visible here and here only. Marked `ownedBy`, so
+	// Struct8 drops the row knowingly:
 	// adopting the instance would hand Terraform a resource the group replaces
 	// at will. Measured 2026-09-10 on 952133486861/us-west-2, three instances of
 	// `web-server-asg` offered as resources of their own.
@@ -1182,18 +1182,37 @@ for (const igw of aws('ec2', 'describe-internet-gateways', igwFilter)?.InternetG
 	});
 }
 
+// THE ADDRESS A NAT GATEWAY HOLDS IS A ROW OF ITS OWN, not one the NAT owns.
+// Struct8's NAT gateway takes `allocation_id` from a drawn Elastic IP wired to
+// it, and the compile refuses a zonal public NAT without one
+// (`nat_zonal_without_eip`). This used to mark the address `ownedBy` the NAT, on
+// the belief that the compile wrote it back as `eip_<nat>`; it has not done that
+// since 2026-09-19, so the import drew the NAT without its address and the
+// compile refused it. Measured on 952133486861/us-west-2, 2026-11-08
+// (eks-import-lab).
+//
+// ITS TAGS COME FROM `describe-addresses`, one call for the addresses of every
+// NAT in the region: `NatGatewayAddresses` carries none, and without them the
+// address was named after its allocation id while the account had `Name` on it.
+// A refused call costs only the tags: the rows are pushed either way.
 const natFilter = vpcIds.length ? ['--filter', `Name=vpc-id,Values=${vpcIds.join(',')}`] : [];
+const natAddresses = [];
 for (const nat of aws('ec2', 'describe-nat-gateways', natFilter)?.NatGateways ?? []) {
 	push(`arn:aws:ec2:${region}:${nat.OwnerId ?? ''}:natgateway/${nat.NatGatewayId}`, {
 		tags: tagsOf(nat.Tags),
 		vpcId: nat.VpcId
 	});
-	// The address the gateway holds. Struct8 drops it -- the compile writes it
-	// back as `eip_<nat>` -- but it is reported so the drop is visible.
 	for (const address of nat.NatGatewayAddresses ?? []) {
-		if (!address.AllocationId) continue;
-		push(`arn:aws:ec2:${region}:${nat.OwnerId ?? ''}:elastic-ip/${address.AllocationId}`, {
-			ownedBy: nat.NatGatewayId
+		if (address.AllocationId) natAddresses.push({ owner: nat.OwnerId ?? '', allocationId: address.AllocationId });
+	}
+}
+if (natAddresses.length) {
+	const allocationIds = [...new Set(natAddresses.map((a) => a.allocationId))];
+	const described = aws('ec2', 'describe-addresses', ['--allocation-ids', ...allocationIds])?.Addresses ?? [];
+	const tagsByAllocation = new Map(described.map((a) => [a.AllocationId, tagsOf(a.Tags)]));
+	for (const { owner, allocationId } of natAddresses) {
+		push(`arn:aws:ec2:${region}:${owner}:elastic-ip/${allocationId}`, {
+			tags: tagsByAllocation.get(allocationId) ?? {}
 		});
 	}
 }
@@ -1297,7 +1316,7 @@ for (const group of aws('ec2', 'describe-security-groups', vpcFilter)?.SecurityG
 // destroy. Marking rather than dropping is the same division the rest of this file
 // keeps: the engine reports what the account holds, Struct8 decides what it
 // accepts, and `ownedBy` is the field it already reads to drop a row knowingly --
-// the NAT's address above arrives the same way.
+// an instance an Auto Scaling group launched arrives the same way.
 //
 // IT HAS TO BE MARKED HERE because nothing else can see it: Cloud Control's
 // `GetResource` for `AWS::Events::Rule` answers `EventBusName, EventPattern,

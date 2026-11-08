@@ -188,6 +188,10 @@ const ANSWERS = {
 			]
 		}
 	],
+	// The NAT's answer carries no tags for its address; this is where they are.
+	'ec2 describe-addresses': [
+		{ Addresses: [{ AllocationId: 'eipalloc-0ded', Tags: [{ Key: 'Name', Value: 'hub-nat-eip' }] }] }
+	],
 	'ec2 describe-route-tables': [
 		{
 			RouteTables: [
@@ -593,9 +597,14 @@ try {
 		'the subnet carries its vpcId, which the sweep cannot answer',
 		out.items.find((i) => i.arn?.endsWith('subnet/subnet-a'))?.vpcId === 'vpc-0703'
 	);
+	// The NAT reads its address from a drawn Elastic IP, so the address is a row of
+	// its own. Marked `ownedBy`, it was dropped and the NAT compiled without one.
+	const natAddress = out.items.find((i) => i.arn?.endsWith('elastic-ip/eipalloc-0ded'));
+	check("the NAT's address is a row of its own, owned by nothing", natAddress && natAddress.ownedBy == null, JSON.stringify(natAddress));
 	check(
-		"the NAT's address came marked as owned, so Struct8 can drop it knowingly",
-		out.items.find((i) => i.arn?.endsWith('elastic-ip/eipalloc-0ded'))?.ownedBy === 'nat-0bce'
+		'and it carries the tags describe-addresses answered, so it is named by its Name',
+		natAddress?.tags?.Name === 'hub-nat-eip',
+		JSON.stringify(natAddress)
 	);
 
 	// --------------------------------------------------------------- layer 2
@@ -801,6 +810,12 @@ try {
 	check(
 		'the NAT gateway uses --filter, singular, which is what that API takes',
 		calls.some((c) => c.startsWith('ec2 describe-nat-gateways') && c.includes('--filter Name=vpc-id'))
+	);
+	check(
+		"the NAT's address tags were asked for by allocation id, in one call",
+		calls.filter((c) => c.startsWith('ec2 describe-addresses')).length === 1 &&
+			calls.some((c) => c.startsWith('ec2 describe-addresses') && c.includes('--allocation-ids eipalloc-0ded')),
+		JSON.stringify(calls.filter((c) => c.startsWith('ec2 describe-addresses')))
 	);
 } finally {
 	fs.rmSync(dir, { recursive: true, force: true });
@@ -1278,6 +1293,39 @@ try {
 	check('while the row itself still carries no arn', store?.arn == null, JSON.stringify(store));
 } finally {
 	fs.rmSync(dir5, { recursive: true, force: true });
+}
+
+// ------------------------------------- the NAT's address, when its tags are refused
+//
+// `describe-addresses` is asked only for the tags. A role that cannot read them
+// costs the name, not the row: the address is still pushed, and the refusal is
+// on the error list Struct8 shows beside what was found.
+const dir6 = fs.mkdtempSync(path.join(os.tmpdir(), 'struct8-scan-eip-'));
+try {
+	const stubEip = stub.replace(
+		`const __ANSWERS = ${JSON.stringify(ANSWERS)};`,
+		`const __ANSWERS = ${JSON.stringify({ ...ANSWERS, 'ec2 describe-addresses': 'THROWS' })};`
+	);
+	if (stubEip === stub) {
+		check('the address-run stub was built from the same shape as the main one', false);
+	}
+	fs.writeFileSync(path.join(dir6, 'scan-account.mjs'), patched(stubEip));
+	fs.writeFileSync(
+		path.join(dir6, 'scan_scope.json'),
+		JSON.stringify({ region: R, vpcIds: ['vpc-0703'], tagFilters: [], cfnTypes: ['AWS::Lambda::Function'] })
+	);
+	execFileSync('node', ['scan-account.mjs'], { cwd: dir6, encoding: 'utf-8', stdio: 'pipe' });
+
+	const out6 = JSON.parse(fs.readFileSync(path.join(dir6, 'scan_inventory.json'), 'utf-8'));
+	const address = out6.items.find((i) => i.arn?.endsWith('elastic-ip/eipalloc-0ded'));
+	check("with its tags refused, the NAT's address is still in the inventory", !!address && address.ownedBy == null, JSON.stringify(address));
+	check(
+		'and the refusal is reported',
+		out6.errors.some((e) => e.source === 'ec2 describe-addresses'),
+		JSON.stringify(out6.errors)
+	);
+} finally {
+	fs.rmSync(dir6, { recursive: true, force: true });
 }
 
 console.log(failures === 0 ? '\nALL CASES PASSED' : `\n${failures} CASE(S) FAILED`);

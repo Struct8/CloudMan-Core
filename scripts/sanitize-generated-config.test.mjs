@@ -437,6 +437,51 @@ const LOG_CONFLITO = `
 	check('and keeps the side it did not name', /availability_zone\s+= "mx-central-1a"/.test(r.config), r.config);
 }
 
+// `ExactlyOneOf` with one side at the type's zero: the zero goes, the account's
+// value stays. Config generation writes both sides of the pair, and pass 1 does
+// not take a numeric zero. Before this, each diagnostic dropped what it quoted,
+// both sides went, and the next round asked for one of them with nothing left
+// to drop: an EKS node group read on the AWS provider 6.72.0, 2026-11-07. The
+// message wraps over several lines, and the attribute comes as a path.
+const NODE_GROUP = `resource "aws_eks_node_group" "ng" {
+  cluster_name = "eksimp-cluster"
+  update_config {
+    max_unavailable            = 1
+    max_unavailable_percentage = 0
+  }
+}
+`;
+
+const exactlyOneLog = (echo) =>
+	['max_unavailable', 'max_unavailable_percentage']
+		.map(
+			(name, i) => `
+╷
+│ Error: Invalid combination of arguments
+│
+│   with aws_eks_node_group.ng,
+│   on generated_resources.tf line ${4 + i}, in resource "aws_eks_node_group" "ng":
+${echo ? `│    ${4 + i}:     ${name} = ${i === 0 ? 1 : 0}` : '│   (source code not available)'}
+│
+│ "update_config.0.${name}": only one of
+│ \`update_config.0.max_unavailable,update_config.0.max_unavailable_percentage\`
+│ can be specified, but
+│ \`update_config.0.max_unavailable,update_config.0.max_unavailable_percentage\`
+│ were specified.
+╵
+`
+		)
+		.join('');
+
+for (const echo of [true, false]) {
+	const r = run(NODE_GROUP, exactlyOneLog(echo));
+	const when = echo ? 'with the source line in the log' : 'on the first run, with no source line';
+	check(`"only one of": the zero side is dropped, ${when}`, !/max_unavailable_percentage/.test(r.config), r.config);
+	check(`"only one of": the side the account answered stays, ${when}`, /max_unavailable\s+= 1/.test(r.config), r.config);
+	check(`"only one of": the block stays, ${when}`, /update_config \{/.test(r.config), r.config);
+	check(`"only one of": exit 0, so the loop validates again, ${when}`, r.code === 0, r.out);
+}
+
 // A name the provider blames that is not in the draft is now said out loud
 // instead of being reported as a drop that happened.
 {

@@ -33,10 +33,10 @@ const ENGINE_ACTION = resolve(ROOT, process.env.ENGINE_ACTION || '.github/action
 /** engine.yml spelling -> action spelling. The only differences allowed. */
 const SUBSTITUTIONS = [
 	['secrets.GITHUB_TOKEN', 'github.token'],
-	// A caller of another organization passes its secrets as STRUCT8_SECRETS; the
-	// action has them in secrets_json either way.
-	['secrets.STRUCT8_SECRETS || toJSON(secrets)', 'inputs.secrets_json'],
-	['toJSON(secrets)', 'inputs.secrets_json'],
+	// Each secret slot engine.yml declares is an input of the action.
+	[/secrets\.STRUCT8_SECRET_(\d+)\b/g, 'inputs.struct8_secret_$1'],
+	// The previous transport, one JSON object, until no caller passes it.
+	['secrets.STRUCT8_SECRETS', 'inputs.secrets_json'],
 ];
 
 let pass = 0;
@@ -164,6 +164,36 @@ console.log('\nthe inputs');
 	const used = new Set([...actionSteps.flat().join('\n').matchAll(/inputs\.([A-Za-z0-9_]+)/g)].map((m) => m[1]));
 	for (const name of used) {
 		check(`'inputs.${name}' used by a step is declared`, actionInputs.has(name));
+	}
+}
+
+console.log('\nthe secrets engine.yml reads are the ones it declares');
+{
+	// A called workflow receives only the secrets it declares; reading another
+	// one resolves to an empty string, with no error anywhere.
+	const declared = defaultsAfter(engineLines, '    secrets:', 6);
+	const rawSteps = listAfter(engineLines, '    steps:', 6).flat().join('\n');
+	const read = new Set([...rawSteps.matchAll(/secrets\.([A-Za-z0-9_]+)/g)].map((m) => m[1]));
+	read.delete('GITHUB_TOKEN');
+	for (const name of read) {
+		check(`secrets.${name} is declared in on.workflow_call.secrets`, declared.has(name));
+	}
+	for (let n = 1; n <= 10; n++) {
+		check(`slot STRUCT8_SECRET_${n} is declared and read`, declared.has(`STRUCT8_SECRET_${n}`) && read.has(`STRUCT8_SECRET_${n}`));
+	}
+}
+
+console.log('\nno file hands the engine every secret of the repository');
+{
+	// toJSON(secrets) is every secret of the caller in one value: what Struct8
+	// has no use for, what every code scanner flags, and what GitHub held the
+	// runs of public repositories for. Comments may still name it.
+	for (const [label, lines] of [
+		['engine.yml', engineLines],
+		['the action', actionLines],
+	]) {
+		const left = lines.filter(meaningful).filter((line) => /toJSON\(\s*secrets\s*\)/.test(line));
+		check(`${label} has no toJSON(secrets)`, left.length === 0, left.join('\n       '));
 	}
 }
 

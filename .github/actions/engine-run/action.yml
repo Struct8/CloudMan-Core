@@ -14,18 +14,20 @@
 # THE STEPS ARE engine.yml's, ONE FOR ONE
 #
 # Same names, same order, same commands, same `if:`. The reasoning behind each
-# step lives in the comments of engine.yml and is not repeated here. Two
+# step lives in the comments of engine.yml and is not repeated here. These
 # substitutions, because a composite action cannot read the `secrets` context:
 #
-#   secrets.GITHUB_TOKEN  ->  github.token          (the same token)
-#   toJSON(secrets)       ->  inputs.secrets_json   (the caller passes toJSON(secrets))
+#   secrets.GITHUB_TOKEN        ->  github.token               (the same token)
+#   secrets.STRUCT8_SECRET_<n>  ->  inputs.struct8_secret_<n>  (the caller passes each secret by name)
+#   secrets.STRUCT8_SECRETS     ->  inputs.secrets_json        (the previous transport, until no caller uses it)
 #
 # `scripts/engine-run-parity.test.mjs` fails when the two lists differ in
 # anything else, so a change to a step of engine.yml lands here in the same
 # commit. A composite action does not export its inputs as INPUT_* variables,
-# so the secrets reach the pipeline step only through SECRETS_CONTEXT, which
-# pipeline.sh takes out of the environment of every child process, as it does
-# on GitHub's machine.
+# so the secrets reach the pipeline step only through the step's environment,
+# which the step clears before pipeline.sh runs, and through SECRETS_CONTEXT,
+# which pipeline.sh takes out of the environment of every child process, as it
+# does on GitHub's machine.
 #
 # WHAT DIFFERS ON THAT RUNNER, AND WHERE IT IS HANDLED
 #
@@ -47,6 +49,8 @@
 #       inputs:
 #         stage: { type: string, required: false, default: dev }
 #         runner_project: { type: string, required: true }
+#       secrets:
+#         AUTH_CLOUDFLARE_X: { required: false }
 #   permissions: { id-token: write, contents: write, actions: read }
 #   jobs:
 #     deploy:
@@ -55,7 +59,11 @@
 #         - uses: Struct8/cloudman-core/.github/actions/engine-run@<channel>
 #           with:
 #             stage: ${{ inputs.stage }}
-#             secrets_json: ${{ toJSON(secrets) }}
+#             secret_names: '{"STRUCT8_SECRET_1":"AUTH_CLOUDFLARE_X"}'
+#             struct8_secret_1: ${{ secrets.AUTH_CLOUDFLARE_X }}
+#
+# One slot per secret Struct8 created in the repository, and none when there is
+# no such secret. The other secrets of the repository never reach this job.
 #
 # The AWS role accepts that job only when its stack has
 # AllowLocalEngineWorkflow=true (CloudFrontTemplate/TerraformBackend.yml in
@@ -82,12 +90,50 @@ inputs:
       meaning and default as the engine.yml input.
     required: false
     default: "main"
+  secret_names:
+    description: >-
+      Which secret of the calling repository each struct8_secret_<n> input
+      holds, as a JSON object of slot to secret name. Same meaning and default
+      as the engine.yml input.
+    required: false
+    default: ""
+  struct8_secret_1:
+    description: The secret in slot 1. A composite action cannot read the secrets context, so the caller passes each value.
+    required: false
+  struct8_secret_2:
+    description: The secret in slot 2.
+    required: false
+  struct8_secret_3:
+    description: The secret in slot 3.
+    required: false
+  struct8_secret_4:
+    description: The secret in slot 4.
+    required: false
+  struct8_secret_5:
+    description: The secret in slot 5.
+    required: false
+  struct8_secret_6:
+    description: The secret in slot 6.
+    required: false
+  struct8_secret_7:
+    description: The secret in slot 7.
+    required: false
+  struct8_secret_8:
+    description: The secret in slot 8.
+    required: false
+  struct8_secret_9:
+    description: The secret in slot 9.
+    required: false
+  struct8_secret_10:
+    description: The secret in slot 10.
+    required: false
   secrets_json:
     description: >-
-      toJSON(secrets) of the calling workflow. The manifest names secrets that
-      cannot be declared in advance, and a composite action cannot read the
-      secrets context.
-    required: true
+      The previous transport: every secret of the calling workflow as one JSON
+      object. Read only when secret_names is empty, for the workflows written
+      before the slots.
+    required: false
+    default: ""
 
 outputs:
   manifest_path:
@@ -244,15 +290,54 @@ runs:
       env:
         GH_CLONE_TOKEN: ${{ steps.gatekeeper.outputs.token || github.token }}
         LOGIN_REGION: ${{ inputs.default_region || 'us-east-1' }}
-        SECRETS_CONTEXT: ${{ inputs.secrets_json }}
+        SECRET_NAMES: ${{ inputs.secret_names }}
+        STRUCT8_SECRET_1: ${{ inputs.struct8_secret_1 }}
+        STRUCT8_SECRET_2: ${{ inputs.struct8_secret_2 }}
+        STRUCT8_SECRET_3: ${{ inputs.struct8_secret_3 }}
+        STRUCT8_SECRET_4: ${{ inputs.struct8_secret_4 }}
+        STRUCT8_SECRET_5: ${{ inputs.struct8_secret_5 }}
+        STRUCT8_SECRET_6: ${{ inputs.struct8_secret_6 }}
+        STRUCT8_SECRET_7: ${{ inputs.struct8_secret_7 }}
+        STRUCT8_SECRET_8: ${{ inputs.struct8_secret_8 }}
+        STRUCT8_SECRET_9: ${{ inputs.struct8_secret_9 }}
+        STRUCT8_SECRET_10: ${{ inputs.struct8_secret_10 }}
+        STRUCT8_SECRETS_JSON: ${{ inputs.secrets_json }}
         GH_TOKEN: ${{ github.token }}   # >>> NOVO — autentica o `gh run view` do backstop (camada 4)
         MANIFEST_PATH_INPUT: ${{ steps.manifest_check.outputs.manifest_path }}
       run: |
-        # secrets_json is an input, not a secret: each value is masked here,
-        # before the pipeline runs, as engine.yml does for STRUCT8_SECRETS.
+        # The inputs are not secrets to the runner: each value is masked by the
+        # loop below, before the pipeline runs, as in engine.yml.
+        if [ -n "$SECRET_NAMES" ]; then
+          if ! jq -e 'type == "object"' <<<"$SECRET_NAMES" >/dev/null 2>&1; then
+            echo "❌ The workflow's secret_names input is not a JSON object of slot to secret name."
+            exit 1
+          fi
+          SECRETS_CONTEXT='{}'
+          while IFS=$'\t' read -r slot name; do
+            case "$slot" in
+              STRUCT8_SECRET_[1-9]|STRUCT8_SECRET_10) ;;
+              *)
+                echo "❌ The workflow's secret_names input names the slot '$slot'. The slots are STRUCT8_SECRET_1 to STRUCT8_SECRET_10."
+                exit 1
+                ;;
+            esac
+            if ! [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+              echo "❌ The workflow's secret_names input gives $slot the name '$name', which is not a GitHub secret name."
+              exit 1
+            fi
+            [ -n "${!slot}" ] || continue
+            SECRETS_CONTEXT=$(jq -c --arg name "$name" --arg slot "$slot" '. + {($name): $ENV[$slot]}' <<<"$SECRETS_CONTEXT")
+          done < <(jq -r 'to_entries[] | [.key, (.value | tostring)] | @tsv' <<<"$SECRET_NAMES")
+        elif [ -n "$STRUCT8_SECRETS_JSON" ]; then
+          SECRETS_CONTEXT="$STRUCT8_SECRETS_JSON"
+        else
+          SECRETS_CONTEXT='{}'
+        fi
         jq -r '.[] | strings' <<<"$SECRETS_CONTEXT" | while IFS= read -r line; do
           if [ -n "$line" ]; then echo "::add-mask::$line"; fi
         done
+        unset SECRET_NAMES STRUCT8_SECRETS_JSON STRUCT8_SECRET_1 STRUCT8_SECRET_2 STRUCT8_SECRET_3 STRUCT8_SECRET_4 STRUCT8_SECRET_5 STRUCT8_SECRET_6 STRUCT8_SECRET_7 STRUCT8_SECRET_8 STRUCT8_SECRET_9 STRUCT8_SECRET_10
+        export SECRETS_CONTEXT
         bash .struct8-engine/scripts/pipeline.sh
     - name: 📤 Publish Engine Output
       if: always() && steps.manifest_check.outputs.skip != 'true' && steps.manifest_check.outputs.action != 'traffic'

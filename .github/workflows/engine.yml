@@ -36,13 +36,65 @@ on:
         required: false
         type: string
         default: "main"
+      secret_names:
+        # Which secret of the caller's repository each STRUCT8_SECRET_<n> slot
+        # below holds, as a JSON object: {"STRUCT8_SECRET_1":"AUTH_CLOUDFLARE_X"}.
+        # Names, never values, so it is an input and not a secret. Empty when the
+        # caller passes no secret.
+        required: false
+        type: string
+        default: ""
     secrets:
+      # THE ENGINE RECEIVES ONLY THE SECRETS STRUCT8 CREATED, EACH ONE BY NAME.
+      #
+      # `secrets: inherit` passes nothing when the caller's repository is in
+      # another organization, and every customer's repository is, so the secrets
+      # the manifest names (a Cloudflare API token, for one) never reached the
+      # engine. A named secret crosses organizations. But a called workflow can
+      # only receive the secrets it declares, and the names the manifest uses
+      # (AUTH_CLOUDFLARE_<account>, one per Cloudflare account) cannot be listed
+      # here in advance.
+      #
+      # So this file declares fixed slots, and the caller says in `secret_names`
+      # which of its secrets fills each one. The workflow Struct8 writes into the
+      # customer's repository names each secret literally:
+      #
+      #   secrets:
+      #     STRUCT8_SECRET_1: ${{ secrets.AUTH_CLOUDFLARE_X }}
+      #   with:
+      #     secret_names: '{"STRUCT8_SECRET_1":"AUTH_CLOUDFLARE_X"}'
+      #
+      # The rest of the caller's secrets never reach this job. Until 2026-11-09
+      # the caller passed `toJSON(secrets)`, every secret of the repository in one
+      # value: that exposed what Struct8 has no use for, every code scanner flags
+      # it, and GitHub held the runs of public repositories for approval
+      # (docs/segredos-do-workflow-gitops-plano.md in the app repository).
+      STRUCT8_SECRET_1:
+        required: false
+      STRUCT8_SECRET_2:
+        required: false
+      STRUCT8_SECRET_3:
+        required: false
+      STRUCT8_SECRET_4:
+        required: false
+      STRUCT8_SECRET_5:
+        required: false
+      STRUCT8_SECRET_6:
+        required: false
+      STRUCT8_SECRET_7:
+        required: false
+      STRUCT8_SECRET_8:
+        required: false
+      STRUCT8_SECRET_9:
+        required: false
+      STRUCT8_SECRET_10:
+        required: false
       STRUCT8_SECRETS:
-        # The caller's secrets as one JSON object (`${{ toJSON(secrets) }}`).
-        # `secrets: inherit` passes nothing when the caller's repository is in
-        # another organization, and every customer's repository is, so the
-        # secrets the manifest names (a Cloudflare API token, for one) never
-        # reached the engine. A named secret crosses organizations.
+        # The previous transport: the caller's secrets as one JSON object. Read
+        # only when `secret_names` is empty, for the workflows written before the
+        # slots. Remove it when no customer workflow passes it any more: passing a
+        # secret this file does not declare makes the caller invalid, and no run
+        # starts.
         required: false
   workflow_dispatch:
   push:
@@ -420,20 +472,79 @@ jobs:
           # Mesma lógica de fallback aqui para o clone dentro do script
           GH_CLONE_TOKEN: ${{ steps.gatekeeper.outputs.token || secrets.GITHUB_TOKEN }}
           LOGIN_REGION: ${{ inputs.default_region || 'us-east-1' }}
-          # STRUCT8_SECRETS when the caller passes it; otherwise the secrets a
-          # caller of this organization inherits, as before.
-          SECRETS_CONTEXT: ${{ secrets.STRUCT8_SECRETS || toJSON(secrets) }}
+          # The secrets of this run: the slots the caller filled, and which of
+          # its secrets each slot holds (see `secrets:` at the top). The step
+          # below turns them into SECRETS_CONTEXT and removes them from the
+          # environment before the pipeline starts.
+          SECRET_NAMES: ${{ inputs.secret_names }}
+          STRUCT8_SECRET_1: ${{ secrets.STRUCT8_SECRET_1 }}
+          STRUCT8_SECRET_2: ${{ secrets.STRUCT8_SECRET_2 }}
+          STRUCT8_SECRET_3: ${{ secrets.STRUCT8_SECRET_3 }}
+          STRUCT8_SECRET_4: ${{ secrets.STRUCT8_SECRET_4 }}
+          STRUCT8_SECRET_5: ${{ secrets.STRUCT8_SECRET_5 }}
+          STRUCT8_SECRET_6: ${{ secrets.STRUCT8_SECRET_6 }}
+          STRUCT8_SECRET_7: ${{ secrets.STRUCT8_SECRET_7 }}
+          STRUCT8_SECRET_8: ${{ secrets.STRUCT8_SECRET_8 }}
+          STRUCT8_SECRET_9: ${{ secrets.STRUCT8_SECRET_9 }}
+          STRUCT8_SECRET_10: ${{ secrets.STRUCT8_SECRET_10 }}
+          # Workflows written before the slots pass one JSON object instead.
+          STRUCT8_SECRETS_JSON: ${{ secrets.STRUCT8_SECRETS }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # >>> NOVO — autentica o `gh run view` do backstop (camada 4)
           # >>> O manifest_path vem por env, nao inline, para nao interpolar valor
           # do GitHub direto no shell (evita injecao via conteudo do caminho).
           MANIFEST_PATH_INPUT: ${{ steps.manifest_check.outputs.manifest_path }}
         run: |
-          # The runner masks STRUCT8_SECRETS line by line, and a line of that JSON
-          # holds a key with its value, so a value printed alone would show in
-          # the log. Each value is masked here, before the pipeline runs.
+          # SECRETS_CONTEXT: a JSON object of secret name -> value, which is what
+          # pipeline.sh and scripts/auth/*.sh read. Built here, in this file, and
+          # not in a script: the scripts are checked out at the channel the
+          # manifest names, which can be another one than this file's, and a
+          # channel that predates the slots would not have the script.
+          #
+          # From the slots when the caller names them. Each name must be one a
+          # GitHub secret can have, and each slot one this file declares; anything
+          # else stops the run before a state is touched. An empty slot is left
+          # out, as a secret the repository does not have was left out of
+          # toJSON(secrets), so the pipeline reports it missing as before.
+          #
+          # The values reach jq through its environment ($ENV), never as a
+          # command-line argument, which other processes on the machine can read.
+          if [ -n "$SECRET_NAMES" ]; then
+            if ! jq -e 'type == "object"' <<<"$SECRET_NAMES" >/dev/null 2>&1; then
+              echo "❌ The workflow's secret_names input is not a JSON object of slot to secret name."
+              exit 1
+            fi
+            SECRETS_CONTEXT='{}'
+            while IFS=$'\t' read -r slot name; do
+              case "$slot" in
+                STRUCT8_SECRET_[1-9]|STRUCT8_SECRET_10) ;;
+                *)
+                  echo "❌ The workflow's secret_names input names the slot '$slot'. The slots are STRUCT8_SECRET_1 to STRUCT8_SECRET_10."
+                  exit 1
+                  ;;
+              esac
+              if ! [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+                echo "❌ The workflow's secret_names input gives $slot the name '$name', which is not a GitHub secret name."
+                exit 1
+              fi
+              [ -n "${!slot}" ] || continue
+              SECRETS_CONTEXT=$(jq -c --arg name "$name" --arg slot "$slot" '. + {($name): $ENV[$slot]}' <<<"$SECRETS_CONTEXT")
+            done < <(jq -r 'to_entries[] | [.key, (.value | tostring)] | @tsv' <<<"$SECRET_NAMES")
+          elif [ -n "$STRUCT8_SECRETS_JSON" ]; then
+            SECRETS_CONTEXT="$STRUCT8_SECRETS_JSON"
+          else
+            SECRETS_CONTEXT='{}'
+          fi
+          # A secret is masked in the log as a whole value. The JSON object above
+          # is not a secret, so each value in it is masked here, before the
+          # pipeline runs.
           jq -r '.[] | strings' <<<"$SECRETS_CONTEXT" | while IFS= read -r line; do
             if [ -n "$line" ]; then echo "::add-mask::$line"; fi
           done
+          # The slots leave the environment here: terraform, every provider and
+          # every local-exec would inherit them otherwise. pipeline.sh does the
+          # same for SECRETS_CONTEXT, which it reads as a shell variable.
+          unset SECRET_NAMES STRUCT8_SECRETS_JSON STRUCT8_SECRET_1 STRUCT8_SECRET_2 STRUCT8_SECRET_3 STRUCT8_SECRET_4 STRUCT8_SECRET_5 STRUCT8_SECRET_6 STRUCT8_SECRET_7 STRUCT8_SECRET_8 STRUCT8_SECRET_9 STRUCT8_SECRET_10
+          export SECRETS_CONTEXT
           bash .struct8-engine/scripts/pipeline.sh
 
       # >>> Publica o que os SCRIPTS decidiram publicar. Nada aqui sabe o que é.

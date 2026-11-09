@@ -27,6 +27,9 @@ jobs:
       - name: The engine action has the steps of engine.yml
         run: node scripts/engine-run-parity.test.mjs
 
+      - name: Only the named secret slots reach the pipeline
+        run: node scripts/secret-slots.test.mjs
+
       - name: Account scan
         run: node scripts/scan-account.test.mjs
 

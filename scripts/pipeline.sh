@@ -31,11 +31,14 @@ export LC_ALL=C.UTF-8   # >>> NOVO — garante que `grep -P` (usado no backstop 
 # ------------------------------------------------------------------------------
 # THE SECRETS STAY IN THIS SHELL AND OUT OF EVERY CHILD PROCESS.
 #
-# SECRETS_CONTEXT is `toJSON(secrets)`: every secret of the caller's repository
-# and organisation, serialised. That transport is unavoidable -- the names the
+# SECRETS_CONTEXT is a JSON object of secret name -> value. Since 2026-11-09 the
+# step that runs this script builds it from the secret slots of engine.yml, so
+# it holds only the secrets Struct8 created in the caller's repository; a
+# workflow written before the slots still passes every secret of the
+# repository in one object (`toJSON(secrets)`). Either way the names the
 # manifest asks for (AUTH_CLOUDFLARE_<account>, or a `secret_name` the customer
-# chose) cannot be declared statically in the workflow. What was not
-# unavoidable is the step's `env:` EXPORTING it: `terraform`, every provider
+# chose) are keys of this object. What was never needed is the step's `env:`
+# EXPORTING it: `terraform`, every provider
 # plugin, `git`, `aws`, `gh` and any `local-exec` a plan runs (the AWS
 # generator emits one for the ECS cleanup) inherited the whole blob.
 #

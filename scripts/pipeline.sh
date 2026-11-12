@@ -418,7 +418,7 @@ remote_backend_names() {
 # ==============================================================================
 runs_without_backend() {
     case "$1" in
-        scan|traffic) return 0 ;;
+        scan|scan_cluster|traffic) return 0 ;;
         read|import)  [ -z "$(remote_backend_names)" ] ;;
         *)            return 1 ;;
     esac
@@ -1311,6 +1311,11 @@ run_terraform_process() {
             # to initialise. It also neither reads nor writes state, which is
             # what makes it the one action here that does not need the backend.
             echo -e "${color}⏭️  ${label} Scan: no Terraform in this folder, skipping init.${NC}"
+        elif [ "$action" == "scan_cluster" ]; then
+            # The cluster scan, for the same reason as the account's: its folder
+            # holds the manifest and the scope, and the listing goes through helm
+            # and kubectl, not through Terraform.
+            echo -e "${color}⏭️  ${label} Cluster scan: no Terraform in this folder, skipping init.${NC}"
         elif [ "$action" == "traffic" ]; then
             # Same reason as scan, from the other side: the folder DOES hold
             # Terraform, but moving the traffic split does not go through it.
@@ -2065,6 +2070,19 @@ run_terraform_process() {
                         | ($a + "." + (map(tostring) | join("."))) ]
                   ' generated_resources.raw.json > generated_resources.json; then
                       rm -f generated_resources.raw.json
+                      # THE VALUES OF A HELM RELEASE, which the provider does not
+                      # flag. Importing a `helm_release` reads `metadata[0].values`,
+                      # the values it was installed with, and the filter above
+                      # follows the provider's flags, so they stay. They can hold a
+                      # password. Same refusal as above when they cannot be removed.
+                      if grep -q '"helm_release"' generated_resources.json; then
+                          if ! command -v node > /dev/null 2>&1 \
+                              || ! node "$ENGINE_PATH/scripts/redact-release-values.mjs" generated_resources.json; then
+                              rm -f generated_resources.json
+                              echo -e "${RED}❌ Critical error: could not remove the values of the Helm releases from the generated JSON; refusing to save it to the repository.${NC}"
+                              exit 1
+                          fi
+                      fi
                       echo -e "${color}✅ JSON generated successfully (sensitive values removed).${NC}"
                   else
                       # Without a trustworthy redaction NOTHING reaches the repository:
@@ -2120,6 +2138,36 @@ run_terraform_process() {
           echo -e "${color}📄 ${label} ${SCAN_COUNT} resource(s) listed, ${SCAN_ERRORS} service(s) unreadable.${NC}"
 
           touch "$GITHUB_WORKSPACE/.needs_scan_commit"
+
+        elif [ "$action" == "scan_cluster" ]; then
+          echo -e "${color}🔎 ${label} Listing the cluster...${NC}"
+
+          # The Helm releases and the namespaces of one EKS cluster, for the
+          # Kubernetes import. The scope (`cluster_scope.json`) names the
+          # cluster and its region, and the credentials are the target's, from
+          # PASSO 2: `aws eks get-token` signs in with them, and the role needs
+          # an access entry on the cluster. scan-cluster.mjs says why each step
+          # is there, and it never asks for the values of a release.
+          for tool in node helm kubectl; do
+            if ! command -v "$tool" > /dev/null 2>&1; then
+              echo -e "${RED}❌ Critical error: ${tool} is not on this runner, and the cluster scan needs it.${NC}"
+              exit 1
+            fi
+          done
+
+          rm -f cluster_inventory.json
+
+          # No `|| true`, as for the account scan: a non-zero exit means the
+          # cluster could not be read, and an empty listing must not pass for a
+          # complete one.
+          node "$ENGINE_PATH/scripts/scan-cluster.mjs" --out cluster_inventory.json
+
+          if [ ! -f cluster_inventory.json ]; then
+            echo -e "${RED}❌ Critical error: the cluster scan produced no listing file.${NC}"
+            exit 1
+          fi
+
+          touch "$GITHUB_WORKSPACE/.needs_cluster_scan_commit"
 
         elif [ "$action" == "destroy" ]; then
 
@@ -2232,7 +2280,7 @@ run_terraform_process() {
           # engine serves, and leaving one out would tell a client running an
           # older engine that the name is wrong, when what is wrong is the
           # engine version.
-          echo -e "${RED}❌ Unknown action '$action'. This engine serves: plan, drift, apply, destroy, import, read, scan, traffic, state_rm.${NC}"
+          echo -e "${RED}❌ Unknown action '$action'. This engine serves: plan, drift, apply, destroy, import, read, scan, scan_cluster, traffic, state_rm.${NC}"
           exit 1
         fi
     )

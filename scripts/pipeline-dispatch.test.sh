@@ -80,16 +80,18 @@ check "apply reaches the apply branch"      "BRANCH_2" "$(fired apply)"
 check "import reaches the draft branch"     "BRANCH_3" "$(fired import)"
 check "read reaches THE SAME branch"        "BRANCH_3" "$(fired read)"
 check "scan reaches the scan branch"        "BRANCH_4" "$(fired scan)"
-check "destroy reaches the destroy branch"  "BRANCH_5" "$(fired destroy)"
+check "scan_cluster reaches its own branch" "BRANCH_5" "$(fired scan_cluster)"
+check "destroy reaches the destroy branch"  "BRANCH_6" "$(fired destroy)"
 
 # The one that used to pass in silence.
-check "an unknown action reaches the else"  "BRANCH_6" "$(fired quietly-wrong)"
-check "an empty action reaches it too"      "BRANCH_6" "$(fired '')"
+check "an unknown action reaches the else"  "BRANCH_7" "$(fired quietly-wrong)"
+check "an empty action reaches it too"      "BRANCH_7" "$(fired '')"
+check "scan-cluster, with a hyphen, is not the cluster scan" "BRANCH_7" "$(fired scan-cluster)"
 
-# Five conditions plus the else, which is the sixth marker but not an `elif`.
+# Six conditions plus the else, which is the seventh marker but not an `elif`.
 # Here so that a branch added without a case above fails this instead of being
 # routed by an expectation nobody wrote.
-check "and the chain has exactly the five conditions this test knows about" "5" "$branch_count"
+check "and the chain has exactly the six conditions this test knows about" "6" "$branch_count"
 
 # ------------------------------------------------- the init skip, structurally
 #
@@ -99,6 +101,13 @@ check "and the chain has exactly the five conditions this test knows about" "5" 
 init_guard=$(awk '/PASSO 1: TERRAFORM INIT/{f=1} f && /PASSO 2: PREPARA/{exit} f' "$PIPELINE" \
   | grep -c 'if \[ "$action" == "scan" \]; then')
 check "a scan skips terraform init, which has nothing to initialise" "1" "$init_guard"
+
+cluster_init=$(awk '/PASSO 1: TERRAFORM INIT/{f=1} f && /PASSO 2: PREPARA/{exit} f' "$PIPELINE" \
+  | grep -c 'elif \[ "\$action" == "scan_cluster" \]; then')
+check "the cluster scan skips it too -- its folder holds no Terraform either" "1" "$cluster_init"
+
+cluster_backend=$(grep -cE '^        scan\|scan_cluster\|traffic\) return 0 ;;' "$PIPELINE")
+check "and it runs with no backend, like the account scan" "1" "$cluster_backend"
 
 traffic_init=$(awk '/PASSO 1: TERRAFORM INIT/{f=1} f && /PASSO 2: PREPARA/{exit} f' "$PIPELINE" \
   | grep -c 'elif \[ "\$action" == "traffic" \]; then')
@@ -146,8 +155,8 @@ check "the sign-in for providers left in the state sits between additional_auth 
 # The list a client reads when their engine is older than the action the app
 # sent. Naming only what the chain serves would tell them the NAME is wrong,
 # when what is old is the engine.
-serves_traffic=$(grep -c "read, scan, traffic, state_rm\." "$PIPELINE")
-check "the unknown-action message names traffic and state_rm among what is served" "1" "$serves_traffic"
+serves_traffic=$(grep -c "read, scan, scan_cluster, traffic, state_rm\." "$PIPELINE")
+check "the unknown-action message names scan_cluster, traffic and state_rm among what is served" "1" "$serves_traffic"
 
 # --------------------------------------------- the dependency lock retry
 # A readonly init refuses two different changes, and only one of them was

@@ -167,6 +167,24 @@ if [ -f "$GITHUB_WORKSPACE/.needs_scan_commit" ]; then
   fi
 fi
 
+# 1c'. THE CLUSTER SCAN'S LISTING
+#
+# The same transport as the account's inventory, for the same reason: Struct8
+# fetches it with the call that fetches generated_resources. It holds the Helm
+# releases and the namespaces of one cluster, and never the values of a release
+# (scan-cluster.mjs does not ask for them).
+if [ -f "$GITHUB_WORKSPACE/.needs_cluster_scan_commit" ]; then
+  echo "🔎 Cluster scan finished. Saving the listing to the repository..."
+  compress_alongside cluster_inventory.json
+  git add -- '*cluster_inventory.json' '*cluster_inventory.json.gz'
+
+  if ! git diff --staged --quiet; then
+    git commit -m "chore: cluster scan listing awaiting CloudMan review [skip ci]"
+    push_with_retry "cluster scan listing"
+    echo "✅ Cluster scan listing pushed to the repository."
+  fi
+fi
+
 # 1d. THE DEPENDENCY LOCK
 #
 # `.terraform.lock.hcl` beside a state's main.tf: the checksums of the

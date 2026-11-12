@@ -13,7 +13,7 @@
 // Usage:
 //   node scripts/scan-cluster.test.mjs
 
-import { readScope, scanCluster } from './scan-cluster.mjs';
+import { PLATFORMS, readScope, scanCluster } from './scan-cluster.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -28,7 +28,7 @@ function check(label, condition, detail) {
 }
 
 const KUBECONFIG = '/tmp/struct8-cluster-test/kubeconfig';
-const SCOPE = { cluster: 'k8simp-cluster', region: 'us-west-2', requestId: 'req-1' };
+const SCOPE = { platform: 'eks', cluster: 'k8simp-cluster', region: 'us-west-2', requestId: 'req-1' };
 
 // `helm list -A -o json`: chart and version joined into one string.
 const HELM_LIST = [
@@ -86,7 +86,7 @@ function fakeRun({ failMetadataOf = null, failList = null, failKubeconfig = null
 	const { run, calls } = fakeRun();
 	const out = scanCluster(SCOPE, run, KUBECONFIG);
 
-	check('the scope is echoed: cluster, region and the request it answers', out.cluster === 'k8simp-cluster' && out.region === 'us-west-2' && out.requestId === 'req-1', JSON.stringify(out).slice(0, 200));
+	check('the scope is echoed: platform, cluster, region and the request it answers', out.platform === 'eks' && out.cluster === 'k8simp-cluster' && out.region === 'us-west-2' && out.requestId === 'req-1', JSON.stringify(out).slice(0, 200));
 	check('every release is listed', out.releases.length === 4, JSON.stringify(out.releases));
 
 	const eso = out.releases.find((r) => r.name === 'external-secrets');
@@ -174,12 +174,52 @@ function fakeRun({ failMetadataOf = null, failList = null, failKubeconfig = null
 {
 	let error = null;
 	try {
-		scanCluster({ region: 'us-west-2' }, fakeRun().run, KUBECONFIG);
+		scanCluster({ platform: 'eks', region: 'us-west-2' }, fakeRun().run, KUBECONFIG);
 	} catch (e) {
 		error = e;
 	}
 	check('a scope with no cluster name ends the scan before calling anything', /No cluster name/.test(error?.message ?? ''), error?.message);
 }
+
+// --------------------------------------------------------------- the platform
+{
+	const { run, calls } = fakeRun();
+	let error = null;
+	try {
+		scanCluster({ cluster: 'k8simp-cluster', region: 'us-west-2' }, run, KUBECONFIG);
+	} catch (e) {
+		error = e;
+	}
+	check('a scope that names no platform is not taken for an EKS cluster', /No platform/.test(error?.message ?? '') && calls.length === 0, `${error?.message} / ${calls.length} call(s)`);
+}
+{
+	const { run, calls } = fakeRun();
+	let error = null;
+	try {
+		scanCluster({ ...SCOPE, platform: 'k3s' }, run, KUBECONFIG);
+	} catch (e) {
+		error = e;
+	}
+	check(
+		'a platform this engine does not know ends the scan before calling anything, and names the ones it knows',
+		/Unknown platform 'k3s': this engine reaches eks./.test(error?.message ?? '') && calls.length === 0,
+		`${error?.message} / ${calls.length} call(s)`
+	);
+}
+{
+	let error = null;
+	try {
+		scanCluster({ ...SCOPE, platform: 'toString' }, fakeRun().run, KUBECONFIG);
+	} catch (e) {
+		error = e;
+	}
+	check('a name inherited by every object is not a platform', /Unknown platform 'toString'/.test(error?.message ?? ''), error?.message);
+}
+check(
+	'every platform says how to write its kubeconfig and what to do on a refusal',
+	Object.values(PLATFORMS).every((p) => typeof p.kubeconfig === 'function' && p.label && p.noAccess),
+	Object.keys(PLATFORMS).join(', ')
+);
 
 // ------------------------------------------------------------------ the scope
 {
@@ -188,8 +228,8 @@ function fakeRun({ failMetadataOf = null, failList = null, failKubeconfig = null
 	fs.writeFileSync(file, JSON.stringify(SCOPE));
 	const fromFile = readScope([], file);
 	check('the scope comes from cluster_scope.json', JSON.stringify(fromFile) === JSON.stringify(SCOPE), JSON.stringify(fromFile));
-	const fromFlags = readScope(['--cluster', 'other', '--region', 'eu-west-1'], file);
-	check('and the flags override it', fromFlags.cluster === 'other' && fromFlags.region === 'eu-west-1' && fromFlags.requestId === 'req-1', JSON.stringify(fromFlags));
+	const fromFlags = readScope(['--platform', 'other-platform', '--cluster', 'other', '--region', 'eu-west-1'], file);
+	check('and the flags override it', fromFlags.platform === 'other-platform' && fromFlags.cluster === 'other' && fromFlags.region === 'eu-west-1' && fromFlags.requestId === 'req-1', JSON.stringify(fromFlags));
 	fs.rmSync(dir, { recursive: true, force: true });
 }
 

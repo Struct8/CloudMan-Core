@@ -23,10 +23,17 @@
 // nothing in this file.
 //
 // CREDENTIALS. Whatever the caller set up: pipeline.sh runs this after PASSO 2,
-// with `AWS_PROFILE=target` exported, as for the account scan. The cluster is
-// reached through a kubeconfig that `aws eks update-kubeconfig` writes in a
-// temporary file; its user runs `aws eks get-token` with that same profile. The
+// signed in to the cloud of the target, as for the account scan. The cluster is
+// reached through a kubeconfig written in a temporary file by the command of its
+// PLATFORM (`PLATFORMS` below), whose user takes a token under that same sign-in.
+// On EKS that is `aws eks update-kubeconfig` with `AWS_PROFILE=target`, and the
 // role needs an access entry on the cluster, or every call answers Unauthorized.
+//
+// Only the kubeconfig and the advice on a refusal depend on the platform: what is
+// listed, Helm releases and namespaces, reads the same on any cluster. A platform
+// is one entry of `PLATFORMS`, and Struct8 sends only the ones it has an entry
+// for too (src/lib/import/providers/clusterPlatforms.ts in the frontend
+// repository; its gate test-k8s-cluster-scan-contract.mjs checks the two lists).
 //
 // FAILURE. A release whose metadata cannot be read is recorded in `errors` and
 // left out, and the rest is listed. A cluster that cannot be reached, or a list
@@ -34,10 +41,11 @@
 // listing passing for a complete one is the worst outcome this action has.
 //
 // SCOPE. Read from `cluster_scope.json` in the working directory, which Struct8
-// pushes next to the manifest: `{ cluster, region, requestId }`. Flags override it.
+// pushes next to the manifest: `{ platform, cluster, region, requestId }`. Flags
+// override it.
 //
 // Usage:
-//   node scan-cluster.mjs [--cluster k8simp-cluster] [--region us-west-2]
+//   node scan-cluster.mjs [--platform eks] [--cluster k8simp-cluster] [--region us-west-2]
 //                         [--out cluster_inventory.json] [--request-id abc]
 
 import { execFileSync } from 'node:child_process';
@@ -61,11 +69,28 @@ function messageOf(error) {
 	return text.split('\n').slice(0, 5).join('\n');
 }
 
+/**
+ * How a cluster is reached, per platform. The scope names one by its key.
+ *
+ *   label       the platform's name, in a message.
+ *   kubeconfig  the command that writes the kubeconfig to `file`, as [command, args],
+ *               under the sign-in the run already holds.
+ *   noAccess    what a person does when the cluster refuses that sign-in.
+ */
+export const PLATFORMS = {
+	eks: {
+		label: 'EKS cluster',
+		kubeconfig: ({ cluster, region }, file) => [
+			'aws',
+			['eks', 'update-kubeconfig', '--name', cluster, '--region', region, '--kubeconfig', file]
+		],
+		noAccess: 'The role this run signs in with has no access to the cluster: give it an access entry on the EKS cluster.'
+	}
+};
+
 /** Why the cluster could not be read, in the words a person can act on. */
-function accessHint(message) {
-	return NO_ACCESS.test(message)
-		? ' The role this run signs in with has no access to the cluster: give it an access entry on the EKS cluster.'
-		: '';
+function accessHint(message, platform) {
+	return NO_ACCESS.test(message) ? ` ${platform.noAccess}` : '';
 }
 
 /** A namespace cut to the four fields the listing carries. */
@@ -87,17 +112,24 @@ function namespaceOf(item) {
  *
  * Throws when the cluster cannot be reached or a list cannot be read.
  */
-export function scanCluster({ cluster, region, requestId = null }, run, kubeconfig) {
+export function scanCluster({ platform: platformKey, cluster, region, requestId = null }, run, kubeconfig) {
+	// No default: a scope that names no platform is not taken for an EKS cluster.
+	if (!platformKey) throw new Error('No platform: cluster_scope.json has no `platform`, and no --platform was given.');
+	const platform = Object.hasOwn(PLATFORMS, platformKey) ? PLATFORMS[platformKey] : null;
+	if (!platform) {
+		throw new Error(`Unknown platform '${platformKey}': this engine reaches ${Object.keys(PLATFORMS).join(', ')}.`);
+	}
 	if (!cluster) throw new Error('No cluster name: cluster_scope.json has no `cluster`, and no --cluster was given.');
 	if (!region) throw new Error('No region: cluster_scope.json has no `region`, and no --region was given.');
 
 	const errors = [];
 
 	try {
-		run('aws', ['eks', 'update-kubeconfig', '--name', cluster, '--region', region, '--kubeconfig', kubeconfig]);
+		const [command, args] = platform.kubeconfig({ cluster, region }, kubeconfig);
+		run(command, args);
 	} catch (error) {
 		const message = messageOf(error);
-		throw new Error(`Could not reach the EKS cluster '${cluster}' in ${region}: ${message}${accessHint(message)}`);
+		throw new Error(`Could not reach the ${platform.label} '${cluster}' in ${region}: ${message}${accessHint(message, platform)}`);
 	}
 
 	let listed;
@@ -108,7 +140,7 @@ export function scanCluster({ cluster, region, requestId = null }, run, kubeconf
 		);
 	} catch (error) {
 		const message = messageOf(error);
-		throw new Error(`Could not list the Helm releases of '${cluster}': ${message}${accessHint(message)}`);
+		throw new Error(`Could not list the Helm releases of '${cluster}': ${message}${accessHint(message, platform)}`);
 	}
 
 	const releases = [];
@@ -139,11 +171,11 @@ export function scanCluster({ cluster, region, requestId = null }, run, kubeconf
 		namespaceList = JSON.parse(run('kubectl', ['get', 'namespaces', '--output', 'json', '--kubeconfig', kubeconfig]));
 	} catch (error) {
 		const message = messageOf(error);
-		throw new Error(`Could not list the namespaces of '${cluster}': ${message}${accessHint(message)}`);
+		throw new Error(`Could not list the namespaces of '${cluster}': ${message}${accessHint(message, platform)}`);
 	}
 	const namespaces = (namespaceList?.items ?? []).filter((n) => n?.metadata?.name).map(namespaceOf);
 
-	return { version: INVENTORY_VERSION, cluster, region, requestId, releases, namespaces, errors };
+	return { version: INVENTORY_VERSION, platform: platformKey, cluster, region, requestId, releases, namespaces, errors };
 }
 
 /** The scope: the file Struct8 pushes, with the flags on top. */
@@ -159,6 +191,7 @@ export function readScope(args, file = 'cluster_scope.json') {
 		// Not fatal: running this by hand with flags behaves the same way.
 	}
 	return {
+		platform: argOf('platform') ?? scope.platform ?? null,
 		cluster: argOf('cluster') ?? scope.cluster ?? null,
 		region: argOf('region') ?? scope.region ?? null,
 		requestId: argOf('request-id') ?? scope.requestId ?? null

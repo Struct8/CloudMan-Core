@@ -1516,6 +1516,13 @@ run_terraform_process() {
                     cloudflare)
                         export CLOUDFLARE_API_TOKEN="$extra_token"
                         ;;
+                    stripe)
+                        # The stripe/stripe provider reads its key from this
+                        # variable when the provider block sets no api_key, which
+                        # is how the app writes it: a key in the block would land
+                        # in the plan file and in the logs.
+                        export STRIPE_API_KEY="$extra_token"
+                        ;;
                     *)
                         # Falha alto: seguir sem a variável faria o apply
                         # quebrar depois, com uma mensagem do provider que

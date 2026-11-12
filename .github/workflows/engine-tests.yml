@@ -39,6 +39,9 @@ jobs:
       - name: R2 credential
         run: bash scripts/auth/r2.test.sh
 
+      - name: Stripe credential
+        run: bash scripts/auth/stripe.test.sh
+
       - name: Generated configuration sanitizer
         run: node scripts/sanitize-generated-config.test.mjs
 

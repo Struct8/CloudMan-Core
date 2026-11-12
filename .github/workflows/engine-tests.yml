@@ -33,6 +33,12 @@ jobs:
       - name: Account scan
         run: node scripts/scan-account.test.mjs
 
+      - name: Kubernetes cluster scan
+        run: node scripts/scan-cluster.test.mjs
+
+      - name: Helm release values kept out of a read
+        run: node scripts/redact-release-values.test.mjs
+
       - name: Lambda source completion
         run: node scripts/complete-lambda-source.test.mjs
 

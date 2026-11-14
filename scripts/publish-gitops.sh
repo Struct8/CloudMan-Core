@@ -171,8 +171,9 @@ fi
 #
 # The same transport as the account's inventory, for the same reason: Struct8
 # fetches it with the call that fetches generated_resources. It holds the Helm
-# releases and the namespaces of one cluster, and never the values of a release
-# (scan-cluster.mjs does not ask for them).
+# releases and the namespaces of one cluster, and the objects of the namespaces
+# the scope chose; never the values of a release, the content of a Secret or the
+# Helm values of an Argo CD Application (scan-cluster.mjs leaves them out).
 if [ -f "$GITHUB_WORKSPACE/.needs_cluster_scan_commit" ]; then
   echo "🔎 Cluster scan finished. Saving the listing to the repository..."
   compress_alongside cluster_inventory.json

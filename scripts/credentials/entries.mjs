@@ -36,7 +36,7 @@ export const DELIVERY_KINDS = ['env', 'ini', 'file'];
 const METHOD_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 // An id names files of the state (the OIDC token of oidc-aws), so it holds no
 // slash and no `..`.
-const ENTRY_ID = /^[A-Za-z0-9](?:[A-Za-z0-9_-]|.(?!.)){0,99}$/;
+const ENTRY_ID = /^[A-Za-z0-9](?:[A-Za-z0-9_-]|\.(?!\.)){0,99}$/;
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const OUTPUT_NAME = /^[a-z][a-z0-9_]*$/;
 const INI_KEY = /^[A-Za-z0-9_.-]+$/;

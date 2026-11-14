@@ -311,6 +311,11 @@ console.log('▸ What an entry may hold');
 
 	const repeated = validateEntries([awsForeign, awsForeign], knownMethod);
 	check('a repeated id is refused', repeated.some((e) => e.includes('repeats the id')), repeated.join('\n'));
+
+	for (const id of ['../escape', 'aws/111', 'aws..111']) {
+		const bad = validateEntries([{ ...awsForeign, id }], knownMethod);
+		check(`an id that could name a path, ${id}, is refused`, bad.some((e) => e.includes('has an id with characters')), bad.join('\n'));
+	}
 }
 
 console.log('▸ Entries that write the same place');

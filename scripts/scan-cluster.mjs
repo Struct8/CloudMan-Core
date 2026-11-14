@@ -108,7 +108,7 @@ const APPLICATION = { apiVersion: 'argoproj.io/v1alpha1', kind: 'Application' };
 const EVERY_NAMESPACE = Symbol('every namespace');
 
 /** The text of a failed command, without the noise around it. */
-function messageOf(error) {
+export function messageOf(error) {
 	const stderr = String(error?.stderr ?? '').trim();
 	const text = stderr || String(error?.message ?? error);
 	return text.split('\n').slice(0, 5).join('\n');
@@ -134,7 +134,7 @@ export const PLATFORMS = {
 };
 
 /** Why the cluster could not be read, in the words a person can act on. */
-function accessHint(message, platform) {
+export function accessHint(message, platform) {
 	return NO_ACCESS.test(message) ? ` ${platform.noAccess}` : '';
 }
 

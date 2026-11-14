@@ -36,6 +36,9 @@ jobs:
       - name: Kubernetes cluster scan
         run: node scripts/scan-cluster.test.mjs
 
+      - name: Kubernetes chart comparison
+        run: node scripts/compare-chart.test.mjs
+
       - name: Helm release values kept out of a read
         run: node scripts/redact-release-values.test.mjs
 

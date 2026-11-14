@@ -68,3 +68,9 @@ jobs:
 
       - name: Writing the blue/green split to a CloudFront KeyValueStore
         run: bash scripts/traffic-store.test.sh
+
+      - name: Sign-in by credential entries
+        run: node scripts/credentials/credentials.test.mjs
+
+      - name: Sign-in by credential entries, in the pipeline's shell
+        run: bash scripts/credentials/sign-in.test.sh

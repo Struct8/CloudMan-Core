@@ -729,6 +729,108 @@ sign_in_providers_left_in_state() {
 }
 
 # ==============================================================================
+# THE FOLDER THAT HOLDS THE CREDENTIALS OF THE STATES.
+#
+# Under RUNNER_TEMP, which GitHub empties at the start and at the end of every
+# job, and readable by the runner's user only. Each state gets a folder of its
+# own inside it (`mktemp -d`), so two states running at the same time never
+# write the same file.
+# ==============================================================================
+credential_root() {
+    local root="${RUNNER_TEMP:-/tmp}/struct8-cred"
+    mkdir -p "$root" && chmod 700 "$root" && printf '%s' "$root"
+}
+
+# ==============================================================================
+# THE STATE'S OWN COPY OF THE AWS CLI FILES.
+#
+# auth_aws writes the state's account into the profile `target` of
+# ~/.aws/credentials, and the states of a stage run at the same time. Two AWS
+# states of different accounts wrote the same profile, and the one that wrote
+# last decided the account of both: the provider block names the profile, not
+# the account, so nothing stopped a plan or an apply in the other account.
+#
+# Each state now works on a copy of ~/.aws/credentials and ~/.aws/config, taken
+# after authenticate_backend wrote the profile `backend`, so the s3 backend
+# still finds it. AWS_SHARED_CREDENTIALS_FILE and AWS_CONFIG_FILE point the AWS
+# CLI, Terraform's AWS provider and the s3 backend at the copy, and
+# `aws configure set`, which auth_aws calls, writes into it.
+#
+# Called inside the state's subshell, so the two variables end with it. The
+# sign-in by `credentials` entries writes its files into the state's folder the
+# same way, through the deliveries the app declares, and does not call this.
+# ==============================================================================
+isolate_aws_profiles() {
+    local root dir
+    local credentials="${AWS_SHARED_CREDENTIALS_FILE:-$HOME/.aws/credentials}"
+    local config="${AWS_CONFIG_FILE:-$HOME/.aws/config}"
+    root=$(credential_root) || return 1
+    dir=$(mktemp -d "$root/aws.XXXXXX") || return 1
+    chmod 700 "$dir"
+    : > "$dir/credentials"
+    : > "$dir/config"
+    chmod 600 "$dir/credentials" "$dir/config"
+    if [ -f "$credentials" ]; then cat "$credentials" > "$dir/credentials"; fi
+    if [ -f "$config" ]; then cat "$config" > "$dir/config"; fi
+    export AWS_SHARED_CREDENTIALS_FILE="$dir/credentials"
+    export AWS_CONFIG_FILE="$dir/config"
+}
+
+# ==============================================================================
+# THE SIGN-IN OF A STATE THAT BRINGS `credentials` ENTRIES.
+#
+# The manifest lists one entry per account the state uses, the state's own among
+# them: the sign-in method (a GitHub secret, or this job's OIDC token traded with
+# AWS, Google Cloud or Azure) and where the result goes (environment variables,
+# an INI section, a file). scripts/credentials/sign-in.mjs signs in to each and
+# writes env.sh, which this function sources. The entries replace the Cloudflare
+# lookup, the `additional_auth` loop and auth_${provider} of
+# run_terraform_process; a manifest without them signs in the way it did before.
+#
+# The secrets go to Node on stdin. SECRETS_CONTEXT is kept out of the
+# environment of every child process, and an environment variable would reach
+# the `aws` and `az` the sign-in starts.
+#
+# A refusal goes to the file the app reads for the state's action, with the
+# reason sign-in.mjs wrote: a method or delivery this engine does not have, two
+# entries that write the same variable, a sign-in a cloud refused.
+#
+# Called inside the state's subshell, from the state's folder.
+# ==============================================================================
+sign_in_credentials() {
+    local path="$1" action="$2" credentials_json="$3" label="$4"
+    local root state_dir status=0
+
+    root=$(credential_root) || return 1
+    state_dir=$(mktemp -d "$root/state.XXXXXX") || return 1
+    chmod 700 "$state_dir"
+    printf '%s' "$credentials_json" > "$state_dir/credentials.json"
+
+    echo -e "${CYAN}🔑 ${label} Signing in to the accounts this state uses...${NC}"
+    printf '%s' "$SECRETS_CONTEXT" \
+        | node "$ENGINE_PATH/scripts/credentials/sign-in.mjs" "$state_dir/credentials.json" "$state_dir" "$root" \
+        || status=$?
+
+    if [ $status -ne 0 ]; then
+        {
+            if [ -s "$state_dir/failure.txt" ]; then
+                cat "$state_dir/failure.txt"
+            else
+                echo "Error: could not sign in to the accounts of this state"
+                echo ""
+                echo "The sign-in ended with status ${status}."
+            fi
+            echo "No resource was changed."
+        } | tee ./.struct8-live.log
+        publish_state_refusal "$path" "$action" "./.struct8-live.log"
+        return 1
+    fi
+
+    # shellcheck source=/dev/null
+    source "$state_dir/env.sh"
+}
+
+# ==============================================================================
 # The version of the state object in the bucket, or nothing.
 #
 # Taken before and after a removal and published with it. The bucket keeps the
@@ -1186,6 +1288,11 @@ run_terraform_process() {
     # The addresses to take out of the state, one per line, when `action` is
     # `state_rm`. Empty for every other action.
     local state_rm_addresses=${7:-}
+    # The manifest's `credentials` entries, one per account the state uses, the
+    # state's own among them. When present they replace auth_json and
+    # additional_auth for the sign-in; see sign_in_credentials. "[]" for a
+    # manifest that does not bring them.
+    local credentials_json=${8:-[]}
     local label="[$path]"
 
     local color=$BLUE
@@ -1414,8 +1521,21 @@ run_terraform_process() {
         # PASSO 2: PREPARAÇÃO DO TARGET
         # ---------------------------------------------------------
 
+        # A manifest with `credentials` entries signs in to every account the
+        # state uses here, in one step; the blocks below that sign in by
+        # provider are skipped. Without them, the state works on its own copy of
+        # the AWS CLI files before those blocks write a profile.
+        local signed_in_by_entries=0
+        if [ -n "$credentials_json" ] && [ "$credentials_json" != "[]" ] && [ "$credentials_json" != "null" ]; then
+            sign_in_credentials "$path" "$action" "$credentials_json" "$label" || exit 1
+            signed_in_by_entries=1
+        else
+            isolate_aws_profiles || { echo "❌ Error: could not copy the AWS CLI files for $path."; exit 1; }
+        fi
+
         # Cloudflare handling
         if [ "$provider" == "cloudflare" ]; then
+          if [ "$signed_in_by_entries" == "0" ]; then
             # Prioriza o secret_name vindo do manifest, se não existir, usa o fallback antigo
             local secret_key=$(echo "$auth_json" | jq -r '.secret_name // empty')
 
@@ -1432,6 +1552,7 @@ run_terraform_process() {
                 exit 1
             fi
             export CLOUDFLARE_API_TOKEN="$token"
+          fi
 
             # Escrever OBJETO no R2 não passa por este token: o conteúdo entra
             # pelo endpoint S3 da conta, que só aceita assinatura SigV4. Quando
@@ -1456,7 +1577,7 @@ run_terraform_process() {
         # `< <(...)` e não `... | while`: um pipe roda o laço em SUBSHELL,
         # e os `export` morreriam com ela -- o terraform rodaria sem os
         # tokens, sem erro nenhum no log.
-        if [ -n "$additional_auth" ] && [ "$additional_auth" != "[]" ]; then
+        if [ "$signed_in_by_entries" == "0" ] && [ -n "$additional_auth" ] && [ "$additional_auth" != "[]" ]; then
             while IFS= read -r extra; do
                 [ -z "$extra" ] && continue
                 local extra_provider=$(echo "$extra" | jq -r '.provider')
@@ -1496,6 +1617,39 @@ run_terraform_process() {
                     if ! aws sts get-caller-identity --profile "acct_${extra_acct}" > /dev/null 2>&1; then
                         echo "❌ Error: could not sign in to AWS account $extra_acct as $extra_role (required by $path)."
                         echo "   Connect that account to this GitOps workspace before deploying a state that uses resources in it."
+                        exit 1
+                    fi
+                    continue
+                fi
+
+                # Google Cloud has no secret either. The app sends the foreign
+                # project's identity under the names of a Google state's
+                # target_auth (`workload_identity_provider`, `service_account`),
+                # and the sign-in is the one a Google state does: auth_google
+                # writes the credential file and exports
+                # GOOGLE_APPLICATION_CREDENTIALS, which the google provider reads.
+                # The provider block names the project; `account_id` is only
+                # used in the messages.
+                #
+                # One credential file per run: the state's own sign-in, below,
+                # would replace this one, so the app sends no Google entry for a
+                # Google state.
+                if [ "$extra_provider" == "google" ]; then
+                    local extra_project=$(echo "$extra" | jq -r '.account_id // empty')
+                    echo "🔑 Additional credential (google): project $extra_project"
+                    AUTH_FAILURE_MESSAGE=""
+                    if ! auth_google "$extra" "target"; then
+                        {
+                            if [ -n "$AUTH_FAILURE_MESSAGE" ]; then
+                                printf '%s\n' "$AUTH_FAILURE_MESSAGE"
+                            else
+                                echo "Error: could not sign in to the Google Cloud project ${extra_project}"
+                            fi
+                            echo ""
+                            echo "This state also writes into the Google Cloud project ${extra_project}, and this was that project's sign-in."
+                            echo "No resource was changed."
+                        } | tee ./.struct8-live.log
+                        publish_state_refusal "$path" "$action" "./.struct8-live.log"
                         exit 1
                     fi
                     continue
@@ -1549,7 +1703,11 @@ run_terraform_process() {
 
         local script_file="$AUTH_SCRIPTS/${provider}.sh"
 
-        if [ -f "$script_file" ]; then
+        if [ "$signed_in_by_entries" == "1" ]; then
+            if [ "$provider" == "aws" ]; then
+                debug_auth_status "TARGET AUTH"
+            fi
+        elif [ -f "$script_file" ]; then
             echo "🔶 Authenticating $provider (target)..."
             source "$script_file"
 
@@ -2675,6 +2833,7 @@ SCH_PATH=()
 SCH_PROVIDER=()
 SCH_TARGET_AUTH=()
 SCH_ADD_AUTH=()
+SCH_CREDENTIALS=()
 SCH_ACTION=()
 SCH_TRAFFIC=()
 SCH_STATE_RM=()
@@ -2755,6 +2914,7 @@ run_dependency_schedule() {
         SCH_PROVIDER+=("$(echo "$state" | jq -r '.provider')")
         SCH_TARGET_AUTH+=("$(echo "$state" | jq -c '.target_auth')")
         SCH_ADD_AUTH+=("$(echo "$state" | jq -c '.additional_auth // []')")
+        SCH_CREDENTIALS+=("$(echo "$state" | jq -c '.credentials // []')")
         # A ação do state e o que ela precisa. Sem estas duas colunas um state
         # de tráfego seria lançado com a ação GLOBAL -- e num manifesto de
         # destroy isso é `terraform destroy` na pasta da loja de configuração,
@@ -2816,7 +2976,7 @@ run_dependency_schedule() {
                     set +e
                     run_terraform_process "$path" "${SCH_ACTION[$k]:-$ACTION}" \
                         "${SCH_TARGET_AUTH[$k]}" "${SCH_PROVIDER[$k]}" "${SCH_ADD_AUTH[$k]}" \
-                        "${SCH_TRAFFIC[$k]}" "${SCH_STATE_RM[$k]}"
+                        "${SCH_TRAFFIC[$k]}" "${SCH_STATE_RM[$k]}" "${SCH_CREDENTIALS[$k]}"
                     echo "$?" > "$SCH_DONE_DIR/$k"
                 ) &
                 SCH_PID[$k]=$!
@@ -2915,6 +3075,8 @@ for (( i=0; i<$TOTAL_STAGES; i++ )); do
         target_auth=$(echo "$state" | jq -c '.target_auth')
         # `// []` cobre o manifesto antigo, que não traz o campo.
         additional_auth=$(echo "$state" | jq -c '.additional_auth // []')
+        # The sign-in entries, when the app sends them; see sign_in_credentials.
+        credentials=$(echo "$state" | jq -c '.credentials // []')
 
         # AÇÃO DESTE STATE, quando ela difere da global.
         #
@@ -2953,7 +3115,7 @@ for (( i=0; i<$TOTAL_STAGES; i++ )); do
             # outcome to the wrong state would clear the badge of a resource that
             # is still being created.
             report_state_progress "$path" "running" "$STATE_INDEX" "$STATE_TOTAL"
-            run_terraform_process "$path" "$state_action" "$target_auth" "$provider" "$additional_auth" "$traffic" "$state_rm_addresses" &
+            run_terraform_process "$path" "$state_action" "$target_auth" "$provider" "$additional_auth" "$traffic" "$state_rm_addresses" "$credentials" &
             PAR_PIDS+=("$!")
             PAR_PATHS+=("$path")
             PAR_IDX+=("$STATE_INDEX")
@@ -2967,7 +3129,7 @@ for (( i=0; i<$TOTAL_STAGES; i++ )); do
             fi
         else
             report_state_progress "$path" "running" "$STATE_INDEX" "$STATE_TOTAL"
-            run_terraform_process "$path" "$state_action" "$target_auth" "$provider" "$additional_auth" "$traffic" "$state_rm_addresses"
+            run_terraform_process "$path" "$state_action" "$target_auth" "$provider" "$additional_auth" "$traffic" "$state_rm_addresses" "$credentials"
             if [ $? -ne 0 ]; then
                 report_state_progress "$path" "failed" "$STATE_INDEX" "$STATE_TOTAL"
                 failed=1

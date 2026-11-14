@@ -224,6 +224,9 @@ function shown(value) {
 /** Whether a change replaces the pods: anything under the pod template of a workload. */
 const touchesPodTemplate = (path) => path === 'spec.template' || path.startsWith('spec.template.') || path.startsWith('spec.template[');
 
+/** A path at or under the object's own labels or annotations (not the pod template's). */
+const isObjectLabelPath = (path) => /^metadata\.(labels|annotations)($|\.|\[)/.test(path);
+
 /**
  * Compares one document with the cluster through `run(command, args)`, which
  * returns the command's stdout or throws. The document is in `file` on disk.
@@ -232,6 +235,9 @@ const touchesPodTemplate = (path) => path === 'spec.template' || path.startsWith
  *   same        a sync leaves the object as it is;
  *   different   a sync changes the fields in `changes`; `restartsPods` when one of
  *               them is in the pod template, which replaces the pods;
+ *               `onlyAddsLabels` when every change adds a label or an annotation
+ *               to the object, and removes or changes nothing: a generator adds
+ *               labels and annotations of its own to every object it writes;
  *   absent      the cluster has no such object, and a sync creates it;
  *   refused     the API server refuses the object as the manifest writes it;
  *   not-served  the cluster does not serve the kind (a CRD that is not installed);
@@ -294,7 +300,13 @@ export function compareDocument(doc, { file, source, namespace }, run, kubeconfi
 		return out;
 	});
 	if (changes.length === 0) return { ...named, status: 'same' };
-	return { ...named, status: 'different', restartsPods: changes.some((c) => touchesPodTemplate(c.path)), changes };
+	return {
+		...named,
+		status: 'different',
+		restartsPods: changes.some((c) => touchesPodTemplate(c.path)),
+		onlyAddsLabels: changes.every((c) => c.change === 'added' && isObjectLabelPath(c.path)),
+		changes
+	};
 }
 
 /** The YAML files of the folder, in order, with their path from the working directory. */
@@ -426,7 +438,10 @@ function main() {
 			`${comparison.objects.length} object(s) compared with '${scope.cluster}' in namespace ${scope.namespace}: ${summaryOf(comparison) || 'none'}; ${comparison.errors.length} file(s) unreadable.`
 		);
 		for (const o of comparison.objects.filter((x) => x.status !== 'same')) {
-			const what = o.status === 'different' ? `${o.changes.length} field(s)${o.restartsPods ? ', replaces the pods' : ''}` : o.status;
+			const what =
+				o.status === 'different'
+					? `${o.changes.length} field(s)${o.restartsPods ? ', replaces the pods' : ''}${o.onlyAddsLabels ? ', only adds labels or annotations' : ''}`
+					: o.status;
 			console.log(`  ${o.kind}/${o.name}: ${what}`);
 		}
 		for (const e of comparison.errors) console.log(`  unreadable: ${e.source}: ${e.message}`);

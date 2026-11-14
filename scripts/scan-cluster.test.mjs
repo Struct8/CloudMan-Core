@@ -592,6 +592,38 @@ check(
 		JSON.stringify(lean)
 	);
 }
+{
+	// The keys of the last apply, so the import can tell a label a person applied from
+	// one a controller wrote. Only the keys: the annotation holds a Secret's values.
+	const applied = JSON.stringify({
+		apiVersion: 'v1',
+		kind: 'Secret',
+		metadata: { name: 'db', labels: { app: 'db' }, annotations: { 'example.com/owner': 'shop' } },
+		stringData: { DB_PASSWORD: SECRET_VALUE }
+	});
+	const secret = objectOf({
+		apiVersion: 'v1',
+		kind: 'Secret',
+		metadata: {
+			name: 'db',
+			namespace: 'app-a',
+			labels: { app: 'db', team: 'shop' },
+			annotations: { 'example.com/owner': 'shop', 'example.com/rotated': '2026-11-01', [LAST_APPLIED]: applied }
+		},
+		type: 'Opaque',
+		data: { DB_PASSWORD: Buffer.from(SECRET_VALUE).toString('base64') }
+	});
+	check(
+		'an object keeps the label and annotation keys of its last apply',
+		JSON.stringify(secret.metadata.appliedKeys) === JSON.stringify({ labels: ['app'], annotations: ['example.com/owner'] }),
+		JSON.stringify(secret.metadata)
+	);
+	check('and nothing else of that annotation', !JSON.stringify(secret).includes(SECRET_VALUE), JSON.stringify(secret));
+	const broken = objectOf({ apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: 'c', annotations: { [LAST_APPLIED]: '{not json' } }, data: {} });
+	check('an annotation that is not JSON gives no applied keys', !('appliedKeys' in broken.metadata), JSON.stringify(broken.metadata));
+	const none = objectOf({ apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: 'c', labels: { a: 'b' } }, data: {} });
+	check('nor does an object no apply wrote', !('appliedKeys' in none.metadata), JSON.stringify(none.metadata));
+}
 
 // ------------------------------------------------------------------ the scope
 {

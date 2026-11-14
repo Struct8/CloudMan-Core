@@ -20,6 +20,7 @@ import {
 	VALUE_MAX,
 	comparable,
 	compareChart,
+	compareDocument,
 	differences,
 	documentsOf,
 	identityOf,
@@ -416,6 +417,8 @@ const SCOPE = { platform: 'eks', cluster: 'k8simp-cluster', region: 'us-west-2',
 		JSON.stringify(paths(service))
 	);
 	check('a change outside a pod template does not replace the pods', service?.status === 'different' && service.restartsPods === false);
+	check('a label added beside a port removed is not only an addition of labels', service?.onlyAddsLabels === false, JSON.stringify(service));
+	check('nor is a change to the pod template', web?.onlyAddsLabels === false);
 
 	// a Secret
 	const secret = of('Secret', 'web-secret');
@@ -465,6 +468,39 @@ const SCOPE = { platform: 'eks', cluster: 'k8simp-cluster', region: 'us-west-2',
 
 	fs.rmSync(dir, { recursive: true, force: true });
 	fs.rmSync(work, { recursive: true, force: true });
+}
+
+// ------------------------------------------------------------------ only labels added
+{
+	// What a generator's own labels and sync wave do to an object that otherwise
+	// matches: the sync adds them, and removes or changes nothing.
+	const live = { apiVersion: 'v1', kind: 'ConfigMap', metadata: kept({ name: 'tags', namespace: 'app-a', labels: { app: 'web' } }), data: { a: '1' } };
+	const adds = {
+		...live,
+		metadata: kept({
+			name: 'tags',
+			namespace: 'app-a',
+			labels: { app: 'web', 'app.kubernetes.io/managed-by': 'struct8' },
+			annotations: { 'argocd.argoproj.io/sync-wave': '0' }
+		})
+	};
+	const compareWith = (merged) =>
+		compareDocument(
+			['apiVersion: v1', 'kind: ConfigMap', 'metadata:', '  name: tags', ''].join('\n'),
+			{ file: 'doc.yaml', source: 'templates/tags.yaml', namespace: 'app-a' },
+			(command, args) => JSON.stringify(args[0] === 'apply' ? merged : live),
+			'kubeconfig'
+		);
+	const added = compareWith(adds);
+	check(
+		'an object that only gains labels and annotations says so',
+		added.status === 'different' && added.onlyAddsLabels === true && added.restartsPods === false && added.changes.length === 2,
+		JSON.stringify(added)
+	);
+	const relabeled = compareWith({ ...adds, metadata: kept({ ...adds.metadata, labels: { app: 'api', 'app.kubernetes.io/managed-by': 'struct8' } }) });
+	check('a label whose value changes is not only an addition', relabeled.onlyAddsLabels === false, JSON.stringify(relabeled.changes));
+	const unlabeled = compareWith({ ...live, metadata: kept({ name: 'tags', namespace: 'app-a' }) });
+	check('nor is a label removed', unlabeled.status === 'different' && unlabeled.onlyAddsLabels === false, JSON.stringify(unlabeled.changes));
 }
 
 // ------------------------------------------------------------------ what ends the run

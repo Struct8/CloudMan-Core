@@ -39,7 +39,13 @@
 //     policy and the objects it syncs (`status.resources`);
 //   - the annotation `kubectl.kubernetes.io/last-applied-configuration`, on any
 //     object, a namespace included. `kubectl apply` writes into it the whole
-//     manifest it applied, the values of a Secret in clear text included.
+//     manifest it applied, the values of a Secret in clear text included. Of it,
+//     an object keeps only the label and annotation KEYS of that manifest
+//     (`metadata.appliedKeys`): a client-side apply, the one Argo CD runs on a
+//     sync by default, removes a label or an annotation that the last apply wrote
+//     and the next manifest leaves out, and keeps every other one. That tells the
+//     ones a person applied from the ones a controller wrote
+//     (`deployment.kubernetes.io/revision`), which no manifest should carry;
 //
 // WHAT THIS SCRIPT DOES NOT KNOW: any Struct8 type name, or which charts or kinds
 // Struct8 can draw. Struct8 decides that from its catalog and sends the kinds in
@@ -167,6 +173,25 @@ function defined(object) {
 	return Object.fromEntries(Object.entries(object).filter(([, value]) => value !== undefined));
 }
 
+/**
+ * The label and annotation keys of the manifest the last `kubectl apply` wrote, read
+ * off its annotation; undefined when there is no such annotation, it is not JSON, or
+ * it names no key. Only the keys leave this function: the annotation can hold the
+ * values of a Secret.
+ */
+function appliedKeysOf(metadata) {
+	let applied;
+	try {
+		applied = JSON.parse(metadata?.annotations?.[LAST_APPLIED] ?? 'null');
+	} catch {
+		return undefined;
+	}
+	const keysOf = (map) => (map && typeof map === 'object' && !Array.isArray(map) ? Object.keys(map) : []);
+	const labels = keysOf(applied?.metadata?.labels);
+	const annotations = keysOf(applied?.metadata?.annotations);
+	return labels.length || annotations.length ? { labels, annotations } : undefined;
+}
+
 /** The `metadata` fields a person writes; the rest is the server's own. */
 function metadataOf(metadata = {}) {
 	const owners = (metadata.ownerReferences ?? []).map(({ apiVersion, kind, name, controller }) =>
@@ -177,6 +202,7 @@ function metadataOf(metadata = {}) {
 		namespace: metadata.namespace,
 		labels: metadata.labels && Object.keys(metadata.labels).length > 0 ? metadata.labels : undefined,
 		annotations: annotationsOf(metadata),
+		appliedKeys: appliedKeysOf(metadata),
 		ownerReferences: owners.length > 0 ? owners : undefined
 	});
 }

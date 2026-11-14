@@ -2143,11 +2143,13 @@ run_terraform_process() {
           echo -e "${color}🔎 ${label} Listing the cluster...${NC}"
 
           # The Helm releases and the namespaces of one EKS cluster, for the
-          # Kubernetes import. The scope (`cluster_scope.json`) names the
-          # cluster and its region, and the credentials are the target's, from
-          # PASSO 2: `aws eks get-token` signs in with them, and the role needs
-          # an access entry on the cluster. scan-cluster.mjs says why each step
-          # is there, and it never asks for the values of a release.
+          # Kubernetes import, and the objects of the namespaces the scope
+          # chooses. The scope (`cluster_scope.json`) names the cluster, its
+          # region, the namespaces and the kinds, and the credentials are the
+          # target's, from PASSO 2: `aws eks get-token` signs in with them, and
+          # the role needs an access entry on the cluster. scan-cluster.mjs says
+          # why each step is there; it never writes the values of a release, the
+          # content of a Secret or the Helm values of an Argo CD Application.
           for tool in node helm kubectl; do
             if ! command -v "$tool" > /dev/null 2>&1; then
               echo -e "${RED}❌ Critical error: ${tool} is not on this runner, and the cluster scan needs it.${NC}"

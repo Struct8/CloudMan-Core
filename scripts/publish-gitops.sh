@@ -186,6 +186,25 @@ if [ -f "$GITHUB_WORKSPACE/.needs_cluster_scan_commit" ]; then
   fi
 fi
 
+# 1c''. THE CHART COMPARISON
+#
+# The same transport again: Struct8 fetches the result with the call that
+# fetches the listing. It holds, per object of a Kubernetes environment's
+# manifests, whether a sync would leave it as it is, change it, create it, or be
+# refused, and the fields it would change; never the value of a Secret, nor the
+# last-applied annotation that would hold one (compare-chart.mjs leaves them out).
+if [ -f "$GITHUB_WORKSPACE/.needs_chart_comparison_commit" ]; then
+  echo "🔎 Chart comparison finished. Saving the result to the repository..."
+  compress_alongside chart_comparison.json
+  git add -- '*chart_comparison.json' '*chart_comparison.json.gz'
+
+  if ! git diff --staged --quiet; then
+    git commit -m "chore: chart comparison awaiting CloudMan review [skip ci]"
+    push_with_retry "chart comparison"
+    echo "✅ Chart comparison pushed to the repository."
+  fi
+fi
+
 # 1d. THE DEPENDENCY LOCK
 #
 # `.terraform.lock.hcl` beside a state's main.tf: the checksums of the

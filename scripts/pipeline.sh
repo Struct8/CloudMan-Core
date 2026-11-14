@@ -418,7 +418,7 @@ remote_backend_names() {
 # ==============================================================================
 runs_without_backend() {
     case "$1" in
-        scan|scan_cluster|traffic) return 0 ;;
+        scan|scan_cluster|compare_chart|traffic) return 0 ;;
         read|import)  [ -z "$(remote_backend_names)" ] ;;
         *)            return 1 ;;
     esac
@@ -1423,6 +1423,11 @@ run_terraform_process() {
             # holds the manifest and the scope, and the listing goes through helm
             # and kubectl, not through Terraform.
             echo -e "${color}⏭️  ${label} Cluster scan: no Terraform in this folder, skipping init.${NC}"
+        elif [ "$action" == "compare_chart" ]; then
+            # The chart comparison, for the same reason: its folder holds the
+            # manifest, the scope and the manifests of a Kubernetes environment,
+            # and the comparison goes through kubectl, not through Terraform.
+            echo -e "${color}⏭️  ${label} Chart comparison: no Terraform in this folder, skipping init.${NC}"
         elif [ "$action" == "traffic" ]; then
             # Same reason as scan, from the other side: the folder DOES hold
             # Terraform, but moving the traffic split does not go through it.
@@ -2329,6 +2334,38 @@ run_terraform_process() {
 
           touch "$GITHUB_WORKSPACE/.needs_cluster_scan_commit"
 
+        elif [ "$action" == "compare_chart" ]; then
+          echo -e "${color}🔎 ${label} Comparing the manifests with the cluster...${NC}"
+
+          # The manifests of a Kubernetes environment, compared with the objects
+          # of one EKS cluster: for each object, whether a sync would leave it as
+          # it is, change it, create it, or be refused. The scope
+          # (`chart_compare_scope.json`) names the cluster, its region, the
+          # namespace the environment syncs into and the folder of the manifests,
+          # and the credentials are the target's, from PASSO 2, as for the cluster
+          # scan. Every apply is a server dry run: nothing in the cluster changes.
+          # compare-chart.mjs says why each step is there; it never writes the
+          # value of a Secret.
+          for tool in node kubectl; do
+            if ! command -v "$tool" > /dev/null 2>&1; then
+              echo -e "${RED}❌ Critical error: ${tool} is not on this runner, and the chart comparison needs it.${NC}"
+              exit 1
+            fi
+          done
+
+          rm -f chart_comparison.json
+
+          # No `|| true`: a non-zero exit means nothing could be compared, and an
+          # empty comparison must not pass for one that found no difference.
+          node "$ENGINE_PATH/scripts/compare-chart.mjs" --out chart_comparison.json
+
+          if [ ! -f chart_comparison.json ]; then
+            echo -e "${RED}❌ Critical error: the chart comparison produced no result file.${NC}"
+            exit 1
+          fi
+
+          touch "$GITHUB_WORKSPACE/.needs_chart_comparison_commit"
+
         elif [ "$action" == "destroy" ]; then
 
           # ANTES de destruir: depois, o state está vazio e não há mais como
@@ -2440,7 +2477,7 @@ run_terraform_process() {
           # engine serves, and leaving one out would tell a client running an
           # older engine that the name is wrong, when what is wrong is the
           # engine version.
-          echo -e "${RED}❌ Unknown action '$action'. This engine serves: plan, drift, apply, destroy, import, read, scan, scan_cluster, traffic, state_rm.${NC}"
+          echo -e "${RED}❌ Unknown action '$action'. This engine serves: plan, drift, apply, destroy, import, read, scan, scan_cluster, compare_chart, traffic, state_rm.${NC}"
           exit 1
         fi
     )

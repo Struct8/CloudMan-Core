@@ -1501,6 +1501,39 @@ run_terraform_process() {
                     continue
                 fi
 
+                # Google Cloud has no secret either. The app sends the foreign
+                # project's identity under the names of a Google state's
+                # target_auth (`workload_identity_provider`, `service_account`),
+                # and the sign-in is the one a Google state does: auth_google
+                # writes the credential file and exports
+                # GOOGLE_APPLICATION_CREDENTIALS, which the google provider reads.
+                # The provider block names the project; `account_id` is only
+                # used in the messages.
+                #
+                # One credential file per run: the state's own sign-in, below,
+                # would replace this one, so the app sends no Google entry for a
+                # Google state.
+                if [ "$extra_provider" == "google" ]; then
+                    local extra_project=$(echo "$extra" | jq -r '.account_id // empty')
+                    echo "🔑 Additional credential (google): project $extra_project"
+                    AUTH_FAILURE_MESSAGE=""
+                    if ! auth_google "$extra" "target"; then
+                        {
+                            if [ -n "$AUTH_FAILURE_MESSAGE" ]; then
+                                printf '%s\n' "$AUTH_FAILURE_MESSAGE"
+                            else
+                                echo "Error: could not sign in to the Google Cloud project ${extra_project}"
+                            fi
+                            echo ""
+                            echo "This state also writes into the Google Cloud project ${extra_project}, and this was that project's sign-in."
+                            echo "No resource was changed."
+                        } | tee ./.struct8-live.log
+                        publish_state_refusal "$path" "$action" "./.struct8-live.log"
+                        exit 1
+                    fi
+                    continue
+                fi
+
                 local extra_secret=$(echo "$extra" | jq -r '.secret_name // empty')
 
                 if [ -z "$extra_secret" ]; then

@@ -471,6 +471,17 @@ check "a refused target sign-in is published" "yes" \
   "$(grep -A 20 '"auth_${provider}" "$auth_json" "target" || AUTH_STATUS=$?' "$body" | grep -q 'publish_state_refusal' && echo yes || echo no)"
 check "a destroy of a gcs state deletes its object" "yes" "$(grep -q 'gcs_delete_object' "$body" && echo yes || echo no)"
 
+# A state of another cloud writing into a Cloud DNS zone: the manifest's
+# additional_auth carries the foreign project's identity, signed in as a target.
+google_extra_line=$(grep -n '"$extra_provider" == "google"' "$body" | head -n1 | cut -d: -f1)
+secret_line=$(grep -n "local extra_secret=" "$body" | head -n1 | cut -d: -f1)
+check "a foreign Google project signs in before any secret lookup" "yes" \
+  "$([ -n "$google_extra_line" ] && [ -n "$secret_line" ] && [ "$google_extra_line" -lt "$secret_line" ] && echo yes || echo no)"
+check "a foreign Google project signs in through auth_google as a target" "yes" \
+  "$(sed -n "${google_extra_line},+8p" "$body" | grep -q 'auth_google "$extra" "target"' && echo yes || echo no)"
+check "a refused foreign Google sign-in is published" "yes" \
+  "$(sed -n "${google_extra_line},+20p" "$body" | grep -q 'publish_state_refusal' && echo yes || echo no)"
+
 top="$(tr -d '\r' < "$PIPELINE")"
 check "pipeline.sh loads google.sh with the other sign-ins" "yes" \
   "$(grep -q '^source "$AUTH_SCRIPTS/google.sh"$' <<< "$top" && echo yes || echo no)"

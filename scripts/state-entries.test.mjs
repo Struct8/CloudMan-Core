@@ -294,6 +294,96 @@ const AWS_SOURCE = 'registry.terraform.io/hashicorp/aws';
 	);
 }
 
+// ──────────────────────────────────────────────────────────────── providers
+//
+// What the engine sends with the progress report, so the app keeps in the code
+// the provider block of every configuration the state still uses.
+
+{
+	const r = run(['providers'], INPUT);
+	check('providers answers with exit 0', r.code === 0, r.err);
+	const rows = r.json?.providers ?? [];
+	check(
+		'one row per configuration that managed resources use, the aliased one apart from the default, in source order',
+		JSON.stringify(rows.map((row) => [row.source, row.alias])) ===
+			JSON.stringify([
+				[CF_SOURCE, null],
+				[AWS_SOURCE, null],
+				[AWS_SOURCE, 'acct_123456789012']
+			]),
+		r.out
+	);
+	const aws = rows.find((row) => row.source === AWS_SOURCE && row.alias === null);
+	check(
+		'each row counts the instances and names them',
+		aws?.resources === 4 &&
+			JSON.stringify(aws?.addresses) ===
+				JSON.stringify(['aws_lambda_function.GetStageV2', 'aws_instance.a[0]', 'aws_instance.a[1]', 'aws_instance.ab']),
+		JSON.stringify(aws)
+	);
+	const aliased = rows.find((row) => row.alias === 'acct_123456789012');
+	check(
+		'a resource inside a module keeps its full address under the aliased configuration',
+		JSON.stringify(aliased?.addresses) === JSON.stringify(['module.net.aws_s3_bucket.b["logs"]']),
+		JSON.stringify(aliased)
+	);
+	check(
+		'every row carries exactly source, alias, resources and addresses',
+		rows.every((row) => JSON.stringify(Object.keys(row)) === JSON.stringify(['source', 'alias', 'resources', 'addresses'])),
+		r.out
+	);
+}
+
+{
+	const dataOnly = {
+		resources: [
+			{
+				mode: 'data',
+				type: 'google_dns_managed_zone',
+				name: 'site',
+				provider: 'provider["registry.terraform.io/hashicorp/google"].acct_site_project',
+				instances: [{ attributes: { id: 'projects/site-project/managedZones/site' } }]
+			}
+		]
+	};
+	const r = run(['providers'], JSON.stringify(dataOnly));
+	check(
+		'a configuration used only by data sources is left out -- they leave the state without it',
+		r.code === 0 && JSON.stringify(r.json) === JSON.stringify({ providers: [] }),
+		r.out
+	);
+}
+
+{
+	const many = {
+		resources: [
+			{
+				mode: 'managed',
+				type: 'aws_route53_record',
+				name: 'r',
+				provider: 'provider["registry.terraform.io/hashicorp/aws"].acct_444455556666',
+				instances: Array.from({ length: 60 }, (_, i) => ({ index_key: i, attributes: { id: `r${i}` } }))
+			}
+		]
+	};
+	const r = run(['providers'], JSON.stringify(many));
+	const row = r.json?.providers?.[0];
+	check(
+		'the addresses stop at 50 and the count stays whole',
+		row?.resources === 60 && row?.addresses?.length === 50 && row?.addresses?.[49] === 'aws_route53_record.r[49]',
+		JSON.stringify(row)
+	);
+}
+
+{
+	const r = run(['providers'], '');
+	check(
+		'a state that was never written uses no configuration',
+		r.code === 0 && JSON.stringify(r.json) === JSON.stringify({ providers: [] }),
+		`${r.code} ${r.out}`
+	);
+}
+
 // ────────────────────────────────────────── nothing but the whitelist leaves
 
 for (const args of [
@@ -301,7 +391,8 @@ for (const args of [
 	['provider-use', AWS_SOURCE],
 	['missing', 'aws_lambda_function.GetStageV2', 'x.y'],
 	['resolve', 'aws_lambda_function.GetStageV2', 'module.net'],
-	['list']
+	['list'],
+	['providers']
 ]) {
 	const r = run(args, INPUT);
 	check(

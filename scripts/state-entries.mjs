@@ -13,16 +13,23 @@
 //                           per line. Nothing when every one names something.
 //   resolve <addr>...       JSON: the resource instances the addresses name.
 //   list                    JSON: every resource instance.
+//   providers               JSON: each provider configuration -- source and
+//                           alias -- that managed resources of the state use,
+//                           with how many and their addresses. The engine
+//                           sends it with the progress report, and the app
+//                           keeps in the code the provider block of every
+//                           configuration on the list.
 //
 // Usage:
 //   terraform state pull | node state-entries.mjs provider-use registry.terraform.io/cloudflare/cloudflare
 //   terraform state pull | node state-entries.mjs missing aws_s3_bucket.logs
 //   terraform state pull | node state-entries.mjs resolve aws_s3_bucket.logs
 //   terraform state pull | node state-entries.mjs list
+//   terraform state pull | node state-entries.mjs providers
 //
 // THE STATE NEVER TOUCHES THE DISK. It carries every attribute of every
 // resource, secrets included, and it comes in on stdin. What goes out is a
-// whitelist: address, mode, type, provider, id, and Cloudflare account
+// whitelist: address, mode, type, provider, alias, id, and Cloudflare account
 // identifiers. That is the same rule `_publish_state_manifest` follows for the
 // file the app reads.
 //
@@ -167,6 +174,37 @@ function list(state) {
 	return { serial: state.serial ?? null, lineage: state.lineage ?? null, resources: entries(state).map(identity) };
 }
 
+// The provider configurations the state needs in the code. Terraform refuses to
+// plan, apply or destroy a managed resource whose aliased configuration is gone
+// from the code ("Provider configuration not present"), and a resource whose
+// configuration has no alias is reached with whatever the default
+// configuration holds. Data sources are left out: one the code no longer
+// declares leaves the state with no call to the provider, aliased or not
+// (measured with Terraform 1.5.7 on 2026-11-15).
+//
+// The addresses are capped, so a state with thousands of resources in one
+// account still sends a small report; `resources` keeps the full count.
+const MAX_ADDRESSES = 50;
+
+function providers(state) {
+	const byConfiguration = new Map();
+	for (const entry of entries(state)) {
+		if (entry.mode !== 'managed') continue;
+		const key = JSON.stringify([entry.provider, entry.alias]);
+		let row = byConfiguration.get(key);
+		if (!row) {
+			row = { source: entry.provider, alias: entry.alias, resources: 0, addresses: [] };
+			byConfiguration.set(key, row);
+		}
+		row.resources++;
+		if (row.addresses.length < MAX_ADDRESSES) row.addresses.push(entry.address);
+	}
+	const rows = [...byConfiguration.values()].sort(
+		(a, b) => a.source.localeCompare(b.source) || (a.alias ?? '').localeCompare(b.alias ?? '')
+	);
+	return { providers: rows };
+}
+
 // `terraform state pull` prints nothing for a state that was never written.
 // That is an empty state, not a broken one: every address in it is missing.
 function readState() {
@@ -183,12 +221,13 @@ const ANSWERS = {
 	'provider-use': (state) => providerUse(state, args[0] ?? ''),
 	missing: (state) => missing(state, args),
 	resolve: (state) => JSON.stringify(resolve(state, args)) + '\n',
-	list: (state) => JSON.stringify(list(state)) + '\n'
+	list: (state) => JSON.stringify(list(state)) + '\n',
+	providers: (state) => JSON.stringify(providers(state)) + '\n'
 };
 
 if (!Object.prototype.hasOwnProperty.call(ANSWERS, command)) {
 	console.error(
-		'state-entries: usage: state-entries.mjs provider-use <source> | missing <address>... | resolve <address>... | list'
+		'state-entries: usage: state-entries.mjs provider-use <source> | missing <address>... | resolve <address>... | list | providers'
 	);
 	process.exit(1);
 }

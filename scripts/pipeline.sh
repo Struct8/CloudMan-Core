@@ -640,6 +640,68 @@ _publish_destroy_result() {
 STATE_ENTRIES="$ENGINE_PATH/scripts/state-entries.mjs"
 
 # ==============================================================================
+# THE PROVIDER CONFIGURATIONS THE STATE STILL USES, FOR THE APP.
+#
+# Terraform refuses to plan, apply or destroy a managed resource whose aliased
+# provider configuration is gone from the code: "Provider configuration not
+# present" (measured with Terraform 1.5.7 on 2026-11-15). The block goes away
+# when the last resource of another account leaves the diagram, while the
+# resource is still in the state, so the run that should destroy it stops. The
+# app keeps that block in the code for as long as the state uses it, and this
+# is how it learns what the state uses: each state writes the list here when it
+# ends, and report_state_progress sends it with the report that closes the
+# state.
+#
+# Only the source, the alias, a count and the addresses leave the state
+# (`state-entries.mjs providers`). The state itself stays in memory, as in
+# remove_from_state.
+#
+# Only the actions that read the remote state write the list, and only after
+# init: a plan, a drift check, an apply, a destroy and a removal from the state.
+# A failed read writes nothing, so the app keeps the list of the last run
+# instead of reading an empty one. Never fails the run.
+# ==============================================================================
+STATE_PROVIDERS_DIR="${RUNNER_TEMP:-/tmp}/struct8-state-providers"
+
+# The same flattening as publish_engine_artifact, so two states never share a
+# file.
+state_providers_file() {
+    local flat="${1#./}"
+    flat="${flat%/}"
+    if [ -z "$flat" ] || [ "$flat" = "." ]; then
+        flat="_root"
+    else
+        flat="${flat//\//__}"
+    fi
+    printf '%s/%s.json' "$STATE_PROVIDERS_DIR" "$flat"
+}
+
+# Runs inside the state's folder: from the EXIT trap of the state's subshell,
+# and from the destroy, before it removes the local cache.
+record_state_providers() {
+    local path="$1" action="$2" file="" tmp="" state_json=""
+
+    case "$action" in
+        plan|drift|apply|destroy|state_rm) ;;
+        *) return 0 ;;
+    esac
+    [ -d .terraform ] || return 0
+    mkdir -p "$STATE_PROVIDERS_DIR" 2>/dev/null || return 0
+
+    file=$(state_providers_file "$path")
+    tmp="${file}.tmp"
+    if ! state_json=$(terraform state pull 2>/dev/null); then
+        return 0
+    fi
+    if printf '%s' "$state_json" | node "$STATE_ENTRIES" providers > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+        mv -f "$tmp" "$file" || true
+    else
+        rm -f "$tmp"
+    fi
+    return 0
+}
+
+# ==============================================================================
 # A PROVIDER THE STATE STILL USES, AND THE MANIFEST BRINGS NO CREDENTIAL FOR.
 #
 # A state can hold resources of a provider its code no longer declares. The case
@@ -1304,6 +1366,11 @@ run_terraform_process() {
     (
         cd "$path" || { echo -e "${RED}❌ ERROR: folder not found: $path${NC}"; exit 1; }
 
+        # The provider configurations the state uses, for the report that closes
+        # it. A trap, so the apply that fails halfway also writes what it left.
+        # The R2 sign-in below arms its own EXIT trap and calls this one too.
+        trap 'record_state_providers "$path" "$action"' EXIT
+
         # =========================================================
         # 🔍 DEBUG LOG: LISTANDO ARQUIVOS ANTES DO TERRAFORM
         # =========================================================
@@ -1567,7 +1634,7 @@ run_terraform_process() {
             # O trap é armado ANTES do mint, e não depois: uma falha no meio da
             # criação já pode ter deixado o token de pé na conta.
             if r2_state_needs_credentials; then
-                trap r2_revoke_ephemeral_credentials EXIT
+                trap 'r2_revoke_ephemeral_credentials; record_state_providers "$path" "$action"' EXIT
                 r2_mint_ephemeral_credentials "$(echo "$auth_json" | jq -r '.account_id')" "$label"
                 r2_verify_credentials "$(echo "$auth_json" | jq -r '.account_id')"
             fi
@@ -2454,6 +2521,10 @@ run_terraform_process() {
               # de onde ler, e a lista de endereços foi tirada antes do destroy.
               _publish_destroy_result "$path" cloudman.destroy_targets.json "$CLEANUP_STATUS" "$CLEANUP_DETAIL"
 
+              # The state is empty now, and the read needs the local cache that
+              # the next step removes; the EXIT trap would find nothing to read.
+              record_state_providers "$path" "$action"
+
               # 3. Limpar arquivos locais
               echo -e "${color}🧹 ${label} Removing the local terraform cache...${NC}"
               rm -rf .terraform terraform.tfstate terraform.tfstate.backup .terraform.lock.hcl
@@ -2722,6 +2793,7 @@ report_state_progress() {
     local state_path="$1" status="$2" index="$3" total="$4"
     local token="" corpo=""
     local sources_json="" body_with_sources="" code=""
+    local providers_file="" body_with_providers=""
 
     # Token OIDC deste run, com audiencia PROPRIA do relatorio de andamento --
     # diferente da `https://struct8.com/gitops` que o GateKeeper valida. Separar as
@@ -2780,6 +2852,26 @@ report_state_progress() {
         fi
     fi
 
+    # The provider configurations the state uses, which record_state_providers
+    # wrote when the state ended. Only the report that closes the state carries
+    # them; a state that wrote no list sends none, and the app keeps the one it
+    # has.
+    if [ "$status" != "running" ]; then
+        providers_file=$(state_providers_file "$state_path")
+        if [ -s "$providers_file" ]; then
+            body_with_providers=$(printf '%s' "$corpo" \
+                | jq -c --slurpfile list "$providers_file" '. + { providers: $list[0].providers }' \
+                2>/dev/null) || body_with_providers=""
+            if [ -n "$body_with_providers" ]; then
+                corpo="$body_with_providers"
+            else
+                providers_file=""
+            fi
+        else
+            providers_file=""
+        fi
+    fi
+
     # The status code is read so the run can tell whether the version arrived.
     # Progress itself stays best-effort: a failure here never brings the pipeline
     # down.
@@ -2795,6 +2887,9 @@ report_state_progress() {
     # to promote.
     if [ -n "$sources_json" ] && [ "$code" = "200" ]; then
         rm -f "$SOURCES_FILE"
+    fi
+    if [ -n "$providers_file" ] && [ "$code" = "200" ]; then
+        rm -f "$providers_file"
     fi
 
     return 0

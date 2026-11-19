@@ -606,6 +606,14 @@ try {
 		natAddress?.tags?.Name === 'hub-nat-eip',
 		JSON.stringify(natAddress)
 	);
+	// A sweep scoped to a VPC keeps the rows placed in it. Cloud Control names the
+	// address `<public ip>|<allocation id>` and the NAT names the allocation id, so
+	// no reference reaches it: without the NAT's VPC it fell outside (k8simp18).
+	check(
+		"and it carries the VPC of the NAT that holds it",
+		natAddress?.vpcId === 'vpc-0703',
+		JSON.stringify(natAddress)
+	);
 
 	// --------------------------------------------------------------- layer 2
 	const association = hints.find((i) => i.terraformTypeHint === 'aws_route_table_association');
@@ -1319,6 +1327,7 @@ try {
 	const out6 = JSON.parse(fs.readFileSync(path.join(dir6, 'scan_inventory.json'), 'utf-8'));
 	const address = out6.items.find((i) => i.arn?.endsWith('elastic-ip/eipalloc-0ded'));
 	check("with its tags refused, the NAT's address is still in the inventory", !!address && address.ownedBy == null, JSON.stringify(address));
+	check("and it still carries the NAT's VPC", address?.vpcId === 'vpc-0703', JSON.stringify(address));
 	check(
 		'and the refusal is reported',
 		out6.errors.some((e) => e.source === 'ec2 describe-addresses'),

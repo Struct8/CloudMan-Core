@@ -1195,6 +1195,16 @@ for (const igw of aws('ec2', 'describe-internet-gateways', igwFilter)?.InternetG
 // NAT in the region: `NatGatewayAddresses` carries none, and without them the
 // address was named after its allocation id while the account had `Name` on it.
 // A refused call costs only the tags: the rows are pushed either way.
+//
+// IT CARRIES THE NAT'S `vpcId`, like every other row these listings push. The EC2
+// answer gives an Elastic IP no VPC of its own, and nothing else in the inventory
+// ties the address to the network: Cloud Control identifies it as
+// `<public ip>|<allocation id>` while the NAT names the allocation id, so the
+// reference graph never meets it. A sweep scoped to a VPC keeps the rows placed in
+// it and what they name (Struct8's `rowsInVpcScope`), so the address fell outside,
+// the NAT compiled without one, and the Elastic IP drawn by hand in its place made
+// the plan create a new address and replace the NAT. Measured on
+// 952133486861/us-west-2, 2026-11-19 (k8simp18).
 const natFilter = vpcIds.length ? ['--filter', `Name=vpc-id,Values=${vpcIds.join(',')}`] : [];
 const natAddresses = [];
 for (const nat of aws('ec2', 'describe-nat-gateways', natFilter)?.NatGateways ?? []) {
@@ -1203,16 +1213,19 @@ for (const nat of aws('ec2', 'describe-nat-gateways', natFilter)?.NatGateways ??
 		vpcId: nat.VpcId
 	});
 	for (const address of nat.NatGatewayAddresses ?? []) {
-		if (address.AllocationId) natAddresses.push({ owner: nat.OwnerId ?? '', allocationId: address.AllocationId });
+		if (address.AllocationId) {
+			natAddresses.push({ owner: nat.OwnerId ?? '', allocationId: address.AllocationId, vpcId: nat.VpcId });
+		}
 	}
 }
 if (natAddresses.length) {
 	const allocationIds = [...new Set(natAddresses.map((a) => a.allocationId))];
 	const described = aws('ec2', 'describe-addresses', ['--allocation-ids', ...allocationIds])?.Addresses ?? [];
 	const tagsByAllocation = new Map(described.map((a) => [a.AllocationId, tagsOf(a.Tags)]));
-	for (const { owner, allocationId } of natAddresses) {
+	for (const { owner, allocationId, vpcId } of natAddresses) {
 		push(`arn:aws:ec2:${region}:${owner}:elastic-ip/${allocationId}`, {
-			tags: tagsByAllocation.get(allocationId) ?? {}
+			tags: tagsByAllocation.get(allocationId) ?? {},
+			vpcId
 		});
 	}
 }

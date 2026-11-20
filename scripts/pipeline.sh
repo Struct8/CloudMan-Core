@@ -241,6 +241,68 @@ run_tf_with_stale_lock_recovery() {
 }
 
 # ==============================================================================
+# `terraform apply`, run once more when every error it printed is transient.
+#
+# WHY. On 2026-11-19 a state failed because Cloudflare answered "404 Not Found"
+# to the read the provider sends right after creating a Workers custom domain,
+# and the same code applied cleanly on the next run. Until then the way out was
+# the person noticing the failure and pushing again.
+#
+# WHAT DECIDES. scripts/apply-retry.mjs reads the error diagnostics in the log
+# of the attempt, and says yes only when each of them carries an HTTP status
+# from its list (404, 429, 500, 502, 503, 504) or one of its network errors.
+# Why each status is in or out is written there.
+#
+# WHY A SECOND APPLY IS SAFE. The apply takes no saved plan: it plans again
+# from the state, so what the first attempt created and recorded is not created
+# again, and only what is missing is applied. The risk left is the one of a
+# person applying again by hand -- a resource the cloud made without Terraform
+# ever receiving its id -- and the retry adds nothing to it.
+#
+# NOTHING IS HIDDEN. Each retry is printed in the log, raised as a warning on
+# the run's summary page, and kept in APPLY_RETRY_NOTE, which goes into the
+# published apply_result.json. A state that passes on the second attempt still
+# says what failed on the first: a 404 can also come from a dependency missing
+# in the code, and a silent retry would cover that up.
+#
+# The log of the last attempt stays in ./.struct8-live.log, so a retry that
+# fails too publishes ITS error.
+# ==============================================================================
+APPLY_RETRY_CLASSIFIER="$ENGINE_PATH/scripts/apply-retry.mjs"
+APPLY_RETRY_MAX=1
+APPLY_RETRY_WAIT_SECONDS=30
+
+apply_with_transient_retry() {
+    local label="$1" status=0 retries=0 verdict annotation
+    APPLY_RETRY_NOTE=""
+
+    run_tf_with_stale_lock_recovery terraform apply -auto-approve -input=false || status=$?
+
+    while [ $status -ne 0 ] && [ $retries -lt $APPLY_RETRY_MAX ]; do
+        # Condition context on purpose: under `set -e` a classifier that says no
+        # (exit 1), or a missing node, would end the subshell right here.
+        if ! verdict=$(node "$APPLY_RETRY_CLASSIFIER" ./.struct8-live.log 2>&1); then
+            echo -e "${YELLOW}ℹ️ ${label} Not retrying the apply: ${verdict}${NC}"
+            break
+        fi
+        retries=$((retries + 1))
+        APPLY_RETRY_NOTE="${APPLY_RETRY_NOTE:+$APPLY_RETRY_NOTE; }attempt ${retries}: ${verdict}"
+        echo -e "${YELLOW}🔁 ${label} The apply failed with a transient error: ${verdict}. Running it again in ${APPLY_RETRY_WAIT_SECONDS}s (retry ${retries} of ${APPLY_RETRY_MAX}).${NC}"
+        # `%` is escaped because the runner reads %25, %0D and %0A as escapes.
+        annotation="${label} ${verdict}"
+        echo "::warning title=Apply retried after a transient error::${annotation//%/%25}"
+        sleep "$APPLY_RETRY_WAIT_SECONDS"
+        status=0
+        run_tf_with_stale_lock_recovery terraform apply -auto-approve -input=false || status=$?
+    done
+
+    if [ $status -eq 0 ] && [ $retries -gt 0 ]; then
+        echo -e "${GREEN}✅ ${label} The apply passed on retry ${retries}.${NC}"
+    fi
+    return $status
+}
+
+# ==============================================================================
 # Hands a file to the workflow's publish step.
 #
 # WHY THIS INDIRECTION EXISTS
@@ -562,8 +624,13 @@ authenticate_backend() {
 # id. É o que a importação precisa, e não há o que vazar no que não é copiado.
 #
 # Se o jq falhar, NADA é publicado -- mesma regra do plan.
+#
+# `retried_after` (fourth argument, optional): what the attempts before the last
+# one failed with, from apply_with_transient_retry. Present only when the apply
+# was retried. It holds the classifier's one line -- HTTP status and resource
+# address -- and never the error body, which can quote attribute values.
 _publish_state_manifest() {
-    local src_dir="$1" action="$2" outfile="$3"
+    local src_dir="$1" action="$2" outfile="$3" retried_after="${4:-}"
 
     if ! terraform show -json > cloudman.state.raw.json 2>/dev/null; then
         echo -e "${YELLOW}⚠️ [${src_dir}] Could not read the state; no ${outfile} published.${NC}"
@@ -575,12 +642,14 @@ _publish_state_manifest() {
     # importação precisa do endereço completo dele.
     if jq \
         --arg action "$action" \
+        --arg retried_after "$retried_after" \
         --arg run_url "${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
         --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         'def walk_modules: (.resources // [])[] , ((.child_modules // [])[] | walk_modules);
          {
             timestamp: $ts,
-            cloudman_result: { action: $action, outcome: "succeeded", run_url: $run_url },
+            cloudman_result: ({ action: $action, outcome: "succeeded", run_url: $run_url }
+                              + (if $retried_after == "" then {} else { retried_after: $retried_after } end)),
             resources: [ (.values.root_module // {}) | walk_modules
                          | { address, type, name, id: (.values.id // null) } ]
          }' cloudman.state.raw.json > "$outfile" && gzip -9 -f "$outfile"; then
@@ -2034,7 +2103,7 @@ run_terraform_process() {
           # havia onde publicar a falha. É o mesmo achado já documentado dentro de
           # `run_tf_with_stale_lock_recovery`.
           APPLY_STATUS=0
-          run_tf_with_stale_lock_recovery terraform apply -auto-approve -input=false || APPLY_STATUS=$?
+          apply_with_transient_retry "$label" || APPLY_STATUS=$?
 
           if [ $APPLY_STATUS -ne 0 ]; then
               publish_apply_failure "$path" apply "./.struct8-live.log"
@@ -2045,7 +2114,7 @@ run_terraform_process() {
 
           # Os ids do que ficou de pé. É deles que sai o bloco `import` do teste
           # de importação, e sem isso o ciclo não fecha.
-          _publish_state_manifest "$path" apply apply_result.json
+          _publish_state_manifest "$path" apply apply_result.json "$APPLY_RETRY_NOTE"
 
         # INÍCIO DA NOVA LÓGICA DE IMPORT (GERAÇÃO PARA REVISÃO)
         # TWO NAMES, ONE PASS. `import` is the original name and the old Import

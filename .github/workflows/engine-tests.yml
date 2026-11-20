@@ -80,3 +80,9 @@ jobs:
 
       - name: Sign-in by credential entries, in the pipeline's shell
         run: bash scripts/credentials/sign-in.test.sh
+
+      - name: Which apply errors are transient
+        run: node scripts/apply-retry.test.mjs
+
+      - name: The apply runs once more after a transient error
+        run: bash scripts/apply-retry.test.sh

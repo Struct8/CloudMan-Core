@@ -339,6 +339,22 @@ let unread = 0;
 let detailAsked = 0;
 
 /**
+ * Every string value at any depth of `value`, 8 characters or longer, added to
+ * `names`. Values, not a search through the text: they are matched whole
+ * against what the sweep found, because a substring hit would tie together
+ * resources that merely share a prefix.
+ */
+const addNamesIn = (value, names) => {
+	if (typeof value === 'string') {
+		if (value.length >= 8) names.add(value);
+	} else if (Array.isArray(value)) {
+		for (const item of value) addNamesIn(item, names);
+	} else if (value && typeof value === 'object') {
+		for (const item of Object.values(value)) addNamesIn(item, names);
+	}
+};
+
+/**
  * Reads one candidate and records what its configuration names.
  *
  * RATE LIMITING IS THE COMMON FAILURE HERE, not a resource that cannot be read.
@@ -385,17 +401,8 @@ const readOne = async (row, onThrottle) => {
 	// substring hit would tie together resources that merely share a prefix.
 	let parsed = null;
 	try {
-		const walk = (value) => {
-			if (typeof value === 'string') {
-				if (value.length >= 8) names.add(value);
-			} else if (Array.isArray(value)) {
-				value.forEach(walk);
-			} else if (value && typeof value === 'object') {
-				Object.values(value).forEach(walk);
-			}
-		};
 		parsed = JSON.parse(properties);
-		walk(parsed);
+		addNamesIn(parsed, names);
 	} catch {
 		// Properties that will not parse still gave up their ARNs above.
 	}
@@ -527,6 +534,17 @@ const readOne = async (row, onThrottle) => {
 		// THIS ONE COSTS A CALL, unlike the two blocks above, which read an answer
 		// already parsed. It is one call per launch template -- a type an account
 		// has few of -- and there is no other way to see the data.
+		//
+		// THE WHOLE DATA, NOT ONLY THE PROFILE. The template names its security
+		// groups, its network interfaces' groups, its key pair and the KMS key of
+		// its volumes in the same `LaunchTemplateData`, and each of them is kept in
+		// an import by what names it, exactly like the profile. So the data goes
+		// through the same harvest as the Cloud Control answer above. Lab k8simp18
+		// (2026-11-19) lost the security group of a node group's nodes this way: the
+		// person's template named it, the answer above did not carry the name, and
+		// the only other row naming it was an instance the node group owns -- so the
+		// group was dropped as owned by the node group, and the compile wrote the
+		// wrong groups into the template.
 		if (row.cfnType === 'AWS::EC2::LaunchTemplate') {
 			const templateId = parsed.LaunchTemplateId ?? row.importId;
 			const versions = await awsAsync('ec2', 'describe-launch-template-versions', [
@@ -537,10 +555,12 @@ const readOne = async (row, onThrottle) => {
 				'$Latest'
 			]);
 			for (const version of versions?.LaunchTemplateVersions ?? []) {
+				addNamesIn(version?.LaunchTemplateData, names);
 				const profile = version?.LaunchTemplateData?.IamInstanceProfile;
-				// Either spelling. The template may name the profile by ARN or by
-				// name, and the matching downstream accepts both: a row is keyed by
-				// its `importId` AND by the ARN the listing carried.
+				// Either spelling, and the name at any length -- the harvest above
+				// skips strings under 8 characters. The template may name the profile
+				// by ARN or by name, and the matching downstream accepts both: a row
+				// is keyed by its `importId` AND by the ARN the listing carried.
 				for (const value of [profile?.Arn, profile?.Name]) {
 					if (typeof value === 'string' && value.trim()) names.add(value.trim());
 				}

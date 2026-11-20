@@ -1337,5 +1337,109 @@ try {
 	fs.rmSync(dir6, { recursive: true, force: true });
 }
 
+// ------------------------------------- what a launch template's data names
+//
+// Cloud Control answers a launch template with its id, its name and two version
+// numbers, and nothing of `LaunchTemplateData`. The scanner reads the data with
+// `describe-launch-template-versions`, and every group, key and profile in it is
+// a name the template holds. Lab k8simp18 (2026-11-19): the person's template
+// named the nodes' security group, only the profile was taken from the data, and
+// the group was dropped as owned by the node group whose instance also named it.
+const dir7 = fs.mkdtempSync(path.join(os.tmpdir(), 'struct8-scan-lt-'));
+try {
+	const LT = 'lt-0a1b2c3d4e5f60718';
+	const NODES_SG = 'sg-0nodes0000000001';
+	const CLUSTER_SG = 'sg-0cluster00000001';
+	const OTHER_SG = 'sg-0other000000001';
+	// Listed by the sweep, as in the lab: the reference index is matched against
+	// what the sweep found.
+	const ANSWERS_LT = {
+		...ANSWERS,
+		'cloudcontrol list-resources AWS::EC2::SecurityGroup': [
+			{
+				ResourceDescriptions: [NODES_SG, CLUSTER_SG, OTHER_SG].map((id) => ({ Identifier: id, Properties: '{}' }))
+			}
+		],
+		'cloudcontrol list-resources AWS::EC2::LaunchTemplate': [
+			{ ResourceDescriptions: [{ Identifier: LT, Properties: '{}' }] }
+		],
+		[`cloudcontrol get-resource AWS::EC2::LaunchTemplate ${LT}`]: [
+			{
+				ResourceDescription: {
+					Identifier: LT,
+					Properties: JSON.stringify({
+						LaunchTemplateId: LT,
+						LaunchTemplateName: 'lab-lt',
+						DefaultVersionNumber: 1,
+						LatestVersionNumber: 2
+					})
+				}
+			}
+		],
+		// The default version names two groups directly; the latest names one of
+		// them through a network interface. All are the template's.
+		'ec2 describe-launch-template-versions': [
+			{
+				LaunchTemplateVersions: [
+					{
+						VersionNumber: 1,
+						LaunchTemplateData: {
+							SecurityGroupIds: [CLUSTER_SG],
+							IamInstanceProfile: { Name: 'np' }
+						}
+					},
+					{
+						VersionNumber: 2,
+						LaunchTemplateData: {
+							NetworkInterfaces: [{ DeviceIndex: 0, Groups: [NODES_SG] }]
+						}
+					}
+				]
+			}
+		]
+	};
+	const stubLt = stub.replace(
+		`const __ANSWERS = ${JSON.stringify(ANSWERS)};`,
+		`const __ANSWERS = ${JSON.stringify(ANSWERS_LT)};`
+	);
+	if (stubLt === stub) {
+		check('the launch-template-run stub was built from the same shape as the main one', false);
+	}
+	fs.writeFileSync(path.join(dir7, 'scan-account.mjs'), patched(stubLt));
+	fs.writeFileSync(
+		path.join(dir7, 'scan_scope.json'),
+		JSON.stringify({
+			region: R,
+			vpcIds: [],
+			tagFilters: [],
+			cfnTypes: ['AWS::EC2::SecurityGroup', 'AWS::EC2::LaunchTemplate'],
+			cfnDetailTypes: ['AWS::EC2::LaunchTemplate']
+		})
+	);
+	execFileSync('node', ['scan-account.mjs'], { cwd: dir7, encoding: 'utf-8', stdio: 'pipe' });
+
+	const out7 = JSON.parse(fs.readFileSync(path.join(dir7, 'scan_inventory.json'), 'utf-8'));
+	const group = (id) => out7.items.find((i) => i.importId === id);
+
+	check(
+		"a group the template's data names directly says the template names it",
+		(group(CLUSTER_SG)?.referencedBy ?? []).includes(LT),
+		JSON.stringify(group(CLUSTER_SG))
+	);
+	check(
+		'and so does a group it names through a network interface',
+		(group(NODES_SG)?.referencedBy ?? []).includes(LT),
+		JSON.stringify(group(NODES_SG))
+	);
+	// THE CONTROL: a group the template does not name gets nothing from it.
+	check(
+		'while a group the template does not name is not tied to it',
+		group(OTHER_SG) != null && !(group(OTHER_SG)?.referencedBy ?? []).includes(LT),
+		JSON.stringify(group(OTHER_SG))
+	);
+} finally {
+	fs.rmSync(dir7, { recursive: true, force: true });
+}
+
 console.log(failures === 0 ? '\nALL CASES PASSED' : `\n${failures} CASE(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

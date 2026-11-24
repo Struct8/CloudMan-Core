@@ -101,7 +101,7 @@ out=$(
   source "$work/fns.sh"
   SECRETS_CONTEXT='{}'
   status=0
-  sign_in_credentials "accounts/cdn" "apply" "[$(cloudflare_entry 0a1b2c3d true oidc-oci)]" "[accounts/cdn]" > "$work/log" 2>&1 || status=$?
+  sign_in_credentials "accounts/cdn" "apply" "[$(cloudflare_entry 0a1b2c3d true oidc-example)]" "[accounts/cdn]" > "$work/log" 2>&1 || status=$?
   printf 'status=%s\n' "$status"
   printf 'token=%s\n' "${CLOUDFLARE_API_TOKEN:-}"
 )
@@ -109,7 +109,7 @@ live="$work/state/.struct8-live.log"
 check "sign_in_credentials returns 1" "status=1" "$(printf '%s\n' "$out" | grep '^status=')"
 check "nothing was exported" "token=" "$(printf '%s\n' "$out" | grep '^token=')"
 check "the reason starts at an Error: line" "Error: the credentials of this state cannot be used" "$(head -1 "$live" 2>/dev/null)"
-check "the reason names the method" "1" "$(grep -c "'oidc-oci', which this engine does not have" "$live" 2>/dev/null)"
+check "the reason names the method" "1" "$(grep -c "'oidc-example', which this engine does not have" "$live" 2>/dev/null)"
 check "and ends saying nothing changed" "No resource was changed." "$(tail -1 "$live" 2>/dev/null)"
 check "the refusal is published for the state's action" "accounts/cdn apply ./.struct8-live.log" "$(cat "$PUBLISHED" 2>/dev/null)"
 

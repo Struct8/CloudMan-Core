@@ -13,6 +13,7 @@
 // Usage: node scripts/credentials/credentials.test.mjs
 
 import { execFileSync } from 'node:child_process';
+import { createPublicKey } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -20,6 +21,7 @@ import { fileURLToPath } from 'node:url';
 import { collisions, replaceIniSection, validateEntries } from './entries.mjs';
 import { knownMethod, signInEntries } from './sign-in.mjs';
 import { sessionName } from './methods/oidc-aws.mjs';
+import { AUDIENCE as OCI_AUDIENCE } from './methods/oidc-oci.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -156,6 +158,55 @@ const stripeEntry = {
 	deliver: [{ kind: 'env', vars: { STRIPE_API_KEY: { from: 'key' } } }]
 };
 
+// The entry of an OCI tenancy (src/lib/resources/oci/oci_cloud_/definition.js):
+// the two files for every tenancy, and the resource principal variables for the
+// state's own one.
+const OCI_DOMAIN = `https://idcs-${'0123456789abcdef'.repeat(2)}.identity.oraclecloud.com`;
+const OCI_CLIENT = 'abcdef0123456789abcdef0123456789';
+const OCI_CLIENT_SECRET = 'test-client-secret-of-the-oci-app';
+const ociEntry = (tenancy, own, inputs = {}) => {
+	const id = `oci-ocid1-tenancy-oc1--${tenancy}`;
+	const rpst = `{state_dir}/oci/${id}.rpst`;
+	const pem = `{state_dir}/oci/${id}.pem`;
+	return {
+		id,
+		provider: 'oci',
+		account: `ocid1.tenancy.oc1..${tenancy}`,
+		own,
+		method: 'oidc-oci',
+		inputs: {
+			domain_url: OCI_DOMAIN,
+			client_id: OCI_CLIENT,
+			client_secret_name: 'AUTH_OCI_ACME_PROD',
+			resource_type: 'struct8_github',
+			rpst_minutes: '120',
+			...inputs
+		},
+		deliver: [
+			{ kind: 'file', path: rpst, from: 'rpst' },
+			{ kind: 'file', path: pem, from: 'private_key_pem' },
+			...(own
+				? [
+						{
+							kind: 'env',
+							vars: {
+								OCI_AUTH: { value: 'ResourcePrincipal' },
+								OCI_RESOURCE_PRINCIPAL_VERSION: { value: '2.2' },
+								OCI_RESOURCE_PRINCIPAL_RPST: { value: rpst },
+								OCI_RESOURCE_PRINCIPAL_PRIVATE_PEM: { value: pem },
+								OCI_RESOURCE_PRINCIPAL_REGION: { value: 'sa-saopaulo-1' }
+							},
+							unset: ['OCI_RESOURCE_PRINCIPAL_PRIVATE_PEM_PASSPHRASE', 'OCI_CONFIG_FILE']
+						}
+					]
+				: [])
+		]
+	};
+};
+const base64url = (value) => Buffer.from(JSON.stringify(value)).toString('base64url');
+/** A session token as OCI gives it: a JWT whose lifetime is 120 minutes. */
+const OCI_RPST = `${base64url({ alg: 'RS256', typ: 'JWT' })}.${base64url({ iat: 1_800_000_000, exp: 1_800_007_200, res_type: 'struct8_github' })}.signature-of-oci`;
+
 // ---------------------------------------------------------------------------
 // Stand-ins.
 // ---------------------------------------------------------------------------
@@ -172,7 +223,7 @@ function response(status, body) {
 	return { ok: status >= 200 && status < 300, status, json: async () => body };
 }
 
-/** fetch that answers GitHub, Google STS and IAM Credentials; `refuse` names one to refuse. */
+/** fetch that answers GitHub, Google STS, IAM Credentials and the OCI identity domain; `refuse` names one to refuse. */
 function fakeFetch(calls, refuse = null) {
 	return async (url, init = {}) => {
 		calls.push({ url, init });
@@ -188,6 +239,11 @@ function fakeFetch(calls, refuse = null) {
 			return refuse === 'impersonation'
 				? response(403, { error: { message: 'Permission iam.serviceAccounts.getAccessToken denied' } })
 				: response(200, { accessToken: 'service-account-token' });
+		}
+		if (url === `${OCI_DOMAIN}/oauth2/v1/token`) {
+			return refuse === 'oci'
+				? response(401, { error: 'invalid_client', error_description: 'Client authentication failed.' })
+				: response(200, { token: OCI_RPST });
 		}
 		return response(404, {});
 	};
@@ -276,11 +332,11 @@ function exported(dirs, read) {
 
 console.log('▸ What an entry may hold');
 {
-	const valid = [awsOwn, awsForeign, googleEntry(false), cloudflareEntry('0a1b2c3d', false), stripeEntry];
+	const valid = [awsOwn, awsForeign, googleEntry(false), cloudflareEntry('0a1b2c3d', false), stripeEntry, ociEntry('aaaabbbb', false)];
 	check('the entries of every cloud the app writes are accepted', validateEntries(valid, knownMethod).length === 0, validateEntries(valid, knownMethod).join('\n'));
 
-	const unknown = validateEntries([{ ...cloudflareEntry('0a1b2c3d', true), method: 'oidc-oci' }], knownMethod);
-	check('a method this engine does not have is named', unknown.some((e) => e.includes("'oidc-oci', which this engine does not have")), unknown.join('\n'));
+	const unknown = validateEntries([{ ...cloudflareEntry('0a1b2c3d', true), method: 'oidc-example' }], knownMethod);
+	check('a method this engine does not have is named', unknown.some((e) => e.includes("'oidc-example', which this engine does not have")), unknown.join('\n'));
 
 	const variable = validateEntries(
 		[{ ...cloudflareEntry('0a1b2c3d', true), deliver: [{ kind: 'variable', name: 'cf', from: 'token' }] }],
@@ -341,6 +397,12 @@ console.log('▸ Entries that write the same place');
 
 	const sameSection = collisions([awsForeign, { ...awsForeign, id: 'aws-copy' }]);
 	check('two entries writing one INI section collide', sameSection.some((c) => c.includes('[acct_444455556666]')), sameSection.join('\n'));
+
+	const ociPlusAws = collisions([ociEntry('aaaabbbb', true), awsForeign]);
+	check('an OCI tenancy and another AWS account do not collide', ociPlusAws.length === 0, ociPlusAws.join('\n'));
+
+	const twoTenancies = collisions([ociEntry('aaaabbbb', true), { ...ociEntry('ccccdddd', true), own: false }]);
+	check('two tenancies that both set the resource principal collide on its variables', twoTenancies.some((c) => c.includes('OCI_RESOURCE_PRINCIPAL_RPST')), twoTenancies.join('\n'));
 }
 
 console.log('▸ INI sections');
@@ -452,10 +514,92 @@ console.log('▸ Google Cloud: the credential file, proved before the plan');
 	check('a provider named by project ID instead of number is refused before any call', result.code === 1 && result.failure.includes("with the project's number, not its ID"), result.failure);
 }
 
+console.log('▸ OCI: a session token and its key, as a resource principal 2.2');
+{
+	const id = 'oci-ocid1-tenancy-oc1--aaaabbbb';
+	const { result, dirs, read, fetchCalls, lines, root } = await signIn([ociEntry('aaaabbbb', true)], {
+		secrets: { AUTH_OCI_ACME_PROD: OCI_CLIENT_SECRET }
+	});
+	const { script, vars, unset } = exported(dirs, read);
+	const rpstFile = `${dirs.state_dir}/oci/${id}.rpst`;
+	const pemFile = `${dirs.state_dir}/oci/${id}.pem`;
+	const pem = read(pemFile) ?? '';
+	const exchange = fetchCalls.find((c) => c.url === `${OCI_DOMAIN}/oauth2/v1/token`);
+	const form = new URLSearchParams(exchange?.init?.body ?? '');
+	check('signed in', result.code === 0, result.failure);
+	check('the GitHub token is asked for the audience OCI receives, and sent as the subject', form.get('subject_token') === `jwt-for-${OCI_AUDIENCE}` && OCI_AUDIENCE === 'https://cloud.oracle.com', form.get('subject_token'));
+	check('the exchange authenticates as the application, with the secret', exchange?.init?.headers?.Authorization === `Basic ${Buffer.from(`${OCI_CLIENT}:${OCI_CLIENT_SECRET}`).toString('base64')}`, JSON.stringify(exchange?.init?.headers));
+	check('the exchange asks for an RPST from a JWT, for the trust resource type, for 120 minutes',
+		form.get('grant_type') === 'urn:ietf:params:oauth:grant-type:token-exchange' &&
+			form.get('requested_token_type') === 'urn:oci:token-type:oci-rpst' &&
+			form.get('subject_token_type') === 'jwt' &&
+			form.get('res_type') === 'struct8_github' &&
+			form.get('rpst_exp') === '120',
+		exchange?.init?.body);
+	check('the exchange does not follow a redirect', exchange?.init?.redirect === 'error', exchange?.init?.redirect);
+	check('the RPST file holds the token', read(rpstFile) === OCI_RPST, read(rpstFile));
+	check('the key file holds a PKCS#8 private key', pem.startsWith('-----BEGIN PRIVATE KEY-----'), pem.slice(0, 40));
+	let sentKey = '';
+	try {
+		sentKey = createPublicKey(pem).export({ type: 'spki', format: 'der' }).toString('base64');
+	} catch {}
+	check('the public key sent is the half of the key in the file', sentKey !== '' && form.get('public_key') === sentKey);
+	check('the provider signs in as a resource principal 2.2 from the two files, in the home region',
+		vars.OCI_AUTH === 'ResourcePrincipal' &&
+			vars.OCI_RESOURCE_PRINCIPAL_VERSION === '2.2' &&
+			vars.OCI_RESOURCE_PRINCIPAL_RPST === rpstFile &&
+			vars.OCI_RESOURCE_PRINCIPAL_PRIVATE_PEM === pemFile &&
+			vars.OCI_RESOURCE_PRINCIPAL_REGION === 'sa-saopaulo-1',
+		JSON.stringify(vars));
+	check('a passphrase and a config file left on the runner are unset', ['OCI_RESOURCE_PRINCIPAL_PRIVATE_PEM_PASSPHRASE', 'OCI_CONFIG_FILE'].every((n) => unset.includes(n)), unset.join(' '));
+	const keyLines = pem.split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('-----'));
+	check('the token and every line of the key are masked', lines.includes(`::add-mask::${OCI_RPST}`) && keyLines.length > 0 && keyLines.every((l) => lines.includes(`::add-mask::${l}`)), lines.filter((l) => !l.startsWith('::add-mask::')).join('\n'));
+	const unmasked = lines.filter((l) => !l.startsWith('::add-mask::'));
+	check('no line of the log and nothing in the script holds the secret, the token or the key',
+		[...unmasked, script].every((l) => !l.includes(OCI_CLIENT_SECRET) && !l.includes(OCI_RPST) && !l.includes('PRIVATE KEY') && !keyLines.some((k) => l.includes(k))),
+		unmasked.join('\n'));
+	check('the log says the application and how long the token lasts', unmasked.includes(`   Signed in as the application ${OCI_CLIENT}, for 120 minutes.`), unmasked.join('\n'));
+	if (process.platform !== 'win32') {
+		check('the key file is readable by this user only', (statSync(pemFile).mode & 0o077) === 0);
+	}
+	rmSync(root, { recursive: true, force: true });
+}
+{
+	const { result } = await signIn([ociEntry('aaaabbbb', true)], { secrets: { auth_oci_acme_prod: OCI_CLIENT_SECRET } });
+	check('an OCI secret listed in other capitals is found', result.code === 0, result.failure);
+}
+{
+	const { result, fetchCalls } = await signIn([ociEntry('aaaabbbb', true, { rpst_minutes: '' })], { secrets: { AUTH_OCI_ACME_PROD: OCI_CLIENT_SECRET } });
+	const exchange = fetchCalls.find((c) => c.url === `${OCI_DOMAIN}/oauth2/v1/token`);
+	check('without a lifetime, none is asked for', result.code === 0 && !new URLSearchParams(exchange?.init?.body ?? '').has('rpst_exp'), exchange?.init?.body);
+}
+{
+	const { result, fetchCalls } = await signIn([ociEntry('aaaabbbb', true)], { secrets: {} });
+	check('a missing OCI secret is named, with the panel that saves it', result.code === 1 && result.failure.includes("secret 'AUTH_OCI_ACME_PROD' was not found") && result.failure.includes('GitOps Workspace panel of the OCI tenancy'), result.failure);
+	check('and nothing is asked of GitHub or OCI', fetchCalls.length === 0, fetchCalls.map((c) => c.url).join('\n'));
+}
+{
+	const { result, dirs, root } = await signIn([ociEntry('aaaabbbb', false)], { secrets: { AUTH_OCI_ACME_PROD: OCI_CLIENT_SECRET }, refuseFetch: 'oci' });
+	check('a refusal by the identity domain gives its reason and the status', result.code === 1 && result.failure.includes('Client authentication failed.') && result.failure.includes('(HTTP 401)'), result.failure);
+	check('and names the application and what to check', result.failure.includes(`as the application ${OCI_CLIENT}`) && result.failure.includes('identity propagation trust') && result.failure.includes("'AUTH_OCI_ACME_PROD'"), result.failure);
+	check('and the foreign tenancy', result.failure.includes('This state also uses the oci account ocid1.tenancy.oc1..aaaabbbb'), result.failure);
+	check('and writes no file', !existsSync(`${dirs.state_dir}/oci/oci-ocid1-tenancy-oc1--aaaabbbb.rpst`) && !existsSync(`${dirs.state_dir}/oci/oci-ocid1-tenancy-oc1--aaaabbbb.pem`));
+	rmSync(root, { recursive: true, force: true });
+}
+for (const [label, inputs, secret] of [
+	['a domain URL with a port', { domain_url: `${OCI_DOMAIN}:443` }, OCI_CLIENT_SECRET],
+	['a lifetime over 720 minutes', { rpst_minutes: '721' }, OCI_CLIENT_SECRET],
+	['a client ID with spaces', { client_id: 'abc def ghi' }, OCI_CLIENT_SECRET],
+	['a secret with a line break', {}, `${OCI_CLIENT_SECRET}\n`]
+]) {
+	const { result, fetchCalls } = await signIn([ociEntry('aaaabbbb', true, inputs)], { secrets: { AUTH_OCI_ACME_PROD: secret } });
+	check(`${label} is refused before any call`, result.code === 1 && result.failure.startsWith('Error:') && fetchCalls.length === 0, `${result.failure}\n${fetchCalls.map((c) => c.url).join('\n')}`);
+}
+
 console.log('▸ Refusals before any sign-in');
 {
-	const { result, runCalls, fetchCalls } = await signIn([awsOwn, { ...cloudflareEntry('0a1b2c3d', false), method: 'oidc-oci' }]);
-	check('an unknown method stops the state with code 2', result.code === 2 && result.failure.includes("'oidc-oci'"), result.failure);
+	const { result, runCalls, fetchCalls } = await signIn([awsOwn, { ...cloudflareEntry('0a1b2c3d', false), method: 'oidc-example' }]);
+	check('an unknown method stops the state with code 2', result.code === 2 && result.failure.includes("'oidc-example'"), result.failure);
 	check('and nothing signed in', runCalls.length === 0 && fetchCalls.length === 0);
 }
 {
@@ -491,7 +635,7 @@ console.log('▸ The command line');
 	check('the secrets come in on stdin and the state signs in', code === 0 && exported(dirs, read).vars.CLOUDFLARE_API_TOKEN === 'cli-token-value', stdout);
 	check('the log shows the mask, never the bare value', stdout.includes('::add-mask::cli-token-value') && stdout.split('\n').filter((l) => !l.startsWith('::add-mask::')).every((l) => !l.includes('cli-token-value')), stdout);
 
-	writeFileSync(file, JSON.stringify([{ ...cloudflareEntry('0a1b2c3d', true), method: 'oidc-oci' }]));
+	writeFileSync(file, JSON.stringify([{ ...cloudflareEntry('0a1b2c3d', true), method: 'oidc-example' }]));
 	code = 0;
 	try {
 		execFileSync(process.execPath, [path.join(HERE, 'sign-in.mjs'), file, dirs.state_dir, dirs.cred_dir], { input: '{}', encoding: 'utf-8' });
